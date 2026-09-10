@@ -7,7 +7,10 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -30,10 +33,12 @@ const YELLOW: Color = Color::Rgb(210, 210, 70);
 const ORANGE: Color = Color::Rgb(230, 145, 60);
 const RED: Color = Color::Rgb(235, 75, 75);
 const CYAN: Color = Color::Rgb(70, 195, 220);
+
 const HISTORY_LEN: usize = 180;
 const MIN_REFRESH_MS: u64 = 100;
 const MAX_REFRESH_MS: u64 = 10_000;
 const REFRESH_STEP_MS: u64 = 100;
+const REFRESH_CONTROL_WIDTH: u16 = 31;
 
 #[derive(Parser, Debug)]
 #[command(name = "orsiktop", version, about = "btop for local LLM Orks")]
@@ -95,10 +100,15 @@ struct PreviousCounters {
     generated_total: f64,
 }
 
+#[derive(Copy, Clone)]
+struct RefreshControls {
+    minus: Rect,
+    plus: Rect,
+}
+
 struct AppState {
     gpu_history: VecDeque<u64>,
     vram_history: VecDeque<u64>,
-    power_history: VecDeque<u64>,
 }
 
 impl Default for AppState {
@@ -106,7 +116,6 @@ impl Default for AppState {
         Self {
             gpu_history: VecDeque::with_capacity(HISTORY_LEN),
             vram_history: VecDeque::with_capacity(HISTORY_LEN),
-            power_history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
 }
@@ -118,14 +127,8 @@ impl AppState {
         } else {
             0.0
         };
-        let power = if gpu.power_limit_w > 0.0 {
-            gpu.power_w / gpu.power_limit_w * 100.0
-        } else {
-            0.0
-        };
         push_history(&mut self.gpu_history, gpu.utilization);
         push_history(&mut self.vram_history, vram);
-        push_history(&mut self.power_history, power);
     }
 }
 
@@ -142,14 +145,18 @@ fn main() -> app_result::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, &args.server, initial_refresh_ms);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -192,32 +199,98 @@ fn run(
             .min(Duration::from_millis(50));
 
         if event::poll(wait)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('[') => {
-                            refresh_ms = refresh_ms
-                                .saturating_sub(REFRESH_STEP_MS)
-                                .max(MIN_REFRESH_MS);
-                            tick = Duration::from_millis(refresh_ms);
-                            last_refresh = Instant::now() - tick;
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('-') | KeyCode::Char('[') => {
+                        change_refresh(
+                            &mut refresh_ms,
+                            false,
+                            &mut tick,
+                            &mut last_refresh,
+                        );
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => {
+                        change_refresh(
+                            &mut refresh_ms,
+                            true,
+                            &mut tick,
+                            &mut last_refresh,
+                        );
+                    }
+                    _ => {}
+                },
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    let (width, _) = crossterm::terminal::size()?;
+                    let header = Rect::new(0, 0, width, 3);
+                    if let Some(controls) = refresh_controls(header) {
+                        if rect_contains(controls.minus, mouse.column, mouse.row) {
+                            change_refresh(
+                                &mut refresh_ms,
+                                false,
+                                &mut tick,
+                                &mut last_refresh,
+                            );
+                        } else if rect_contains(controls.plus, mouse.column, mouse.row) {
+                            change_refresh(
+                                &mut refresh_ms,
+                                true,
+                                &mut tick,
+                                &mut last_refresh,
+                            );
                         }
-                        KeyCode::Char(']') => {
-                            refresh_ms = refresh_ms
-                                .saturating_add(REFRESH_STEP_MS)
-                                .min(MAX_REFRESH_MS);
-                            tick = Duration::from_millis(refresh_ms);
-                            last_refresh = Instant::now() - tick;
-                        }
-                        _ => {}
                     }
                 }
+                _ => {}
             }
         }
     }
 
     Ok(())
+}
+
+fn change_refresh(
+    refresh_ms: &mut u64,
+    increase: bool,
+    tick: &mut Duration,
+    last_refresh: &mut Instant,
+) {
+    *refresh_ms = if increase {
+        refresh_ms
+            .saturating_add(REFRESH_STEP_MS)
+            .min(MAX_REFRESH_MS)
+    } else {
+        refresh_ms
+            .saturating_sub(REFRESH_STEP_MS)
+            .max(MIN_REFRESH_MS)
+    };
+    *tick = Duration::from_millis(*refresh_ms);
+    *last_refresh = Instant::now() - *tick;
+}
+
+fn refresh_controls(area: Rect) -> Option<RefreshControls> {
+    if area.height < 3 || area.width < REFRESH_CONTROL_WIDTH + 4 {
+        return None;
+    }
+
+    let inner_right = area.x + area.width.saturating_sub(1);
+    let start_x = inner_right.saturating_sub(REFRESH_CONTROL_WIDTH);
+    let y = area.y + 1;
+
+    Some(RefreshControls {
+        // "REFRESH  [ - ]  10000 ms  [ + ]"
+        minus: Rect::new(start_x + 9, y, 5, 1),
+        plus: Rect::new(start_x + 26, y, 5, 1),
+    })
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
 }
 
 fn fetch_llm_stats(
@@ -478,25 +551,54 @@ fn draw_header(
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     };
 
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " OrsikTop ",
-            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("— btop for local LLM Orks  "),
-        Span::styled(status, status_style),
-        Span::styled(format!("  {server}"), Style::default().fg(MUTED)),
-        Span::styled(
-            format!("  ↻ {refresh_ms} ms"),
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM_GREEN)),
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DIM_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let controls = refresh_controls(area);
+    let left_width = controls
+        .map(|c| c.minus.x.saturating_sub(9).saturating_sub(inner.x))
+        .unwrap_or(inner.width);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " OrsikTop ",
+                Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("— btop for local LLM Orks  "),
+            Span::styled(status, status_style),
+            Span::styled(format!("  {server}"), Style::default().fg(MUTED)),
+        ])),
+        Rect::new(inner.x, inner.y, left_width, 1),
     );
-    frame.render_widget(header, area);
+
+    if let Some(c) = controls {
+        let control_x = c.minus.x.saturating_sub(9);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("REFRESH  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "[ - ]",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ORK_GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {:>5} ms  ", refresh_ms)),
+                Span::styled(
+                    "[ + ]",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ORK_GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            Rect::new(control_x, inner.y, REFRESH_CONTROL_WIDTH, 1),
+        );
+    }
 }
 
 fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState) {
@@ -573,11 +675,36 @@ fn draw_gpu_core(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     };
 
     let mut lines = vec![
-        pixel_meter("GPU", gpu.utilization, bar_width, format!("{:>3.0}%", gpu.utilization)),
-        pixel_meter("PWR", power_pct, bar_width, format!("{:>3.0}W", gpu.power_w)),
-        pixel_meter("ENC", gpu.encoder_utilization, bar_width, format!("{:>3.0}%", gpu.encoder_utilization)),
-        pixel_meter("DEC", gpu.decoder_utilization, bar_width, format!("{:>3.0}%", gpu.decoder_utilization)),
-        pixel_meter("FAN", gpu.fan_percent, bar_width, format!("{:>3.0}%", gpu.fan_percent)),
+        pixel_meter(
+            "GPU",
+            gpu.utilization,
+            bar_width,
+            format!("{:>3.0}%", gpu.utilization),
+        ),
+        pixel_meter(
+            "PWR",
+            power_pct,
+            bar_width,
+            format!("{:>3.0}W", gpu.power_w),
+        ),
+        pixel_meter(
+            "ENC",
+            gpu.encoder_utilization,
+            bar_width,
+            format!("{:>3.0}%", gpu.encoder_utilization),
+        ),
+        pixel_meter(
+            "DEC",
+            gpu.decoder_utilization,
+            bar_width,
+            format!("{:>3.0}%", gpu.decoder_utilization),
+        ),
+        pixel_meter(
+            "FAN",
+            gpu.fan_percent,
+            bar_width,
+            format!("{:>3.0}%", gpu.fan_percent),
+        ),
         Line::from(vec![
             Span::styled("CORE ", Style::default().fg(MUTED)),
             Span::styled(
@@ -632,8 +759,14 @@ fn draw_gpu_memory(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState
         Line::from(vec![
             Span::styled("VRAM ", Style::default().fg(MUTED)),
             Span::styled(
-                format!("{:>4.1}/{:>4.1} GiB", gpu.memory_used_mib / 1024.0, gpu.memory_total_mib / 1024.0),
-                Style::default().fg(heat_color(vram_pct)).add_modifier(Modifier::BOLD),
+                format!(
+                    "{:>4.1}/{:>4.1} GiB",
+                    gpu.memory_used_mib / 1024.0,
+                    gpu.memory_total_mib / 1024.0
+                ),
+                Style::default()
+                    .fg(heat_color(vram_pct))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(" {:>3.0}%", vram_pct)),
         ]),
@@ -650,17 +783,27 @@ fn draw_gpu_memory(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState
         ]),
         Line::from(vec![
             Span::styled("RX   ", Style::default().fg(MUTED)),
-            Span::styled(format!("{:>7.1} MiB/s", gpu.pcie_rx_mib_s), Style::default().fg(CYAN)),
+            Span::styled(
+                format!("{:>7.1} MiB/s", gpu.pcie_rx_mib_s),
+                Style::default().fg(CYAN),
+            ),
         ]),
         Line::from(vec![
             Span::styled("TX   ", Style::default().fg(MUTED)),
-            Span::styled(format!("{:>7.1} MiB/s", gpu.pcie_tx_mib_s), Style::default().fg(CYAN)),
+            Span::styled(
+                format!("{:>7.1} MiB/s", gpu.pcie_tx_mib_s),
+                Style::default().fg(CYAN),
+            ),
         ]),
     ];
     frame.render_widget(Paragraph::new(info), parts[0]);
 
     if parts[1].height > 0 {
-        let mut matrix = pixel_fill_matrix(vram_pct, parts[1].width as usize, parts[1].height as usize);
+        let mut matrix = pixel_fill_matrix(
+            vram_pct,
+            parts[1].width as usize,
+            parts[1].height as usize,
+        );
         if !app.vram_history.is_empty() && parts[1].height >= 2 {
             let trend = pixel_history_lines(&app.vram_history, parts[1].width as usize, 1);
             if let Some(line) = trend.into_iter().next() {
@@ -675,15 +818,25 @@ fn draw_gpu_memory(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState
 fn pixel_meter(label: &str, percent: f64, width: usize, value: String) -> Line<'static> {
     let pct = percent.clamp(0.0, 100.0);
     let filled = ((pct / 100.0) * width as f64).round() as usize;
-    let mut spans = Vec::with_capacity(4);
-    spans.push(Span::styled(format!("{label:<3} "), Style::default().fg(MUTED)));
-    spans.push(Span::styled("▪".repeat(filled), Style::default().fg(heat_color(pct))));
-    spans.push(Span::styled("·".repeat(width.saturating_sub(filled)), Style::default().fg(PIXEL_OFF)));
-    spans.push(Span::styled(format!(" {value}"), Style::default().fg(Color::White)));
-    Line::from(spans)
+    Line::from(vec![
+        Span::styled(format!("{label:<3} "), Style::default().fg(MUTED)),
+        Span::styled(
+            "▪".repeat(filled),
+            Style::default().fg(heat_color(pct)),
+        ),
+        Span::styled(
+            "·".repeat(width.saturating_sub(filled)),
+            Style::default().fg(PIXEL_OFF),
+        ),
+        Span::styled(format!(" {value}"), Style::default().fg(Color::White)),
+    ])
 }
 
-fn pixel_history_lines(history: &VecDeque<u64>, width: usize, height: usize) -> Vec<Line<'static>> {
+fn pixel_history_lines(
+    history: &VecDeque<u64>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
     let height = height.max(1);
     let start = history.len().saturating_sub(width);
@@ -695,11 +848,17 @@ fn pixel_history_lines(history: &VecDeque<u64>, width: usize, height: usize) -> 
             let threshold = ((height - row) as f64 / height as f64 * 100.0) as u64;
             let mut spans = Vec::with_capacity(width + 1);
             if left_pad > 0 {
-                spans.push(Span::styled("·".repeat(left_pad), Style::default().fg(PIXEL_OFF)));
+                spans.push(Span::styled(
+                    "·".repeat(left_pad),
+                    Style::default().fg(PIXEL_OFF),
+                ));
             }
             for sample in &samples {
                 if *sample >= threshold {
-                    spans.push(Span::styled("▪", Style::default().fg(heat_color(*sample as f64))));
+                    spans.push(Span::styled(
+                        "▪",
+                        Style::default().fg(heat_color(*sample as f64)),
+                    ));
                 } else {
                     spans.push(Span::styled("·", Style::default().fg(PIXEL_OFF)));
                 }
@@ -721,7 +880,10 @@ fn pixel_fill_matrix(percent: f64, width: usize, height: usize) -> Vec<Line<'sta
             let row_filled = filled.saturating_sub(row_start).min(width);
             Line::from(vec![
                 Span::styled("▪".repeat(row_filled), Style::default().fg(color)),
-                Span::styled("·".repeat(width.saturating_sub(row_filled)), Style::default().fg(PIXEL_OFF)),
+                Span::styled(
+                    "·".repeat(width.saturating_sub(row_filled)),
+                    Style::default().fg(PIXEL_OFF),
+                ),
             ])
         })
         .collect()
@@ -765,7 +927,10 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         ])
         .split(inner);
 
-    frame.render_widget(Paragraph::new(format!(" Model      {}", llm.model)), rows[0]);
+    frame.render_widget(
+        Paragraph::new(format!(" Model      {}", llm.model)),
+        rows[0],
+    );
     frame.render_widget(
         Paragraph::new(format!(
             " Throughput prompt {:>8.1} tok/s   generate {:>8.1} tok/s",
@@ -860,10 +1025,13 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &System) {
 fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, refresh_ms: u64) {
     let footer_text = if llm.error.is_empty() {
         format!(
-            " q/Esc quit  |  [ -100ms  ] +100ms  |  refresh {refresh_ms} ms  |  MORE POWER, HAPPIER ORKS "
+            " q/Esc quit  |  click [ - ] / [ + ] or use -/+  |  refresh {refresh_ms} ms  |  MORE POWER, HAPPIER ORKS "
         )
     } else {
-        format!(" q/Esc quit  |  [ / ] refresh  |  {} ", llm.error)
+        format!(
+            " q/Esc quit  |  click [ - ] / [ + ]  |  refresh {refresh_ms} ms  |  {} ",
+            llm.error
+        )
     };
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::Gray))
