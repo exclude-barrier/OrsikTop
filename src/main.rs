@@ -31,6 +31,9 @@ const ORANGE: Color = Color::Rgb(230, 145, 60);
 const RED: Color = Color::Rgb(235, 75, 75);
 const CYAN: Color = Color::Rgb(70, 195, 220);
 const HISTORY_LEN: usize = 180;
+const MIN_REFRESH_MS: u64 = 100;
+const MAX_REFRESH_MS: u64 = 10_000;
+const REFRESH_STEP_MS: u64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(name = "orsiktop", version, about = "btop for local LLM Orks")]
@@ -40,8 +43,14 @@ struct Args {
     server: String,
 
     /// Refresh interval in milliseconds
-    #[arg(long, default_value_t = 1000)]
-    interval: u64,
+    #[arg(
+        short = 'i',
+        long = "interval-ms",
+        alias = "interval",
+        env = "ORSIKTOP_INTERVAL_MS",
+        default_value_t = 1000
+    )]
+    interval_ms: u64,
 }
 
 #[derive(Clone, Default)]
@@ -129,7 +138,7 @@ fn push_history(history: &mut VecDeque<u64>, value: f64) {
 
 fn main() -> app_result::Result<()> {
     let args = Args::parse();
-    let tick = Duration::from_millis(args.interval.max(200));
+    let initial_refresh_ms = args.interval_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -137,7 +146,7 @@ fn main() -> app_result::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &args.server, tick);
+    let result = run(&mut terminal, &args.server, initial_refresh_ms);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -149,7 +158,7 @@ fn main() -> app_result::Result<()> {
 fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     server: &str,
-    tick: Duration,
+    initial_refresh_ms: u64,
 ) -> app_result::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(700))
@@ -157,6 +166,8 @@ fn run(
     let mut system = System::new_all();
     let mut previous = PreviousCounters::default();
     let mut app = AppState::default();
+    let mut refresh_ms = initial_refresh_ms;
+    let mut tick = Duration::from_millis(refresh_ms);
     let mut last_refresh = Instant::now() - tick;
 
     let mut llm = LlmStats::default();
@@ -171,19 +182,36 @@ fn run(
             last_refresh = Instant::now();
         }
 
-        terminal.draw(|frame| draw(frame, &system, &llm, &gpu, &app, server))?;
+        terminal.draw(|frame| {
+            draw(frame, &system, &llm, &gpu, &app, server, refresh_ms)
+        })?;
 
         let wait = tick
             .checked_sub(last_refresh.elapsed())
             .unwrap_or(Duration::ZERO)
-            .min(Duration::from_millis(100));
+            .min(Duration::from_millis(50));
 
         if event::poll(wait)? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                {
-                    break;
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('[') => {
+                            refresh_ms = refresh_ms
+                                .saturating_sub(REFRESH_STEP_MS)
+                                .max(MIN_REFRESH_MS);
+                            tick = Duration::from_millis(refresh_ms);
+                            last_refresh = Instant::now() - tick;
+                        }
+                        KeyCode::Char(']') => {
+                            refresh_ms = refresh_ms
+                                .saturating_add(REFRESH_STEP_MS)
+                                .min(MAX_REFRESH_MS);
+                            tick = Duration::from_millis(refresh_ms);
+                            last_refresh = Instant::now() - tick;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -417,25 +445,32 @@ fn draw(
     gpu: &GpuStats,
     app: &AppState,
     server: &str,
+    refresh_ms: u64,
 ) {
     let area = frame.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Percentage(55),
+            Constraint::Length(13),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(area);
 
-    draw_header(frame, rows[0], llm, server);
+    draw_header(frame, rows[0], llm, server, refresh_ms);
     draw_gpu(frame, rows[1], gpu, app);
     draw_llm_and_system(frame, rows[2], system, llm);
-    draw_footer(frame, rows[3], llm);
+    draw_footer(frame, rows[3], llm, refresh_ms);
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str) {
+fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    llm: &LlmStats,
+    server: &str,
+    refresh_ms: u64,
+) {
     let status = if llm.connected { "ONLINE" } else { "OFFLINE" };
     let status_style = if llm.connected {
         Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD)
@@ -451,6 +486,10 @@ fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str) {
         Span::raw("— btop for local LLM Orks  "),
         Span::styled(status, status_style),
         Span::styled(format!("  {server}"), Style::default().fg(MUTED)),
+        Span::styled(
+            format!("  ↻ {refresh_ms} ms"),
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ),
     ]))
     .block(
         Block::default()
@@ -483,8 +522,8 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(36),
+            Constraint::Percentage(32),
+            Constraint::Percentage(39),
             Constraint::Percentage(29),
         ])
         .split(inner);
@@ -818,11 +857,13 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &System) {
     );
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats) {
+fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, refresh_ms: u64) {
     let footer_text = if llm.error.is_empty() {
-        " q/Esc quit  |  LOCAL LLMS  |  MORE POWER  |  HAPPIER ORKS ".to_string()
+        format!(
+            " q/Esc quit  |  [ -100ms  ] +100ms  |  refresh {refresh_ms} ms  |  MORE POWER, HAPPIER ORKS "
+        )
     } else {
-        format!(" q/Esc quit  |  {} ", llm.error)
+        format!(" q/Esc quit  |  [ / ] refresh  |  {} ", llm.error)
     };
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::Gray))
