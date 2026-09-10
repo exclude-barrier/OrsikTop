@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
     Frame, Terminal,
 };
 use serde_json::Value;
@@ -25,7 +25,12 @@ use sysinfo::System;
 const ORK_GREEN: Color = Color::Rgb(105, 210, 70);
 const DIM_GREEN: Color = Color::Rgb(70, 135, 60);
 const MUTED: Color = Color::Rgb(145, 150, 145);
-const HISTORY_LEN: usize = 120;
+const PIXEL_OFF: Color = Color::Rgb(48, 55, 50);
+const YELLOW: Color = Color::Rgb(210, 210, 70);
+const ORANGE: Color = Color::Rgb(230, 145, 60);
+const RED: Color = Color::Rgb(235, 75, 75);
+const CYAN: Color = Color::Rgb(70, 195, 220);
+const HISTORY_LEN: usize = 180;
 
 #[derive(Parser, Debug)]
 #[command(name = "orsiktop", version, about = "btop for local LLM Orks")]
@@ -83,23 +88,43 @@ struct PreviousCounters {
 
 struct AppState {
     gpu_history: VecDeque<u64>,
+    vram_history: VecDeque<u64>,
+    power_history: VecDeque<u64>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             gpu_history: VecDeque::with_capacity(HISTORY_LEN),
+            vram_history: VecDeque::with_capacity(HISTORY_LEN),
+            power_history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
 }
 
 impl AppState {
-    fn push_gpu_sample(&mut self, value: f64) {
-        if self.gpu_history.len() >= HISTORY_LEN {
-            self.gpu_history.pop_front();
-        }
-        self.gpu_history.push_back(value.clamp(0.0, 100.0) as u64);
+    fn push_sample(&mut self, gpu: &GpuStats) {
+        let vram = if gpu.memory_total_mib > 0.0 {
+            gpu.memory_used_mib / gpu.memory_total_mib * 100.0
+        } else {
+            0.0
+        };
+        let power = if gpu.power_limit_w > 0.0 {
+            gpu.power_w / gpu.power_limit_w * 100.0
+        } else {
+            0.0
+        };
+        push_history(&mut self.gpu_history, gpu.utilization);
+        push_history(&mut self.vram_history, vram);
+        push_history(&mut self.power_history, power);
     }
+}
+
+fn push_history(history: &mut VecDeque<u64>, value: f64) {
+    if history.len() >= HISTORY_LEN {
+        history.pop_front();
+    }
+    history.push_back(value.clamp(0.0, 100.0) as u64);
 }
 
 fn main() -> app_result::Result<()> {
@@ -142,7 +167,7 @@ fn run(
             system.refresh_all();
             llm = fetch_llm_stats(&client, server, &mut previous);
             gpu = fetch_gpu_stats().unwrap_or_default();
-            app.push_gpu_sample(gpu.utilization);
+            app.push_sample(&gpu);
             last_refresh = Instant::now();
         }
 
@@ -370,8 +395,6 @@ fn fetch_pcie_throughput() -> Option<(f64, f64)> {
         .rev()
         .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))?;
     let fields: Vec<_> = line.split_whitespace().collect();
-
-    // nvidia-smi dmon -s t: gpu, rxpci, txpci (MiB/s on current drivers)
     if fields.len() < 3 {
         return None;
     }
@@ -380,7 +403,7 @@ fn fetch_pcie_throughput() -> Option<(f64, f64)> {
 }
 
 fn parse_num(value: &str) -> f64 {
-    if value.eq_ignore_ascii_case("n/a") || value == "-" {
+    if value.eq_ignore_ascii_case("n/a") || value == "-" || value == "[N/A]" {
         0.0
     } else {
         value.parse::<f64>().unwrap_or(0.0)
@@ -400,8 +423,8 @@ fn draw(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Percentage(48),
-            Constraint::Min(11),
+            Constraint::Percentage(55),
+            Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(area);
@@ -441,121 +464,237 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState) {
     let title = if gpu.name.is_empty() {
         " gpu0 — NVIDIA unavailable ".to_string()
     } else {
-        format!(" gpu0 — {} ", gpu.name)
+        format!(
+            " gpu0  {}  {:>4.0} MHz  {:>3.0}°C  {} ",
+            gpu.name,
+            gpu.graphics_clock_mhz,
+            gpu.temperature_c,
+            fallback(&gpu.pstate, "—")
+        )
     };
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ORK_GREEN));
+        .border_style(Style::default().fg(DIM_GREEN));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Percentage(36),
+            Constraint::Percentage(29),
+        ])
         .split(inner);
 
-    let history: Vec<u64> = app.gpu_history.iter().copied().collect();
-    let spark = Sparkline::default()
-        .block(Block::default().title(" GPU load history ").borders(Borders::RIGHT))
-        .data(&history)
-        .max(100)
-        .style(Style::default().fg(ORK_GREEN));
-    frame.render_widget(spark, cols[0]);
+    draw_gpu_history(frame, cols[0], app);
+    draw_gpu_core(frame, cols[1], gpu);
+    draw_gpu_memory(frame, cols[2], gpu, app);
+}
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(2),
-        ])
-        .split(cols[1]);
+fn draw_gpu_history(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .title(" GPU LOAD HISTORY ")
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(DIM_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" GPU ", Style::default().fg(MUTED)),
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let lines = pixel_history_lines(
+        &app.gpu_history,
+        inner.width as usize,
+        inner.height as usize,
+    );
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_gpu_core(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
+    let block = Block::default()
+        .title(" CORE / POWER ")
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(DIM_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 12 || inner.height == 0 {
+        return;
+    }
+
+    let bar_width = inner.width.saturating_sub(18).max(8) as usize;
+    let power_pct = if gpu.power_limit_w > 0.0 {
+        gpu.power_w / gpu.power_limit_w * 100.0
+    } else {
+        0.0
+    };
+
+    let mut lines = vec![
+        pixel_meter("GPU", gpu.utilization, bar_width, format!("{:>3.0}%", gpu.utilization)),
+        pixel_meter("PWR", power_pct, bar_width, format!("{:>3.0}W", gpu.power_w)),
+        pixel_meter("ENC", gpu.encoder_utilization, bar_width, format!("{:>3.0}%", gpu.encoder_utilization)),
+        pixel_meter("DEC", gpu.decoder_utilization, bar_width, format!("{:>3.0}%", gpu.decoder_utilization)),
+        pixel_meter("FAN", gpu.fan_percent, bar_width, format!("{:>3.0}%", gpu.fan_percent)),
+        Line::from(vec![
+            Span::styled("CORE ", Style::default().fg(MUTED)),
             Span::styled(
-                format!("{:>3.0}%", gpu.utilization),
+                format!("{:>5.0} MHz", gpu.graphics_clock_mhz),
                 Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(
-                "   {:>4.0} MHz   {:>3.0}°C   P-state {}",
-                gpu.graphics_clock_mhz,
-                gpu.temperature_c,
-                fallback(&gpu.pstate, "—")
-            )),
-        ])),
-        rows[0],
-    );
+        ]),
+        Line::from(vec![
+            Span::styled("TEMP ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{:>3.0}°C", gpu.temperature_c),
+                Style::default().fg(heat_color(gpu.temperature_c.min(100.0))),
+            ),
+            Span::styled("   P-STATE ", Style::default().fg(MUTED)),
+            Span::styled(
+                fallback(&gpu.pstate, "—").to_string(),
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("LIMIT ", Style::default().fg(MUTED)),
+            Span::raw(format!("{:>5.0} W", gpu.power_limit_w)),
+        ]),
+    ];
 
-    let power_ratio = if gpu.power_limit_w > 0.0 {
-        gpu.power_w / gpu.power_limit_w
+    lines.truncate(inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_gpu_memory(frame: &mut Frame, area: Rect, gpu: &GpuStats, app: &AppState) {
+    let block = Block::default().title(" VRAM / BUS ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let vram_pct = if gpu.memory_total_mib > 0.0 {
+        gpu.memory_used_mib / gpu.memory_total_mib * 100.0
     } else {
         0.0
     };
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(ORK_GREEN))
-            .ratio((gpu.utilization / 100.0).clamp(0.0, 1.0))
-            .label(format!(
-                "GPU {:>3.0}%   MEM {:>3.0}%",
-                gpu.utilization, gpu.memory_utilization
-            )),
-        rows[1],
-    );
 
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(ORK_GREEN))
-            .ratio(power_ratio.clamp(0.0, 1.0))
-            .label(format!(
-                "PWR {:.0} / {:.0} W   FAN {:.0}%",
-                gpu.power_w, gpu.power_limit_w, gpu.fan_percent
-            )),
-        rows[2],
-    );
+    let header_height = 5u16.min(inner.height);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
+        .split(inner);
 
-    let vram_ratio = if gpu.memory_total_mib > 0.0 {
-        gpu.memory_used_mib / gpu.memory_total_mib
-    } else {
-        0.0
-    };
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(ORK_GREEN))
-            .ratio(vram_ratio.clamp(0.0, 1.0))
-            .label(format!(
-                "VRAM {:.1} / {:.1} GiB  {:>3.0}%",
-                gpu.memory_used_mib / 1024.0,
-                gpu.memory_total_mib / 1024.0,
-                vram_ratio * 100.0
-            )),
-        rows[3],
-    );
+    let info = vec![
+        Line::from(vec![
+            Span::styled("VRAM ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{:>4.1}/{:>4.1} GiB", gpu.memory_used_mib / 1024.0, gpu.memory_total_mib / 1024.0),
+                Style::default().fg(heat_color(vram_pct)).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {:>3.0}%", vram_pct)),
+        ]),
+        Line::from(vec![
+            Span::styled("VCLK ", Style::default().fg(MUTED)),
+            Span::raw(format!("{:>5.0} MHz", gpu.memory_clock_mhz)),
+        ]),
+        Line::from(vec![
+            Span::styled("MEM  ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{:>3.0}%", gpu.memory_utilization),
+                Style::default().fg(heat_color(gpu.memory_utilization)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("RX   ", Style::default().fg(MUTED)),
+            Span::styled(format!("{:>7.1} MiB/s", gpu.pcie_rx_mib_s), Style::default().fg(CYAN)),
+        ]),
+        Line::from(vec![
+            Span::styled("TX   ", Style::default().fg(MUTED)),
+            Span::styled(format!("{:>7.1} MiB/s", gpu.pcie_tx_mib_s), Style::default().fg(CYAN)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(info), parts[0]);
 
-    frame.render_widget(
-        Paragraph::new(format!(
-            " VRAM clock {:>5.0} MHz   ENC {:>3.0}%   DEC {:>3.0}%",
-            gpu.memory_clock_mhz, gpu.encoder_utilization, gpu.decoder_utilization
-        )),
-        rows[4],
-    );
+    if parts[1].height > 0 {
+        let mut matrix = pixel_fill_matrix(vram_pct, parts[1].width as usize, parts[1].height as usize);
+        if !app.vram_history.is_empty() && parts[1].height >= 2 {
+            let trend = pixel_history_lines(&app.vram_history, parts[1].width as usize, 1);
+            if let Some(line) = trend.into_iter().next() {
+                let last = matrix.len().saturating_sub(1);
+                matrix[last] = line;
+            }
+        }
+        frame.render_widget(Paragraph::new(matrix), parts[1]);
+    }
+}
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" PCIe ", Style::default().fg(MUTED)),
-            Span::raw(format!(
-                "RX {:>7.1} MiB/s   TX {:>7.1} MiB/s",
-                gpu.pcie_rx_mib_s, gpu.pcie_tx_mib_s
-            )),
-        ])),
-        rows[5],
-    );
+fn pixel_meter(label: &str, percent: f64, width: usize, value: String) -> Line<'static> {
+    let pct = percent.clamp(0.0, 100.0);
+    let filled = ((pct / 100.0) * width as f64).round() as usize;
+    let mut spans = Vec::with_capacity(4);
+    spans.push(Span::styled(format!("{label:<3} "), Style::default().fg(MUTED)));
+    spans.push(Span::styled("▪".repeat(filled), Style::default().fg(heat_color(pct))));
+    spans.push(Span::styled("·".repeat(width.saturating_sub(filled)), Style::default().fg(PIXEL_OFF)));
+    spans.push(Span::styled(format!(" {value}"), Style::default().fg(Color::White)));
+    Line::from(spans)
+}
+
+fn pixel_history_lines(history: &VecDeque<u64>, width: usize, height: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let start = history.len().saturating_sub(width);
+    let samples: Vec<u64> = history.iter().skip(start).copied().collect();
+    let left_pad = width.saturating_sub(samples.len());
+
+    (0..height)
+        .map(|row| {
+            let threshold = ((height - row) as f64 / height as f64 * 100.0) as u64;
+            let mut spans = Vec::with_capacity(width + 1);
+            if left_pad > 0 {
+                spans.push(Span::styled("·".repeat(left_pad), Style::default().fg(PIXEL_OFF)));
+            }
+            for sample in &samples {
+                if *sample >= threshold {
+                    spans.push(Span::styled("▪", Style::default().fg(heat_color(*sample as f64))));
+                } else {
+                    spans.push(Span::styled("·", Style::default().fg(PIXEL_OFF)));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn pixel_fill_matrix(percent: f64, width: usize, height: usize) -> Vec<Line<'static>> {
+    let pct = percent.clamp(0.0, 100.0);
+    let total = width.saturating_mul(height).max(1);
+    let filled = ((pct / 100.0) * total as f64).round() as usize;
+    let color = heat_color(pct);
+
+    (0..height.max(1))
+        .map(|row| {
+            let row_start = row.saturating_mul(width);
+            let row_filled = filled.saturating_sub(row_start).min(width);
+            Line::from(vec![
+                Span::styled("▪".repeat(row_filled), Style::default().fg(color)),
+                Span::styled("·".repeat(width.saturating_sub(row_filled)), Style::default().fg(PIXEL_OFF)),
+            ])
+        })
+        .collect()
+}
+
+fn heat_color(value: f64) -> Color {
+    match value {
+        v if v >= 90.0 => RED,
+        v if v >= 75.0 => ORANGE,
+        v if v >= 55.0 => YELLOW,
+        _ => ORK_GREEN,
+    }
 }
 
 fn draw_llm_and_system(frame: &mut Frame, area: Rect, system: &System, llm: &LlmStats) {
