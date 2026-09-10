@@ -1,0 +1,17 @@
+[package]
+name = "orsiktop"
+version = "0.1.0"
+edition = "2021"
+description = "btop for local LLM Orks"
+license = "MIT"
+repository = "https://github.com/exclude-barrier/OrsikTop"
+keywords = ["llm", "llama-cpp", "tui", "monitoring", "nvidia"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.28"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1.0"
+sysinfo = "0.33"
