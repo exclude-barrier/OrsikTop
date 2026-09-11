@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/orsiktop dist/orsiktop
+          cp README.md LICENSE dist/
+          tar -C dist -czf orsiktop-linux-x86_64.tar.gz orsiktop README.md LICENSE
+          sha256sum orsiktop-linux-x86_64.tar.gz > orsiktop-linux-x86_64.tar.gz.sha256
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            orsiktop-linux-x86_64.tar.gz \
+            orsiktop-linux-x86_64.tar.gz.sha256 \
+            --title "OrsikTop ${GITHUB_REF_NAME}" \
+            --generate-notes
