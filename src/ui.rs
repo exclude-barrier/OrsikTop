@@ -97,7 +97,12 @@ pub fn draw(
     } else {
         22
     };
-    let dashboard = Rect::new(area.x, area.y, area.width, area.height.min(dashboard_height));
+    let dashboard = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.min(dashboard_height),
+    );
 
     let rows = if show_history {
         Layout::default()
@@ -299,11 +304,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         ),
         Line::from(vec![
             label_span(" BUS    "),
-            data_pair(
-                "MEMCTRL",
-                format!("{:.0}%", gpu.memory_utilization),
-                CYAN,
-            ),
+            data_pair("MEMCTRL", format!("{:.0}%", gpu.memory_utilization), CYAN),
             data_pair("ENC", format!("{:.0}%", gpu.encoder_utilization), WHITE),
             data_pair("DEC", format!("{:.0}%", gpu.decoder_utilization), WHITE),
             data_pair("PCIe RX", format!("{:.1} MiB/s", gpu.pcie_rx_mib_s), CYAN),
@@ -848,10 +849,7 @@ mod tests {
     fn trend_plot_uses_single_pixel_per_sample() {
         let history = VecDeque::from([0, 25, 50, 75, 100]);
         let lines = trend_lines(&history, 5, 5, ORK_GREEN);
-        let rendered = lines
-            .iter()
-            .map(|line| line.width())
-            .collect::<Vec<_>>();
+        let rendered = lines.iter().map(|line| line.width()).collect::<Vec<_>>();
         assert_eq!(rendered, vec![5, 5, 5, 5, 5]);
     }
 }
