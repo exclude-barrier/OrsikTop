@@ -91,7 +91,7 @@ impl GpuMonitor {
                 .unwrap_or(0.0),
             pstate: device
                 .performance_state()
-                .map(|state| format!("{state:?}"))
+                .map(|state| normalize_pstate(&format!("{state:?}")))
                 .unwrap_or_else(|_| "—".to_string()),
             graphics_clock_mhz: device
                 .clock_info(Clock::Graphics)
@@ -140,6 +140,30 @@ fn kib_per_second_to_mib(kib_per_second: u32) -> f64 {
     kib_per_second as f64 / 1024.0
 }
 
+fn normalize_pstate(raw: &str) -> String {
+    let number = match raw {
+        "Zero" => Some(0),
+        "One" => Some(1),
+        "Two" => Some(2),
+        "Three" => Some(3),
+        "Four" => Some(4),
+        "Five" => Some(5),
+        "Six" => Some(6),
+        "Seven" => Some(7),
+        "Eight" => Some(8),
+        "Nine" => Some(9),
+        "Ten" => Some(10),
+        "Eleven" => Some(11),
+        "Twelve" => Some(12),
+        "Thirteen" => Some(13),
+        "Fourteen" => Some(14),
+        "Fifteen" => Some(15),
+        _ => None,
+    };
+
+    number.map(|n| format!("P{n}")).unwrap_or_else(|| raw.to_string())
+}
+
 fn sanitize(stats: &mut GpuStats) {
     stats.utilization = stats.utilization.clamp(0.0, 100.0);
     stats.memory_utilization = stats.memory_utilization.clamp(0.0, 100.0);
@@ -161,6 +185,14 @@ mod tests {
     #[test]
     fn converts_bytes_to_mib() {
         assert_eq!(bytes_to_mib(1024 * 1024), 1.0);
+    }
+
+    #[test]
+    fn normalizes_nvml_pstate_names() {
+        assert_eq!(normalize_pstate("Zero"), "P0");
+        assert_eq!(normalize_pstate("Two"), "P2");
+        assert_eq!(normalize_pstate("Fifteen"), "P15");
+        assert_eq!(normalize_pstate("Unknown"), "Unknown");
     }
 
     #[test]
