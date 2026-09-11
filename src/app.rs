@@ -48,7 +48,7 @@ pub fn run(
 
     loop {
         while let Ok(next) = rx.try_recv() {
-            ui_state.push_gpu_sample(&next.gpu);
+            ui_state.push_sample(&next.gpu, &next.system);
             snapshot = next;
         }
 
