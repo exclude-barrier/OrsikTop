@@ -161,7 +161,9 @@ fn normalize_pstate(raw: &str) -> String {
         _ => None,
     };
 
-    number.map(|n| format!("P{n}")).unwrap_or_else(|| raw.to_string())
+    number
+        .map(|n| format!("P{n}"))
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn sanitize(stats: &mut GpuStats) {
