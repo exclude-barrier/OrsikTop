@@ -194,7 +194,10 @@ fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str, refr
             Paragraph::new(Line::from(vec![
                 Span::raw(" "),
                 button_span("[ - ]"),
-                Span::styled(format!("  {:>4} ms  ", refresh_ms), Style::default().fg(WHITE)),
+                Span::styled(
+                    format!("  {:>4} ms  ", refresh_ms),
+                    Style::default().fg(WHITE),
+                ),
                 button_span("[ + ]"),
             ])),
             Rect::new(start_x, inner.y, REFRESH_CONTROL_WIDTH, 1),
@@ -241,7 +244,11 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
             ORK_GREEN,
             format!("{:>3.0}%", gpu.utilization),
             vec![
-                data_pair("CORE", format!("{:.0} MHz", gpu.graphics_clock_mhz), ORK_GREEN),
+                data_pair(
+                    "CORE",
+                    format!("{:.0} MHz", gpu.graphics_clock_mhz),
+                    ORK_GREEN,
+                ),
                 data_pair(
                     "TEMP",
                     format!("{:.0}°C", gpu.temperature_c),
@@ -318,7 +325,10 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
 
     if !llm.connected {
         let lines = vec![
-            Line::from(vec![label_span(" STATUS   "), value_span("METRICS OFF", YELLOW)]),
+            Line::from(vec![
+                label_span(" STATUS   "),
+                value_span("METRICS OFF", YELLOW),
+            ]),
             Line::from(vec![
                 label_span(" LLAMA    "),
                 Span::styled("restart server with --metrics", Style::default().fg(MUTED)),
@@ -345,11 +355,17 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
     let mut lines = vec![
         Line::from(vec![
             label_span(" MODEL    "),
-            Span::styled(llm.model.clone(), Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                llm.model.clone(),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             label_span(" SPEED    "),
-            Span::styled(format!("PROMPT {:>7.1} tok/s", llm.prompt_tps), Style::default().fg(CYAN)),
+            Span::styled(
+                format!("PROMPT {:>7.1} tok/s", llm.prompt_tps),
+                Style::default().fg(CYAN),
+            ),
             Span::styled("    ", Style::default()),
             Span::styled(
                 format!("GENERATE {:>7.1} tok/s", llm.generation_tps),
@@ -358,9 +374,15 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         ]),
         Line::from(vec![
             label_span(" AVG      "),
-            Span::styled(format!("PROMPT {:>7.1}", llm.prompt_avg_tps), Style::default().fg(MUTED)),
+            Span::styled(
+                format!("PROMPT {:>7.1}", llm.prompt_avg_tps),
+                Style::default().fg(MUTED),
+            ),
             Span::styled("    ", Style::default()),
-            Span::styled(format!("GENERATE {:>7.1}", llm.generation_avg_tps), Style::default().fg(MUTED)),
+            Span::styled(
+                format!("GENERATE {:>7.1}", llm.generation_avg_tps),
+                Style::default().fg(MUTED),
+            ),
         ]),
         Line::from(vec![
             label_span(" TOKENS   "),
@@ -546,7 +568,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
 
     if inner.width > help_width {
         frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Paragraph::new(status).style(
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Rect::new(
                 inner.x.saturating_add(help_width),
                 inner.y,
@@ -606,10 +632,7 @@ fn value_span(text: &str, color: Color) -> Span<'static> {
 }
 
 fn data_pair(label: &'static str, value: String, color: Color) -> Span<'static> {
-    Span::styled(
-        format!("  {label} {value}"),
-        Style::default().fg(color),
-    )
+    Span::styled(format!("  {label} {value}"), Style::default().fg(color))
 }
 
 fn meter_line(
