@@ -71,14 +71,8 @@ impl GpuMonitor {
             available: true,
             name: device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string()),
             utilization: utilization.as_ref().map(|v| v.gpu as f64).unwrap_or(0.0),
-            memory_utilization: utilization
-                .as_ref()
-                .map(|v| v.memory as f64)
-                .unwrap_or(0.0),
-            memory_used_mib: memory
-                .as_ref()
-                .map(|m| bytes_to_mib(m.used))
-                .unwrap_or(0.0),
+            memory_utilization: utilization.as_ref().map(|v| v.memory as f64).unwrap_or(0.0),
+            memory_used_mib: memory.as_ref().map(|m| bytes_to_mib(m.used)).unwrap_or(0.0),
             memory_total_mib: memory
                 .as_ref()
                 .map(|m| bytes_to_mib(m.total))
@@ -115,10 +109,7 @@ impl GpuMonitor {
                 .as_ref()
                 .map(|info| info.utilization as f64)
                 .unwrap_or(0.0),
-            fan_percent: device
-                .fan_speed(0)
-                .map(|speed| speed as f64)
-                .unwrap_or(0.0),
+            fan_percent: device.fan_speed(0).map(|speed| speed as f64).unwrap_or(0.0),
             pcie_rx_mib_s: device
                 .pcie_throughput(PcieUtilCounter::Receive)
                 .map(kib_per_second_to_mib)

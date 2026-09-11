@@ -16,9 +16,7 @@ use sysinfo::System;
 use crate::{
     gpu::{GpuMonitor, GpuStats},
     llama::{LlamaMonitor, LlmStats},
-    ui::{
-        self, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
-    },
+    ui::{self, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS},
 };
 
 #[derive(Clone, Debug, Default)]

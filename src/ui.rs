@@ -112,13 +112,7 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_header(
-    frame: &mut Frame,
-    area: Rect,
-    llm: &LlmStats,
-    server: &str,
-    refresh_ms: u64,
-) {
+fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str, refresh_ms: u64) {
     let status = if llm.connected { "ONLINE" } else { "OFFLINE" };
     let status_style = if llm.connected {
         Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD)
@@ -173,7 +167,12 @@ fn draw_header(
                         .add_modifier(Modifier::BOLD),
                 ),
             ])),
-            Rect::new(c.minus.x.saturating_sub(9), inner.y, REFRESH_CONTROL_WIDTH, 1),
+            Rect::new(
+                c.minus.x.saturating_sub(9),
+                inner.y,
+                REFRESH_CONTROL_WIDTH,
+                1,
+            ),
         );
     }
 }
@@ -251,8 +250,18 @@ fn draw_gpu_core(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     };
 
     let mut lines = vec![
-        pixel_meter("GPU", gpu.utilization, bar_width, format!("{:>3.0}%", gpu.utilization)),
-        pixel_meter("PWR", power_pct, bar_width, format!("{:>3.0}W", gpu.power_w)),
+        pixel_meter(
+            "GPU",
+            gpu.utilization,
+            bar_width,
+            format!("{:>3.0}%", gpu.utilization),
+        ),
+        pixel_meter(
+            "PWR",
+            power_pct,
+            bar_width,
+            format!("{:>3.0}W", gpu.power_w),
+        ),
         pixel_meter(
             "ENC",
             gpu.encoder_utilization,
@@ -265,7 +274,12 @@ fn draw_gpu_core(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
             bar_width,
             format!("{:>3.0}%", gpu.decoder_utilization),
         ),
-        pixel_meter("FAN", gpu.fan_percent, bar_width, format!("{:>3.0}%", gpu.fan_percent)),
+        pixel_meter(
+            "FAN",
+            gpu.fan_percent,
+            bar_width,
+            format!("{:>3.0}%", gpu.fan_percent),
+        ),
         Line::from(vec![
             Span::styled("CORE ", Style::default().fg(MUTED)),
             Span::styled(
@@ -360,11 +374,8 @@ fn draw_gpu_memory(frame: &mut Frame, area: Rect, gpu: &GpuStats, state: &UiStat
     frame.render_widget(Paragraph::new(info), parts[0]);
 
     if parts[1].height > 0 {
-        let mut matrix = pixel_fill_matrix(
-            vram_pct,
-            parts[1].width as usize,
-            parts[1].height as usize,
-        );
+        let mut matrix =
+            pixel_fill_matrix(vram_pct, parts[1].width as usize, parts[1].height as usize);
         if !state.vram_history.is_empty() && parts[1].height >= 2 {
             let trend = pixel_history_lines(&state.vram_history, parts[1].width as usize, 1);
             if let Some(line) = trend.into_iter().next() {
@@ -596,11 +607,7 @@ fn pixel_meter(label: &str, percent: f64, width: usize, value: String) -> Line<'
     ])
 }
 
-fn pixel_history_lines(
-    history: &VecDeque<u64>,
-    width: usize,
-    height: usize,
-) -> Vec<Line<'static>> {
+fn pixel_history_lines(history: &VecDeque<u64>, width: usize, height: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let height = height.max(1);
     let start = history.len().saturating_sub(width);
@@ -684,9 +691,21 @@ mod tests {
         let area = Rect::new(0, 0, 120, 3);
         let controls = refresh_controls(area).unwrap();
 
-        assert!(rect_contains(controls.minus, controls.minus.x + 2, controls.minus.y));
-        assert!(rect_contains(controls.plus, controls.plus.x + 2, controls.plus.y));
-        assert!(!rect_contains(controls.minus, controls.plus.x, controls.plus.y));
+        assert!(rect_contains(
+            controls.minus,
+            controls.minus.x + 2,
+            controls.minus.y
+        ));
+        assert!(rect_contains(
+            controls.plus,
+            controls.plus.x + 2,
+            controls.plus.y
+        ));
+        assert!(!rect_contains(
+            controls.minus,
+            controls.plus.x,
+            controls.plus.y
+        ));
     }
 
     #[test]

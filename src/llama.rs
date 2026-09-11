@@ -122,7 +122,10 @@ impl LlamaMonitor {
         );
         stats.prompt_avg_tps = pick_metric(
             &metrics,
-            &["llamacpp:prompt_tokens_seconds", "llamacpp_prompt_tokens_seconds"],
+            &[
+                "llamacpp:prompt_tokens_seconds",
+                "llamacpp_prompt_tokens_seconds",
+            ],
         );
         stats.generation_avg_tps = pick_metric(
             &metrics,
@@ -151,10 +154,8 @@ impl LlamaMonitor {
             &metrics,
             &["llamacpp:n_tokens_max", "llamacpp_n_tokens_max"],
         ) as u64;
-        stats.spec_draft_tokens = pick_metric(
-            &metrics,
-            &["llamacpp:spec_decode_num_draft_tokens_total"],
-        );
+        stats.spec_draft_tokens =
+            pick_metric(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]);
         stats.spec_accepted_tokens = pick_metric(
             &metrics,
             &["llamacpp:spec_decode_num_accepted_tokens_total"],
@@ -292,10 +293,7 @@ fn slot_decoded_tokens(slot: &Value) -> u64 {
             .and_then(|item| item.get("n_decoded"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        Some(Value::Object(map)) => map
-            .get("n_decoded")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        Some(Value::Object(map)) => map.get("n_decoded").and_then(Value::as_u64).unwrap_or(0),
         _ => 0,
     }
 }
@@ -317,7 +315,10 @@ pub(crate) fn parse_prometheus(input: &str) -> HashMap<String, f64> {
             continue;
         };
 
-        let name = name_with_labels.split('{').next().unwrap_or(name_with_labels);
+        let name = name_with_labels
+            .split('{')
+            .next()
+            .unwrap_or(name_with_labels);
         if let Ok(value) = value.parse::<f64>() {
             *metrics.entry(name.to_string()).or_insert(0.0) += value;
         }
@@ -334,8 +335,12 @@ fn pick_metric(metrics: &HashMap<String, f64>, names: &[&str]) -> f64 {
 }
 
 fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str).map(ToOwned::to_owned))
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn json_u64_path(value: &Value, path: &[&str]) -> Option<u64> {
