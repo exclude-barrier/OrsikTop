@@ -6,7 +6,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rust:
@@ -23,21 +23,7 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Apply rustfmt once
-        if: github.event_name == 'push'
-        run: |
-          cargo fmt --all
-          if git diff --quiet -- src; then
-            echo "Sources already formatted."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add src
-            git commit -m "style: format redesigned TUI"
-            git push
-          fi
-
-      - name: Cargo fmt check
+      - name: Cargo fmt
         run: cargo fmt --all -- --check
 
       - name: Cargo check
