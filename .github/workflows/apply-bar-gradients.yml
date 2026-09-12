@@ -1,0 +1,38 @@
+name: Apply bar gradients
+
+on:
+  push:
+    branches: [feat/bar-gradients]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/bar-gradients
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply patch
+        run: python .github/gradient_patch.py
+      - name: Validate
+        run: |
+          cargo fmt --all -- --check || cargo fmt --all
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+      - name: Remove temporary patch files
+        run: |
+          rm .github/gradient_patch.py
+          rm .github/workflows/apply-bar-gradients.yml
+      - name: Commit result
+        run: |
+          git config user.name "exclude-barrier"
+          git config user.email "christopher@cloudfiebig.de"
+          git add -A
+          git commit -m "Add semantic load gradients to meter bars"
+          git push origin HEAD:feat/bar-gradients
