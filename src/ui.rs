@@ -1487,10 +1487,10 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         "↑"
     };
     let title = if sorted.is_empty() {
-        format!(" PROCESSES · {sort_name} {sort_arrow} · 0 ")
+        format!(" PROCESSES · SORT {sort_name} {sort_arrow} · 0 ")
     } else {
         format!(
-            " PROCESSES · {sort_name} {sort_arrow} · {}–{}/{} ",
+            " PROCESSES · SORT {sort_name} {sort_arrow} · {}–{}/{} ",
             start + 1,
             end,
             sorted.len()
@@ -1524,7 +1524,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         )
     };
     frame.render_widget(
-        Paragraph::new(header).style(Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+        Paragraph::new(header),
         Rect::new(inner.x, inner.y, table_width, 1),
     );
     state.process_header_hits = process_header_hits(inner, table_width, wide);
@@ -1606,17 +1606,39 @@ fn process_sort_name(key: ProcessSortKey) -> &'static str {
     }
 }
 
-fn process_header_label(
+fn process_header_button(
     label: &str,
     key: ProcessSortKey,
     active: ProcessSortKey,
     descending: bool,
-) -> String {
-    if key == active {
-        format!("{label}{}", if descending { "↓" } else { "↑" })
+    width: usize,
+    right_align: bool,
+) -> Span<'static> {
+    let is_active = key == active;
+    let arrow = if is_active {
+        if descending {
+            "↓"
+        } else {
+            "↑"
+        }
     } else {
-        label.to_string()
+        "↕"
+    };
+    let button = format!("[{label}{arrow}]");
+    let cell = if right_align {
+        format!("{button:>width$}")
+    } else {
+        format!("{button:<width$}")
+    };
+    let mut style = Style::default()
+        .fg(if is_active { ORK_GREEN } else { CYAN })
+        .add_modifier(Modifier::BOLD);
+    if is_active {
+        style = style
+            .bg(PROCESS_SELECTED_BG)
+            .add_modifier(Modifier::UNDERLINED);
     }
+    Span::styled(cell, style)
 }
 
 fn process_header_hits(inner: Rect, table_width: u16, wide: bool) -> Vec<ProcessHeaderHit> {
@@ -1697,29 +1719,52 @@ fn draw_process_scrollbar(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn process_header_compact(width: usize, active: ProcessSortKey, descending: bool) -> String {
+fn process_header_compact(width: usize, active: ProcessSortKey, descending: bool) -> Line<'static> {
     let fixed = 7 + 7 + 9 + 6;
-    let program_width = width.saturating_sub(fixed).max(8);
-    let pid = process_header_label("PID", ProcessSortKey::Pid, active, descending);
-    let program = process_header_label("PROGRAM", ProcessSortKey::Program, active, descending);
-    let cpu = process_header_label("CPU%", ProcessSortKey::Cpu, active, descending);
-    let memory = process_header_label("MEM", ProcessSortKey::Memory, active, descending);
-    let threads = process_header_label("THR", ProcessSortKey::Threads, active, descending);
-    format!(" {pid:<6}{program:<program_width$}{cpu:>6} {memory:>8} {threads:>5}")
+    let program_width = width.saturating_sub(fixed).max(10);
+    Line::from(vec![
+        Span::raw(" "),
+        process_header_button("PID", ProcessSortKey::Pid, active, descending, 6, false),
+        process_header_button(
+            "PROGRAM",
+            ProcessSortKey::Program,
+            active,
+            descending,
+            program_width,
+            false,
+        ),
+        process_header_button("CPU", ProcessSortKey::Cpu, active, descending, 6, true),
+        Span::raw(" "),
+        process_header_button("MEM", ProcessSortKey::Memory, active, descending, 8, true),
+        Span::raw(" "),
+        process_header_button("THR", ProcessSortKey::Threads, active, descending, 5, true),
+    ])
 }
 
-fn process_header_wide(width: usize, active: ProcessSortKey, descending: bool) -> String {
+fn process_header_wide(width: usize, active: ProcessSortKey, descending: bool) -> Line<'static> {
     let fixed = 7 + 17 + 7 + 9 + 6;
     let command_width = width.saturating_sub(fixed).max(12);
-    let pid = process_header_label("PID", ProcessSortKey::Pid, active, descending);
-    let program = process_header_label("PROGRAM", ProcessSortKey::Program, active, descending);
-    let cpu = process_header_label("CPU%", ProcessSortKey::Cpu, active, descending);
-    let memory = process_header_label("MEM", ProcessSortKey::Memory, active, descending);
-    let threads = process_header_label("THR", ProcessSortKey::Threads, active, descending);
-    format!(
-        " {pid:<6}{program:<16}{:<command_width$}{cpu:>6} {memory:>8} {threads:>5}",
-        "COMMAND"
-    )
+    Line::from(vec![
+        Span::raw(" "),
+        process_header_button("PID", ProcessSortKey::Pid, active, descending, 6, false),
+        process_header_button(
+            "PROGRAM",
+            ProcessSortKey::Program,
+            active,
+            descending,
+            16,
+            false,
+        ),
+        Span::styled(
+            format!("{:<command_width$}", "COMMAND"),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        process_header_button("CPU", ProcessSortKey::Cpu, active, descending, 6, true),
+        Span::raw(" "),
+        process_header_button("MEM", ProcessSortKey::Memory, active, descending, 8, true),
+        Span::raw(" "),
+        process_header_button("THR", ProcessSortKey::Threads, active, descending, 5, true),
+    ])
 }
 
 fn process_line_compact(process: &ProcessStats, width: usize, selected: bool) -> Line<'static> {
@@ -1883,8 +1928,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let help =
-        format!(" [q] quit  [-]/[+] refresh  [↑/↓ Pg] proc  [click] sort  {refresh_ms} ms  ");
+    let help = format!(
+        " [q] quit  [-]/[+] refresh  [↑/↓ Pg] proc  [click header] sort  {refresh_ms} ms  "
+    );
     let help_width = help.chars().count() as u16;
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(MUTED)),
