@@ -312,9 +312,21 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         Line::from(vec![
             label_span(" BUS    "),
             data_pair("MEMCTRL", format!("{:.0}%", gpu.memory_utilization), CYAN),
-            data_pair("ENC", optional_number(gpu.encoder_utilization, 0, "%"), WHITE),
-            data_pair("DEC", optional_number(gpu.decoder_utilization, 0, "%"), WHITE),
-            data_pair("PCIe RX", optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"), CYAN),
+            data_pair(
+                "ENC",
+                optional_number(gpu.encoder_utilization, 0, "%"),
+                WHITE,
+            ),
+            data_pair(
+                "DEC",
+                optional_number(gpu.decoder_utilization, 0, "%"),
+                WHITE,
+            ),
+            data_pair(
+                "PCIe RX",
+                optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                CYAN,
+            ),
             data_pair("TX", optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"), CYAN),
         ]),
     ];
