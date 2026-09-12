@@ -69,6 +69,7 @@ pub fn run(
 
     loop {
         while let Ok(next) = fast_rx.try_recv() {
+            ui_state.clamp_process_selection(next.system.processes.len());
             ui_state.push_sample(&next.gpu, &next.system);
             snapshot.gpu = next.gpu;
             snapshot.system = next.system;
@@ -99,21 +100,42 @@ pub fn run(
                     KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => {
                         change_refresh(&mut refresh_ms, true, &refresh_shared);
                     }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        ui_state.move_process_selection(-1, snapshot.system.processes.len());
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        ui_state.move_process_selection(1, snapshot.system.processes.len());
+                    }
+                    KeyCode::PageUp => {
+                        ui_state.move_process_selection(-10, snapshot.system.processes.len());
+                    }
+                    KeyCode::PageDown => {
+                        ui_state.move_process_selection(10, snapshot.system.processes.len());
+                    }
+                    KeyCode::Home => ui_state.process_home(),
+                    KeyCode::End => ui_state.process_end(snapshot.system.processes.len()),
                     _ => {}
                 },
-                Event::Mouse(mouse)
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-                {
-                    let (width, _) = crossterm::terminal::size()?;
-                    let header = Rect::new(0, 0, width, 3);
-                    if let Some(controls) = ui::refresh_controls(header) {
-                        if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
-                            change_refresh(&mut refresh_ms, false, &refresh_shared);
-                        } else if ui::rect_contains(controls.plus, mouse.column, mouse.row) {
-                            change_refresh(&mut refresh_ms, true, &refresh_shared);
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let (width, _) = crossterm::terminal::size()?;
+                        let header = Rect::new(0, 0, width, 3);
+                        if let Some(controls) = ui::refresh_controls(header) {
+                            if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
+                                change_refresh(&mut refresh_ms, false, &refresh_shared);
+                            } else if ui::rect_contains(controls.plus, mouse.column, mouse.row) {
+                                change_refresh(&mut refresh_ms, true, &refresh_shared);
+                            }
                         }
                     }
-                }
+                    MouseEventKind::ScrollUp => {
+                        ui_state.move_process_selection(-3, snapshot.system.processes.len());
+                    }
+                    MouseEventKind::ScrollDown => {
+                        ui_state.move_process_selection(3, snapshot.system.processes.len());
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
