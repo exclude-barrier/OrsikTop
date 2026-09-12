@@ -84,7 +84,7 @@ pub fn run(
                 &snapshot.system,
                 &snapshot.llm,
                 &snapshot.gpu,
-                &ui_state,
+                &mut ui_state,
                 server,
                 refresh_ms,
             )
@@ -120,18 +120,35 @@ pub fn run(
                     MouseEventKind::Down(MouseButton::Left) => {
                         let (width, _) = crossterm::terminal::size()?;
                         let header = Rect::new(0, 0, width, 3);
+                        let mut handled = false;
                         if let Some(controls) = ui::refresh_controls(header) {
                             if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
                                 change_refresh(&mut refresh_ms, false, &refresh_shared);
+                                handled = true;
                             } else if ui::rect_contains(controls.plus, mouse.column, mouse.row) {
                                 change_refresh(&mut refresh_ms, true, &refresh_shared);
+                                handled = true;
                             }
                         }
+                        if !handled && ui_state.click_process_sort(mouse.column, mouse.row) {
+                            handled = true;
+                        }
+                        if !handled {
+                            ui_state.click_process_row(
+                                mouse.column,
+                                mouse.row,
+                                snapshot.system.processes.len(),
+                            );
+                        }
                     }
-                    MouseEventKind::ScrollUp => {
+                    MouseEventKind::ScrollUp
+                        if ui_state.process_pane_contains(mouse.column, mouse.row) =>
+                    {
                         ui_state.move_process_selection(-3, snapshot.system.processes.len());
                     }
-                    MouseEventKind::ScrollDown => {
+                    MouseEventKind::ScrollDown
+                        if ui_state.process_pane_contains(mouse.column, mouse.row) =>
+                    {
                         ui_state.move_process_selection(3, snapshot.system.processes.len());
                     }
                     _ => {}
@@ -253,7 +270,7 @@ fn spawn_fast_worker(
 }
 
 fn collect_process_stats(system: &System) -> Vec<ProcessStats> {
-    let mut processes = system
+    system
         .processes()
         .iter()
         .map(|(pid, process)| {
@@ -273,16 +290,7 @@ fn collect_process_stats(system: &System) -> Vec<ProcessStats> {
                 threads: read_process_thread_count(pid_u32).unwrap_or(1),
             }
         })
-        .collect::<Vec<_>>();
-
-    processes.sort_by(|a, b| {
-        b.cpu_pct
-            .total_cmp(&a.cpu_pct)
-            .then_with(|| b.memory_bytes.cmp(&a.memory_bytes))
-            .then_with(|| a.pid.cmp(&b.pid))
-    });
-    processes.truncate(256);
-    processes
+        .collect()
 }
 
 fn read_process_thread_count(pid: u32) -> Option<usize> {
