@@ -1,0 +1,144 @@
+name: Apply MTP status patch
+
+on:
+  push:
+    branches:
+      - feat/mtp-status
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/mtp-status
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Patch speculative status and acceptance display
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f'target not found: {label}')
+              return text.replace(old, new, 1)
+
+          p = Path('src/llama.rs')
+          s = p.read_text()
+          s = replace_once(
+              s,
+              '    pub spec_drafts_total: f64,\n    pub spec_draft_tokens: f64,\n    pub spec_accepted_tokens: f64,\n    pub spec_acceptance_pct: Option<f64>,\n',
+              '    pub spec_drafts_total: f64,\n    pub spec_draft_tokens: f64,\n    pub spec_accepted_tokens: f64,\n    pub spec_enabled: bool,\n    pub spec_n_max: Option<u64>,\n    pub spec_acceptance_pct: Option<f64>,\n',
+              'llm speculative fields',
+          )
+          s = replace_once(
+              s,
+              'struct CachedProps {\n    model: String,\n    context_size: u64,\n    total_slots: u64,\n    last_refresh: Option<Instant>,\n}',
+              'struct CachedProps {\n    model: String,\n    context_size: u64,\n    total_slots: u64,\n    spec_enabled: bool,\n    spec_n_max: Option<u64>,\n    last_refresh: Option<Instant>,\n}',
+              'cached speculative fields',
+          )
+          s = replace_once(
+              s,
+              '        stats.context_size = self.props.context_size;\n        stats.props_slot_count = self.props.total_slots;\n',
+              '        stats.context_size = self.props.context_size;\n        stats.props_slot_count = self.props.total_slots;\n        stats.spec_enabled = self.props.spec_enabled;\n        stats.spec_n_max = self.props.spec_n_max;\n',
+              'copy speculative props',
+          )
+          s = replace_once(
+              s,
+              '        stats.spec_accepted_tokens = pick_metric(\n            &metrics,\n            &["llamacpp:spec_decode_num_accepted_tokens_total"],\n        );\n\n        let metric_live = self.update_metric_counters(&mut stats);\n',
+              '        stats.spec_accepted_tokens = pick_metric(\n            &metrics,\n            &["llamacpp:spec_decode_num_accepted_tokens_total"],\n        );\n        if stats.spec_drafts_total > 0.0\n            || stats.spec_draft_tokens > 0.0\n            || stats.spec_accepted_tokens > 0.0\n        {\n            stats.spec_enabled = true;\n        }\n\n        let metric_live = self.update_metric_counters(&mut stats);\n',
+              'metrics imply speculative enabled',
+          )
+          s = replace_once(
+              s,
+              '        self.props.total_slots = props\n            .get("total_slots")\n            .and_then(Value::as_u64)\n            .unwrap_or(self.props.total_slots);\n\n        let model = json_string(&props, &["model_name", "model_alias", "model_path"])\n',
+              '        self.props.total_slots = props\n            .get("total_slots")\n            .and_then(Value::as_u64)\n            .unwrap_or(self.props.total_slots);\n\n        if let Some(defaults) = props.get("default_generation_settings") {\n            let (enabled, n_max) = speculative_config(defaults);\n            if let Some(enabled) = enabled {\n                self.props.spec_enabled = enabled;\n            }\n            if let Some(n_max) = n_max {\n                self.props.spec_n_max = (n_max > 0).then_some(n_max);\n                if n_max > 0 {\n                    self.props.spec_enabled = true;\n                }\n            }\n        }\n\n        let model = json_string(&props, &["model_name", "model_alias", "model_path"])\n',
+              'parse speculative props',
+          )
+          s = replace_once(
+              s,
+              '        let is_processing = slot\n            .get("is_processing")\n            .and_then(Value::as_bool)\n            .unwrap_or(false);\n        if is_processing {\n            busy += 1;\n        }\n\n        let prompt_tokens = slot\n',
+              '        let is_processing = slot\n            .get("is_processing")\n            .and_then(Value::as_bool)\n            .unwrap_or(false);\n        if is_processing {\n            busy += 1;\n        }\n\n        let (slot_spec_enabled, slot_spec_n_max) = speculative_config(slot);\n        if slot_spec_enabled.unwrap_or(false) || slot_spec_n_max.is_some_and(|value| value > 0) {\n            stats.spec_enabled = true;\n        }\n        if let Some(n_max) = slot_spec_n_max.filter(|value| *value > 0) {\n            stats.spec_n_max = Some(stats.spec_n_max.map_or(n_max, |current| current.max(n_max)));\n        }\n\n        let prompt_tokens = slot\n',
+              'parse speculative slots',
+          )
+          marker = 'fn slot_delta_tps(previous: &[SlotCounter], current: &[SlotCounter], seconds: f64) -> (f64, f64) {'
+          helper = '''fn speculative_config(value: &Value) -> (Option<bool>, Option<u64>) {\n    let enabled = value.get("speculative").and_then(Value::as_bool);\n    let n_max = value\n        .get("params")\n        .and_then(|params| params.get("speculative.n_max"))\n        .and_then(Value::as_u64);\n    (enabled, n_max)\n}\n\n'''
+          if marker not in s:
+              raise SystemExit('target not found: speculative helper insertion')
+          s = s.replace(marker, helper + marker, 1)
+          p.write_text(s)
+
+          p = Path('src/ui.rs')
+          s = p.read_text()
+          old = '''    let (mtp, mtp_color) = match llm.spec_acceptance_pct {\n        Some(value) => (format!("{value:.0}%"), ORK_GREEN),\n        None => ("—".to_string(), MUTED),\n    };\n'''
+          new = '''    let (mtp, mtp_color) = if llm.spec_enabled {\n        (\n            llm.spec_n_max\n                .filter(|value| *value > 0)\n                .map(|value| format!("MTP{value}"))\n                .unwrap_or_else(|| "MTP".to_string()),\n            CYAN,\n        )\n    } else {\n        ("MTP OFF".to_string(), MUTED)\n    };\n    let (acc, acc_color) = match llm.spec_acceptance_pct {\n        Some(value) => (format!("{value:.0}%"), ORK_GREEN),\n        None => ("—".to_string(), MUTED),\n    };\n'''
+          s = replace_once(s, old, new, 'mtp and acceptance display values')
+          old = '''            label_span("MTP "),\n            value_span(&mtp, mtp_color),\n'''
+          new = '''            value_span(&mtp, mtp_color),\n            Span::raw("    "),\n            label_span("ACC "),\n            value_span(&acc, acc_color),\n'''
+          s = replace_once(s, old, new, 'state row mtp acceptance')
+          p.write_text(s)
+
+          # Add focused unit coverage without touching existing fixtures.
+          p = Path('src/llama.rs')
+          s = p.read_text()
+          test = r'''
+
+#[cfg(test)]
+mod speculative_status_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_speculative_status_and_n_max_from_slot_shape() {
+        let slot = json!({
+            "speculative": true,
+            "params": {"speculative.n_max": 3}
+        });
+        assert_eq!(speculative_config(&slot), (Some(true), Some(3)));
+    }
+
+    #[test]
+    fn slot_telemetry_marks_speculative_enabled() {
+        let mut stats = LlmStats::default();
+        let slots = json!([{
+            "id": 0,
+            "id_task": 11,
+            "n_ctx": 4096,
+            "speculative": true,
+            "is_processing": true,
+            "params": {"speculative.n_max": 3},
+            "n_prompt_tokens": 128,
+            "n_prompt_tokens_processed": 128,
+            "next_token": {"n_decoded": 9}
+        }]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert!(stats.spec_enabled);
+        assert_eq!(stats.spec_n_max, Some(3));
+    }
+}
+'''
+          if 'mod speculative_status_tests {' not in s:
+              s += test
+          p.write_text(s)
+          PY
+
+          cargo fmt --all
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+      - name: Remove temporary workflow
+        run: rm .github/workflows/apply-mtp-status.yml
+      - name: Commit result
+        shell: bash
+        run: |
+          git config user.name "exclude-barrier"
+          git config user.email "christopher@cloudfiebig.de"
+          git add src/llama.rs src/ui.rs .github/workflows/apply-mtp-status.yml
+          git commit -m "Separate MTP status from acceptance"
+          git push origin HEAD:feat/mtp-status
