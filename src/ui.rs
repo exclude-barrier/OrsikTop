@@ -104,7 +104,7 @@ pub fn draw(
         return;
     }
 
-    let llm_height = if llm.connected { 9 } else { 5 };
+    let llm_height = if llm.connected { 10 } else { 5 };
     let history_required = 3 + 7 + llm_height + 5 + 3;
     let show_history = area.height >= history_required;
 
@@ -444,30 +444,71 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         None => ("—".to_string(), MUTED),
     };
     let (phase, phase_color) = llm_phase(llm);
+
     let live_pp = if llm.prompt_tps > 0.05 {
-        format!("{:>7.1} tok/s", llm.prompt_tps)
+        format!("{:.1} tok/s", llm.prompt_tps)
     } else {
-        "      — tok/s".to_string()
+        "— tok/s".to_string()
     };
     let live_tg = if llm.generation_tps > 0.05 {
-        format!("{:>7.1} tok/s", llm.generation_tps)
+        format!("{:.1} tok/s", llm.generation_tps)
     } else {
-        "      — tok/s".to_string()
+        "— tok/s".to_string()
     };
     let request_pp = if llm.busy_slots > 0 {
-        llm.request_prompt_tokens.to_string()
+        format!("{} tok", grouped_u64(llm.request_prompt_tokens))
     } else {
-        "—".to_string()
+        "— tok".to_string()
     };
     let request_tg = if llm.busy_slots > 0 {
-        llm.request_generated_tokens.to_string()
+        format!("{} tok", grouped_u64(llm.request_generated_tokens))
     } else {
-        "—".to_string()
+        "— tok".to_string()
     };
+    let total_pp = format!("{} tok", grouped_f64(llm.prompt_total));
+    let total_tg = format!("{} tok", grouped_f64(llm.generated_total));
     let cache = llm
         .prompt_cached_total
-        .map(|value| format!("{value:.0}"))
+        .map(grouped_f64)
         .unwrap_or_else(|| "—".to_string());
+
+    let metric_width = ((inner.width as usize).saturating_sub(10) / 2).clamp(16, 30);
+    let mut state = vec![
+        label_span(" STATE    "),
+        value_span(phase, phase_color),
+        llm_sep(),
+        label_span("SLOT "),
+        value_span(&slots, CYAN),
+        llm_sep(),
+        label_span("QUEUE "),
+        value_span(&format!("{:.0}", llm.deferred_requests), WHITE),
+        llm_sep(),
+        value_span(&mtp, mtp_color),
+        llm_sep(),
+        label_span("ACC "),
+        value_span(&acc, acc_color),
+    ];
+    if inner.width < 66 {
+        state = vec![
+            label_span(" STATE    "),
+            value_span(phase, phase_color),
+            Span::raw("  "),
+            label_span("SLOT "),
+            value_span(&slots, CYAN),
+            Span::raw("  "),
+            value_span(&mtp, mtp_color),
+        ];
+    }
+
+    let mut total_line = vec![
+        label_span(" TOTAL    "),
+        llm_metric_cell(&total_pp, metric_width, WHITE, false),
+        llm_metric_cell(&total_tg, metric_width, WHITE, false),
+    ];
+    if inner.width >= 78 {
+        total_line.push(label_span("CACHE "));
+        total_line.push(value_span(&cache, CYAN));
+    }
 
     let mut lines = vec![
         Line::from(vec![
@@ -477,57 +518,38 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
                 Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
             ),
         ]),
+        Line::from(state),
         Line::from(vec![
-            label_span(" STATE    "),
-            value_span(phase, phase_color),
-            Span::raw("    "),
-            label_span("SLOT "),
-            value_span(&slots, CYAN),
-            Span::raw("    "),
-            label_span("QUEUED "),
-            value_span(&format!("{:.0}", llm.deferred_requests), WHITE),
-            Span::raw("    "),
-            value_span(&mtp, mtp_color),
-            Span::raw("    "),
-            label_span("ACC "),
-            value_span(&acc, acc_color),
+            label_span("          "),
+            llm_metric_cell("PREFILL / PP", metric_width, CYAN, true),
+            llm_metric_cell("DECODE / TG", metric_width, ORK_GREEN, true),
         ]),
         Line::from(vec![
             label_span(" LIVE     "),
-            Span::styled(format!("PP {live_pp}"), Style::default().fg(CYAN)),
-            Span::raw("    "),
-            Span::styled(
-                format!("TG {live_tg}"),
-                Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
-            ),
+            llm_metric_cell(&live_pp, metric_width, CYAN, llm.prompt_tps > 0.05),
+            llm_metric_cell(&live_tg, metric_width, ORK_GREEN, llm.generation_tps > 0.05),
         ]),
         Line::from(vec![
             label_span(" SERVER   "),
-            Span::styled(
-                format!("PP {:>7.1} tok/s", llm.prompt_avg_tps),
-                Style::default().fg(MUTED),
+            llm_metric_cell(
+                &format!("{:.1} tok/s", llm.prompt_avg_tps),
+                metric_width,
+                MUTED,
+                false,
             ),
-            Span::raw("    "),
-            Span::styled(
-                format!("TG {:>7.1} tok/s", llm.generation_avg_tps),
-                Style::default().fg(MUTED),
+            llm_metric_cell(
+                &format!("{:.1} tok/s", llm.generation_avg_tps),
+                metric_width,
+                MUTED,
+                false,
             ),
         ]),
         Line::from(vec![
             label_span(" REQUEST  "),
-            value_span(&format!("PP {request_pp}"), WHITE),
-            Span::raw("    "),
-            value_span(&format!("TG {request_tg}"), WHITE),
+            llm_metric_cell(&request_pp, metric_width, WHITE, false),
+            llm_metric_cell(&request_tg, metric_width, WHITE, false),
         ]),
-        Line::from(vec![
-            label_span(" TOTAL    "),
-            value_span(&format!("PP {:.0}", llm.prompt_total), WHITE),
-            Span::raw("    "),
-            value_span(&format!("TG {:.0}", llm.generated_total), WHITE),
-            Span::raw("    "),
-            label_span("CACHE "),
-            value_span(&cache, CYAN),
-        ]),
+        Line::from(total_line),
         meter_line(
             "CTX",
             context_pct,
@@ -536,7 +558,11 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             format!("{:>5.1}%", context_pct),
             vec![Span::styled(
                 if llm.context_size > 0 {
-                    format!(" {context_used} / {} tok", llm.context_size)
+                    format!(
+                        " {} / {} tok",
+                        grouped_u64(context_used),
+                        grouped_u64(llm.context_size)
+                    )
                 } else {
                     " waiting for context".to_string()
                 },
@@ -547,6 +573,38 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
 
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn llm_metric_cell(text: &str, width: usize, color: Color, bold: bool) -> Span<'static> {
+    let mut style = Style::default().fg(color);
+    if bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Span::styled(format!("{text:<width$}"), style)
+}
+
+fn llm_sep() -> Span<'static> {
+    Span::styled("  │  ", Style::default().fg(INNER_GREEN))
+}
+
+fn grouped_u64(value: u64) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, ch) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn grouped_f64(value: f64) -> String {
+    if value.is_finite() && value >= 0.0 {
+        grouped_u64(value.round() as u64)
+    } else {
+        "—".to_string()
+    }
 }
 
 fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
@@ -882,7 +940,7 @@ fn bar_gradient_color(label: &str, level: f64, fallback: Color) -> Color {
         "GPU" | "CPU" => &[(0.0, DARK_GREEN), (100.0, ORK_GREEN)],
         "VRAM" => &[
             (0.0, DARK_CYAN),
-            (80.0, CYAN),
+            (90.0, CYAN),
             (95.0, YELLOW),
             (98.0, ORANGE),
             (100.0, RED),
@@ -1277,10 +1335,19 @@ mod tests {
     #[test]
     fn bar_gradients_use_expected_endpoints() {
         assert_eq!(bar_gradient_color("GPU", 100.0, WHITE), ORK_GREEN);
+        assert_eq!(bar_gradient_color("VRAM", 90.0, WHITE), CYAN);
         assert_eq!(bar_gradient_color("VRAM", 100.0, WHITE), RED);
         assert_eq!(bar_gradient_color("PWR", 100.0, WHITE), RED);
         assert_eq!(bar_gradient_color("CTX", 100.0, WHITE), RED);
         assert_eq!(bar_gradient_color("OTHER", 50.0, CYAN), CYAN);
+    }
+
+    #[test]
+    fn token_counts_are_grouped_for_readability() {
+        assert_eq!(grouped_u64(999), "999");
+        assert_eq!(grouped_u64(1_000), "1,000");
+        assert_eq!(grouped_u64(196_608), "196,608");
+        assert_eq!(grouped_f64(447_924.0), "447,924");
     }
 
     #[test]
