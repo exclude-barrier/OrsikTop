@@ -18,10 +18,19 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Apply patch
-        run: python .github/gradient_patch.py
+        run: |
+          python .github/gradient_patch.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/ui.rs')
+          s = p.read_text()
+          s = s.replace('\nfn fine_bar(percent: f64, width: usize) -> (String, String) {', '\n#[cfg(test)]\nfn fine_bar(percent: f64, width: usize) -> (String, String) {', 1)
+          p.write_text(s)
+          PY
       - name: Validate
         run: |
-          cargo fmt --all -- --check || cargo fmt --all
+          cargo fmt --all
+          cargo fmt --all -- --check
           cargo check --all-targets --locked
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --all-targets --locked
