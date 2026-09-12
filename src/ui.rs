@@ -24,6 +24,7 @@ const REFRESH_CONTROL_WIDTH: u16 = 22;
 const BG_BLACK: Color = Color::Rgb(0, 0, 0);
 const BAR_EMPTY: Color = Color::Rgb(48, 52, 48);
 const ORK_GREEN: Color = Color::Rgb(105, 210, 70);
+const BRIGHT_GREEN: Color = Color::Rgb(150, 235, 95);
 const DIM_GREEN: Color = Color::Rgb(70, 135, 60);
 const INNER_GREEN: Color = Color::Rgb(42, 83, 48);
 const MUTED: Color = Color::Rgb(145, 150, 145);
@@ -113,7 +114,7 @@ pub fn draw(
         return;
     }
 
-    let llm_height = if llm.connected { 10 } else { 5 };
+    let llm_height = if llm.connected { 12 } else { 5 };
     let history_required = 3 + 7 + llm_height + 5 + 3;
     let show_history = area.height >= history_required;
 
@@ -659,7 +660,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     );
     let bar_width = inner.width.saturating_sub(16).max(8) as usize;
 
-    if inner.width < 34 || inner.height < 8 {
+    if inner.width < 35 || inner.height < 10 {
         let mut lines = vec![
             meter_line(
                 "CPU",
@@ -700,7 +701,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     let frequency = system
         .cpu_frequency_mhz
         .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| format!("{:.2}G", value / 1000.0))
+        .map(|value| format!("{:.2} GHz", value / 1000.0))
         .unwrap_or_else(|| "—".to_string());
     let temperature = system
         .cpu_temperature_c
@@ -717,10 +718,6 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "—".to_string());
 
-    let max_per_row = inner.width.saturating_sub(11).max(1) as usize;
-    let displayed_cores = system.per_cpu_usage.len().min(max_per_row * 2);
-    let first_end = displayed_cores.div_ceil(2);
-
     let lines = vec![
         meter_line(
             "CPU",
@@ -731,11 +728,11 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
             vec![],
         ),
         Line::from(vec![
-            label_span(" FREQ "),
+            label_span("      "),
             value_span(&frequency, CYAN),
-            label_span("  TEMP "),
+            label_span("   "),
             value_span(&temperature, temperature_tint),
-            label_span("  IOW "),
+            label_span("   IOW "),
             value_span(
                 &io_wait,
                 if system.io_wait_pct.unwrap_or(0.0) >= 10.0 {
@@ -745,6 +742,10 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                 },
             ),
         ]),
+        core_matrix_line(&system.per_cpu_usage, 0),
+        core_matrix_line(&system.per_cpu_usage, 1),
+        core_matrix_line(&system.per_cpu_usage, 2),
+        core_matrix_line(&system.per_cpu_usage, 3),
         Line::from(vec![
             label_span(" LOAD "),
             value_span(
@@ -755,8 +756,6 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                 WHITE,
             ),
         ]),
-        core_usage_line(&system.per_cpu_usage, 0, first_end),
-        core_usage_line(&system.per_cpu_usage, first_end, displayed_cores),
         meter_line(
             "RAM",
             ram_pct,
@@ -766,7 +765,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
             vec![],
         ),
         Line::from(vec![
-            label_span(" USED "),
+            label_span("      "),
             value_span(
                 &format!(
                     "{:.1} / {:.1} GiB",
@@ -796,23 +795,46 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn core_usage_line(usages: &[f64], start: usize, end: usize) -> Line<'static> {
-    if start >= end || start >= usages.len() {
-        return Line::from(vec![label_span(" CORES     "), value_span("—", MUTED)]);
+fn core_matrix_line(usages: &[f64], row: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    let mut rendered = false;
+
+    for column in 0..6 {
+        let index = row + column * 4;
+        let Some(usage) = usages.get(index).copied() else {
+            continue;
+        };
+
+        if rendered {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("{index:02} "),
+            Style::default().fg(MUTED),
+        ));
+        spans.push(Span::styled(
+            core_usage_glyph(usage).to_string(),
+            Style::default()
+                .fg(core_usage_color(usage))
+                .add_modifier(Modifier::BOLD),
+        ));
+        rendered = true;
     }
 
-    let end = end.min(usages.len());
-    let mut spans = vec![Span::styled(
-        format!(" C{start:02}-{:02}  ", end - 1),
-        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-    )];
-    for usage in &usages[start..end] {
-        spans.push(Span::styled(
-            core_usage_glyph(*usage).to_string(),
-            Style::default().fg(bar_gradient_color("CPU", clamp_percent(*usage), ORK_GREEN)),
-        ));
+    if !rendered {
+        spans.push(value_span("CORES —", MUTED));
     }
     Line::from(spans)
+}
+
+fn core_usage_color(usage: f64) -> Color {
+    match clamp_percent(usage) {
+        value if value >= 90.0 => ORANGE,
+        value if value >= 75.0 => YELLOW,
+        value if value >= 50.0 => BRIGHT_GREEN,
+        value if value >= 25.0 => ORK_GREEN,
+        _ => DIM_GREEN,
+    }
 }
 
 fn core_usage_glyph(usage: f64) -> char {
@@ -1387,6 +1409,16 @@ mod tests {
         assert_eq!(core_usage_glyph(50.0), '▅');
         assert_eq!(core_usage_glyph(87.5), '█');
         assert_eq!(core_usage_glyph(100.0), '█');
+    }
+
+    #[test]
+    fn core_usage_color_uses_non_red_load_scale() {
+        assert_eq!(core_usage_color(0.0), DIM_GREEN);
+        assert_eq!(core_usage_color(25.0), ORK_GREEN);
+        assert_eq!(core_usage_color(50.0), BRIGHT_GREEN);
+        assert_eq!(core_usage_color(75.0), YELLOW);
+        assert_eq!(core_usage_color(90.0), ORANGE);
+        assert_eq!(core_usage_color(100.0), ORANGE);
     }
 
     #[test]
