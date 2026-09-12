@@ -268,10 +268,11 @@ impl LlamaMonitor {
         if let Some(previous_at) = self.previous_metrics.at {
             let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
             if seconds > 0.0 {
-                live.0 = counter_delta(stats.prompt_total, self.previous_metrics.prompt_total)
-                    / seconds;
-                live.1 = counter_delta(stats.generated_total, self.previous_metrics.generated_total)
-                    / seconds;
+                live.0 =
+                    counter_delta(stats.prompt_total, self.previous_metrics.prompt_total) / seconds;
+                live.1 =
+                    counter_delta(stats.generated_total, self.previous_metrics.generated_total)
+                        / seconds;
             }
 
             let draft_delta =
