@@ -56,9 +56,33 @@ Unsupported NVML fields are shown as unavailable (`—`) instead of being report
 
 ### System
 
-- CPU utilization
-- RAM used / total
-- 60-second CPU/RAM history
+- CPU utilization, frequency, package temperature, load and I/O wait
+- automatic Intel P-core / E-core topology grouping when Linux exposes it
+- RAM and swap usage
+- process list with sorting, scrolling and pinned processes
+- 60-second GPU/VRAM/CPU/RAM history
+
+## Install
+
+From a local checkout:
+
+```bash
+git clone https://github.com/exclude-barrier/OrsikTop.git
+cd OrsikTop
+cargo install --path . --locked --force
+```
+
+Or directly from GitHub:
+
+```bash
+cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
+```
+
+Cargo installs the binary as `orsiktop` (normally into `~/.cargo/bin`). With that directory in your `PATH`, start it exactly like btop:
+
+```bash
+orsiktop
+```
 
 ## Quick start
 
@@ -74,22 +98,30 @@ If you use the newer CLI form:
 llama serve -hf user/model:Q4_K_M --metrics
 ```
 
-Then run OrsikTop:
+Then simply run:
 
 ```bash
-cargo run --release -- --server http://127.0.0.1:8080
+orsiktop
+```
+
+When `--server` / `ORSIKTOP_SERVER` is not set, OrsikTop scans local `/proc` entries for a running `llama-server` or `llama serve` process and derives its `--host` and `--port` automatically. A wildcard bind such as `0.0.0.0` is reached through loopback. If no local llama.cpp process is found, OrsikTop still starts and falls back to the standard `http://127.0.0.1:8080` endpoint, so GPU/system/process telemetry remains available while the LLM panel reports the server as offline.
+
+Manual server override remains available:
+
+```bash
+orsiktop --server http://127.0.0.1:8081
 ```
 
 For a 500 ms telemetry interval:
 
 ```bash
-cargo run --release -- --server http://127.0.0.1:8080 --interval-ms 500
+orsiktop --interval-ms 500
 ```
 
 To monitor another NVIDIA GPU:
 
 ```bash
-cargo run --release -- --gpu-index 1
+orsiktop --gpu-index 1
 ```
 
 ## Controls
@@ -99,6 +131,10 @@ cargo run --release -- --gpu-index 1
 | Quit | `q` or `Esc` |
 | Faster refresh | click `[ - ]`, `-` or `[` |
 | Slower refresh | click `[ + ]`, `+` or `]` |
+| Process navigation | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn`, `Home` / `End`, mouse wheel |
+| Pin process | click process row |
+| Unpin process | click away from process row |
+| Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` header |
 
 Refresh can be changed live from **100 ms to 10,000 ms** in 100 ms steps. GPU telemetry follows that interval; CPU/RAM are refreshed on a lower-overhead cadence and llama.cpp HTTP polling runs independently so a slow `/metrics` or `/slots` response does not stall GPU updates.
 
@@ -106,9 +142,11 @@ Refresh can be changed live from **100 ms to 10,000 ms** in 100 ms steps. GPU te
 
 | Option | Environment variable | Default |
 | --- | --- | --- |
-| `--server` | `ORSIKTOP_SERVER` | `http://127.0.0.1:8080` |
+| `--server` | `ORSIKTOP_SERVER` | auto-discover local llama.cpp; fallback `http://127.0.0.1:8080` |
 | `--interval-ms`, `-i` | `ORSIKTOP_INTERVAL_MS` | `1000` |
 | `--gpu-index` | `ORSIKTOP_GPU_INDEX` | `0` |
+
+Explicit `--server` and `ORSIKTOP_SERVER` values take precedence over auto-discovery.
 
 ## Build
 
@@ -127,7 +165,7 @@ The code deliberately stays small:
 
 ```text
 src/
-├── main.rs   terminal setup + CLI
+├── main.rs   terminal setup + CLI + local llama.cpp discovery
 ├── app.rs    event loop + fast/LLM telemetry workers
 ├── llama.rs  llama.cpp /metrics, /slots and /props
 ├── gpu.rs    NVIDIA NVML telemetry
