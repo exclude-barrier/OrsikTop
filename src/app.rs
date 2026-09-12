@@ -69,7 +69,7 @@ pub fn run(
 
     loop {
         while let Ok(next) = fast_rx.try_recv() {
-            ui_state.clamp_process_selection(next.system.processes.len());
+            ui_state.clamp_process_selection(&next.system.processes);
             ui_state.push_sample(&next.gpu, &next.system);
             snapshot.gpu = next.gpu;
             snapshot.system = next.system;
@@ -101,23 +101,30 @@ pub fn run(
                         change_refresh(&mut refresh_ms, true, &refresh_shared);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        ui_state.move_process_selection(-1, snapshot.system.processes.len());
+                        ui_state.move_process_selection(-1, &snapshot.system.processes);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        ui_state.move_process_selection(1, snapshot.system.processes.len());
+                        ui_state.move_process_selection(1, &snapshot.system.processes);
                     }
                     KeyCode::PageUp => {
-                        ui_state.move_process_selection(-10, snapshot.system.processes.len());
+                        ui_state.move_process_selection(-10, &snapshot.system.processes);
                     }
                     KeyCode::PageDown => {
-                        ui_state.move_process_selection(10, snapshot.system.processes.len());
+                        ui_state.move_process_selection(10, &snapshot.system.processes);
                     }
-                    KeyCode::Home => ui_state.process_home(),
-                    KeyCode::End => ui_state.process_end(snapshot.system.processes.len()),
+                    KeyCode::Home => ui_state.process_home(&snapshot.system.processes),
+                    KeyCode::End => ui_state.process_end(&snapshot.system.processes),
                     _ => {}
                 },
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
+                        if ui_state.click_process_row(mouse.column, mouse.row) {
+                            continue;
+                        }
+
+                        // Any left-click away from a process row releases the pinned process.
+                        ui_state.clear_process_selection();
+
                         let (width, _) = crossterm::terminal::size()?;
                         let header = Rect::new(0, 0, width, 3);
                         let mut handled = false;
@@ -130,26 +137,19 @@ pub fn run(
                                 handled = true;
                             }
                         }
-                        if !handled && ui_state.click_process_sort(mouse.column, mouse.row) {
-                            handled = true;
-                        }
                         if !handled {
-                            ui_state.click_process_row(
-                                mouse.column,
-                                mouse.row,
-                                snapshot.system.processes.len(),
-                            );
+                            ui_state.click_process_sort(mouse.column, mouse.row);
                         }
                     }
                     MouseEventKind::ScrollUp
                         if ui_state.process_pane_contains(mouse.column, mouse.row) =>
                     {
-                        ui_state.move_process_selection(-3, snapshot.system.processes.len());
+                        ui_state.scroll_processes(-3, snapshot.system.processes.len());
                     }
                     MouseEventKind::ScrollDown
                         if ui_state.process_pane_contains(mouse.column, mouse.row) =>
                     {
-                        ui_state.move_process_selection(3, snapshot.system.processes.len());
+                        ui_state.scroll_processes(3, snapshot.system.processes.len());
                     }
                     _ => {}
                 },
