@@ -1,0 +1,10 @@
+# TYPE llamacpp:spec_decode_num_drafts_total counter
+llamacpp:spec_decode_num_drafts_total 50
+# TYPE llamacpp:spec_decode_num_draft_tokens_total counter
+llamacpp:spec_decode_num_draft_tokens_total 200
+# TYPE llamacpp:spec_decode_num_accepted_tokens_total counter
+llamacpp:spec_decode_num_accepted_tokens_total 140
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 50
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="1"} 45
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="2"} 30
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="3"} 15

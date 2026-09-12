@@ -34,3 +34,6 @@ jobs:
 
       - name: Cargo test
         run: cargo test --all-targets --locked
+
+      - name: CLI smoke test
+        run: cargo run --locked -- --help

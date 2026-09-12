@@ -1,0 +1,20 @@
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 12000
+# TYPE llamacpp:prompt_tokens_cached_total counter
+llamacpp:prompt_tokens_cached_total 26000
+# TYPE llamacpp:prompt_seconds_total counter
+llamacpp:prompt_seconds_total 12
+# TYPE llamacpp:tokens_predicted_total counter
+llamacpp:tokens_predicted_total 800
+# TYPE llamacpp:tokens_predicted_seconds_total counter
+llamacpp:tokens_predicted_seconds_total 20
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 0
+# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 0
+# TYPE llamacpp:requests_processing gauge
+llamacpp:requests_processing 1
+# TYPE llamacpp:requests_deferred gauge
+llamacpp:requests_deferred 0
+# TYPE llamacpp:n_tokens_max counter
+llamacpp:n_tokens_max 38779
