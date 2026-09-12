@@ -1,0 +1,36 @@
+name: Apply local MTP fallback
+
+on:
+  push:
+    branches: [feat/mtp-local-fallback]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/mtp-local-fallback
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply patch
+        run: python3 .github/patch-mtp-local-fallback.py
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+      - name: Remove temporary patch files
+        run: rm .github/workflows/apply-mtp-local-fallback.yml .github/patch-mtp-local-fallback.py
+      - name: Commit result
+        run: |
+          git config user.name "exclude-barrier"
+          git config user.email "christopher@cloudfiebig.de"
+          git add src/llama.rs src/ui.rs .github/workflows/apply-mtp-local-fallback.yml .github/patch-mtp-local-fallback.py
+          git commit -m "Detect local MTP draft length"
+          git push origin HEAD:feat/mtp-local-fallback
