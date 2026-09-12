@@ -1,0 +1,40 @@
+name: Apply physical core layout
+
+on:
+  push:
+    branches: [feat/physical-core-layout]
+    paths:
+      - .github/workflows/apply-physical-core-layout.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/physical-core-layout
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply patch
+        run: python .github/scripts/apply_physical_core_layout.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Validate
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo run --locked -- --help
+      - name: Remove temporary patch files
+        run: rm .github/scripts/apply_physical_core_layout.py .github/workflows/apply-physical-core-layout.yml
+      - name: Commit result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Group hybrid CPU threads by physical core"
+          git push origin HEAD:feat/physical-core-layout
