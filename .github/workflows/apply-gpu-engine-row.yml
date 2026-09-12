@@ -2,14 +2,14 @@ name: Apply GPU engine row patch
 
 on:
   push:
-    branches: [fix/gpu-engine-row]
+    branches:
+      - fix/gpu-engine-row
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +19,9 @@ jobs:
         with:
           components: rustfmt
       - name: Move engine metrics to their own row
+        shell: bash
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
           p = Path('src/ui.rs')
           s = p.read_text()
@@ -88,7 +89,8 @@ jobs:
           PY
       - name: Format and test
         run: |
-          cargo fmt --all -- --check || cargo fmt --all
+          cargo fmt --all
+          cargo fmt --all -- --check
           cargo check --all-targets --locked
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --all-targets --locked
