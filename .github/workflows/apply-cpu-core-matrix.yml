@@ -1,0 +1,42 @@
+name: Apply CPU core matrix
+
+on:
+  push:
+    branches: [feat/cpu-core-matrix]
+    paths:
+      - '.github/workflows/apply-cpu-core-matrix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/cpu-core-matrix
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply patch
+        run: python .github/scripts/apply_cpu_core_matrix.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Validate
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo run --locked -- --help >/dev/null
+      - name: Remove temporary patch files
+        run: |
+          rm -f .github/scripts/apply_cpu_core_matrix.py
+          rm -f .github/workflows/apply-cpu-core-matrix.yml
+      - name: Commit result
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Redesign SYSTEM CPU core matrix'
+          git push origin HEAD:feat/cpu-core-matrix
