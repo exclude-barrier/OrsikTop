@@ -453,36 +453,67 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parses_current_llama_metrics_without_collapsing_labels() {
-        let metrics = parse_prometheus(
-            r#"
-# HELP ignored ignored
-llamacpp:prompt_tokens_total 120
-llamacpp:tokens_predicted_total{slot="0"} 20
-llamacpp:tokens_predicted_total{slot="1"} 30
-llamacpp:prompt_tokens_cached_total 40
-not_finite NaN
-"#,
-        );
+    fn parses_current_llama_metrics_fixture() {
+        let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_current.prom"));
 
-        assert!(metrics.iter().any(|metric| {
-            metric.name == "llamacpp:prompt_tokens_total"
-                && metric.labels.is_none()
-                && metric.value == 120.0
-        }));
-        let labeled = metrics
-            .iter()
-            .filter(|metric| metric.name == "llamacpp:tokens_predicted_total")
-            .collect::<Vec<_>>();
-        assert_eq!(labeled.len(), 2);
-        assert_eq!(
-            pick_metric(&metrics, &["llamacpp:tokens_predicted_total"]),
-            0.0
-        );
+        assert_eq!(pick_metric(&metrics, &["llamacpp:prompt_tokens_total"]), 12000.0);
         assert_eq!(
             pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]),
-            40.0
+            26000.0
         );
+        assert_eq!(pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]), 12.0);
+        assert_eq!(
+            pick_metric(&metrics, &["llamacpp:tokens_predicted_seconds_total"]),
+            20.0
+        );
+        assert_eq!(
+            safe_ratio(
+                pick_metric(&metrics, &["llamacpp:prompt_tokens_total"]),
+                pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]),
+            ),
+            Some(1000.0)
+        );
+    }
+
+    #[test]
+    fn speculative_fixture_preserves_position_labels() {
+        let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_speculative.prom"));
+        assert_eq!(
+            pick_metric(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]),
+            200.0
+        );
+        assert_eq!(
+            pick_metric(
+                &metrics,
+                &["llamacpp:spec_decode_num_accepted_tokens_total"]
+            ),
+            140.0
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .filter(|sample| {
+                    sample.name == "llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+                        && sample.labels.is_some()
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn parser_ignores_non_finite_values_and_does_not_collapse_labels() {
+        let metrics = parse_prometheus(
+            "llamacpp:test{slot=\"0\"} 20\nllamacpp:test{slot=\"1\"} 30\nnot_finite NaN\n",
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .filter(|metric| metric.name == "llamacpp:test")
+                .count(),
+            2
+        );
+        assert_eq!(pick_metric(&metrics, &["llamacpp:test"]), 0.0);
         assert!(!metrics.iter().any(|metric| metric.name == "not_finite"));
     }
 
@@ -499,34 +530,48 @@ not_finite NaN
     }
 
     #[test]
-    fn derives_live_context_from_slots() {
+    fn derives_live_context_from_slots_fixture() {
         let mut stats = LlmStats {
             context_size: 4096,
             ..Default::default()
         };
-        let slots = json!([
-            {
-                "id": 0,
-                "n_ctx": 65536,
-                "is_processing": true,
-                "n_prompt_tokens": 12345,
-                "next_token": [{"n_decoded": 42}]
-            },
-            {
-                "id": 1,
-                "n_ctx": 65536,
-                "is_processing": false,
-                "n_prompt_tokens": 777
-            }
-        ]);
+        let slots: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/slots_active.json")).unwrap();
 
         apply_slots_json(&mut stats, &slots).unwrap();
 
         assert!(stats.slots_available);
         assert_eq!(stats.slot_count, 2);
         assert_eq!(stats.busy_slots, 1);
-        assert_eq!(stats.context_size, 65536);
-        assert_eq!(stats.context_used, 12345);
+        assert_eq!(stats.context_size, 196608);
+        assert_eq!(stats.context_used, 38779);
+    }
+
+    #[test]
+    fn idle_slots_fixture_reports_no_busy_slots() {
+        let mut stats = LlmStats::default();
+        let slots: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/slots_idle.json")).unwrap();
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.slot_count, 1);
+        assert_eq!(stats.busy_slots, 0);
+        assert_eq!(stats.context_used, 0);
+    }
+
+    #[test]
+    fn props_fixture_exposes_context_slots_and_model() {
+        let props: Value = serde_json::from_str(include_str!("../tests/fixtures/props.json")).unwrap();
+        assert_eq!(
+            json_u64_path(&props, &["default_generation_settings", "n_ctx"]),
+            Some(196608)
+        );
+        assert_eq!(props.get("total_slots").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            json_string(&props, &["model_path"])
+                .map(|value| model_display_name(&value))
+                .as_deref(),
+            Some("Qwen3.8-27B-UD-Q4_K_M")
+        );
     }
 
     #[test]
