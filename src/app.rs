@@ -15,11 +15,10 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use sysinfo::System;
 
 use crate::{
+    cpu::{detect_cpu_topology, CpuTopology},
     gpu::{GpuMonitor, GpuStats},
     llama::{LlamaMonitor, LlmStats},
-    ui::{
-        self, CpuCoreKind, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
-    },
+    ui::{self, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS},
 };
 
 const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -146,7 +145,7 @@ fn spawn_fast_worker(
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
         let mut previous_cpu_times = read_cpu_times();
-        let mut cpu_core_kinds: Option<Vec<CpuCoreKind>> = None;
+        let mut cpu_topology: Option<CpuTopology> = None;
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
@@ -173,13 +172,13 @@ fn spawn_fast_worker(
                     .iter()
                     .map(|cpu| cpu.cpu_usage() as f64)
                     .collect::<Vec<_>>();
-                let core_kinds = cpu_core_kinds
-                    .get_or_insert_with(|| detect_cpu_core_kinds(per_cpu_usage.len()))
+                let topology = cpu_topology
+                    .get_or_insert_with(|| detect_cpu_topology(per_cpu_usage.len()))
                     .clone();
                 system_stats = SystemStats {
                     cpu_usage: system.global_cpu_usage() as f64,
                     per_cpu_usage,
-                    cpu_core_kinds: core_kinds,
+                    cpu_topology: topology,
                     cpu_frequency_mhz: read_cpu_frequency_mhz(),
                     cpu_temperature_c: read_cpu_temperature_c(),
                     io_wait_pct,
@@ -256,114 +255,6 @@ fn read_load_average() -> Option<(f64, f64, f64)> {
         fields.next()?.parse().ok()?,
         fields.next()?.parse().ok()?,
     ))
-}
-
-fn detect_cpu_core_kinds(cpu_count: usize) -> Vec<CpuCoreKind> {
-    let mut kinds = vec![CpuCoreKind::Unknown; cpu_count];
-
-    let p_list = fs::read_to_string("/sys/devices/cpu_core/cpus")
-        .ok()
-        .and_then(|value| parse_cpu_list(&value));
-    let e_list = fs::read_to_string("/sys/devices/cpu_atom/cpus")
-        .ok()
-        .and_then(|value| parse_cpu_list(&value));
-    let lpe_list = fs::read_to_string("/sys/devices/cpu_lowpower/cpus")
-        .ok()
-        .and_then(|value| parse_cpu_list(&value));
-
-    let mut direct_detected = false;
-    if let Some(cpus) = p_list {
-        for cpu in cpus {
-            if cpu < kinds.len() {
-                kinds[cpu] = CpuCoreKind::Performance;
-                direct_detected = true;
-            }
-        }
-    }
-    for cpus in [e_list, lpe_list].into_iter().flatten() {
-        for cpu in cpus {
-            if cpu < kinds.len() {
-                kinds[cpu] = CpuCoreKind::Efficiency;
-                direct_detected = true;
-            }
-        }
-    }
-    if direct_detected
-        && kinds
-            .iter()
-            .any(|kind| matches!(kind, CpuCoreKind::Performance))
-        && kinds
-            .iter()
-            .any(|kind| matches!(kind, CpuCoreKind::Efficiency))
-    {
-        return kinds;
-    }
-
-    if !is_intel_cpu() {
-        return vec![CpuCoreKind::Unknown; cpu_count];
-    }
-
-    let sibling_counts = (0..cpu_count)
-        .map(|cpu| {
-            fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
-            ))
-            .ok()
-            .and_then(|value| parse_cpu_list(&value))
-            .map(|cpus| cpus.len())
-        })
-        .collect::<Vec<_>>();
-
-    let mut counts = sibling_counts.iter().flatten().copied().collect::<Vec<_>>();
-    counts.sort_unstable();
-    counts.dedup();
-    if counts.len() < 2 {
-        return vec![CpuCoreKind::Unknown; cpu_count];
-    }
-
-    let min_threads = counts[0];
-    let max_threads = *counts.last().unwrap_or(&min_threads);
-    if min_threads == max_threads {
-        return vec![CpuCoreKind::Unknown; cpu_count];
-    }
-
-    sibling_counts
-        .into_iter()
-        .map(|count| match count {
-            Some(value) if value == max_threads => CpuCoreKind::Performance,
-            Some(value) if value == min_threads => CpuCoreKind::Efficiency,
-            _ => CpuCoreKind::Unknown,
-        })
-        .collect()
-}
-
-fn is_intel_cpu() -> bool {
-    fs::read_to_string("/proc/cpuinfo")
-        .map(|text| {
-            text.lines().any(|line| {
-                line.split_once(':')
-                    .map(|(key, value)| key.trim() == "vendor_id" && value.trim() == "GenuineIntel")
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
-    let mut cpus = Vec::new();
-    for part in text.trim().split(',').filter(|part| !part.is_empty()) {
-        if let Some((start, end)) = part.split_once('-') {
-            let start = start.trim().parse::<usize>().ok()?;
-            let end = end.trim().parse::<usize>().ok()?;
-            if end < start {
-                return None;
-            }
-            cpus.extend(start..=end);
-        } else {
-            cpus.push(part.trim().parse::<usize>().ok()?);
-        }
-    }
-    (!cpus.is_empty()).then_some(cpus)
 }
 
 fn read_cpu_frequency_mhz() -> Option<f64> {
@@ -526,16 +417,6 @@ mod tests {
         change_refresh(&mut value, false, &shared);
         assert_eq!(value, 900);
         assert_eq!(shared.load(Ordering::Relaxed), 900);
-    }
-
-    #[test]
-    fn parses_linux_cpu_lists() {
-        assert_eq!(
-            parse_cpu_list("0-3,8,10-11\n"),
-            Some(vec![0, 1, 2, 3, 8, 10, 11])
-        );
-        assert_eq!(parse_cpu_list("7"), Some(vec![7]));
-        assert_eq!(parse_cpu_list("3-1"), None);
     }
 
     #[test]

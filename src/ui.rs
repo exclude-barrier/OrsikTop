@@ -11,7 +11,11 @@ use ratatui::{
     Frame,
 };
 
-use crate::{gpu::GpuStats, llama::LlmStats};
+use crate::{
+    cpu::{CpuCoreKind, CpuTopology, CpuVendor},
+    gpu::GpuStats,
+    llama::LlmStats,
+};
 
 pub const MIN_REFRESH_MS: u64 = 100;
 pub const MAX_REFRESH_MS: u64 = 10_000;
@@ -34,19 +38,11 @@ const RED: Color = Color::Rgb(235, 75, 75);
 const CYAN: Color = Color::Rgb(70, 195, 220);
 const WHITE: Color = Color::Rgb(225, 225, 225);
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum CpuCoreKind {
-    Performance,
-    Efficiency,
-    #[default]
-    Unknown,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SystemStats {
     pub cpu_usage: f64,
     pub per_cpu_usage: Vec<f64>,
-    pub cpu_core_kinds: Vec<CpuCoreKind>,
+    pub cpu_topology: CpuTopology,
     pub cpu_frequency_mhz: Option<f64>,
     pub cpu_temperature_c: Option<f64>,
     pub io_wait_pct: Option<f64>,
@@ -653,7 +649,7 @@ fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
 
 fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     let block = Block::default()
-        .title(" SYSTEM ")
+        .title(system_panel_title(&system.cpu_topology, area.width))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM_GREEN));
     let inner = block.inner(area);
@@ -733,17 +729,6 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         .enumerate()
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(index, _)| index);
-    let p_threads = system
-        .cpu_core_kinds
-        .iter()
-        .filter(|kind| matches!(kind, CpuCoreKind::Performance))
-        .count();
-    let e_threads = system
-        .cpu_core_kinds
-        .iter()
-        .filter(|kind| matches!(kind, CpuCoreKind::Efficiency))
-        .count();
-    let hybrid_known = p_threads > 0 && e_threads > 0;
 
     let mut lines = vec![
         meter_line(
@@ -781,26 +766,14 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         ]),
     ];
 
-    if hybrid_known {
-        lines.push(Line::from(vec![
-            label_span(" THREADS "),
-            value_span(&format!("P {p_threads}T"), BRIGHT_GREEN),
-            Span::raw("   "),
-            value_span(&format!("E {e_threads}T"), CYAN),
-        ]));
-    } else {
-        lines.push(Line::from(vec![label_span(" THREADS ")]));
-    }
-
-    for row in 0..4 {
-        lines.push(core_heatmap_line(
-            &system.per_cpu_usage,
-            &system.cpu_core_kinds,
-            row,
-            busiest,
-            hybrid_known,
-        ));
-    }
+    lines.extend(core_heatmap_rows(
+        &system.per_cpu_usage,
+        &system.cpu_topology.core_kinds,
+        inner.width,
+        busiest,
+        system.cpu_topology.is_hybrid(),
+        4,
+    ));
 
     lines.extend([
         meter_line(
@@ -843,20 +816,151 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn core_heatmap_line(
+fn system_panel_title(topology: &CpuTopology, width: u16) -> String {
+    let model = compact_cpu_model(topology);
+    let topology_text = if topology.is_hybrid() {
+        match (topology.performance_cores, topology.efficiency_cores) {
+            (Some(p), Some(e)) => format!("{p}P+{e}E/{}T", topology.logical_cpus),
+            _ => format!(
+                "P{}T+E{}T",
+                topology.performance_threads(),
+                topology.efficiency_threads()
+            ),
+        }
+    } else if let Some(cores) = topology.physical_cores {
+        format!("{cores}C/{}T", topology.logical_cpus)
+    } else if topology.logical_cpus > 0 {
+        format!("{}T", topology.logical_cpus)
+    } else {
+        String::new()
+    };
+
+    let mut title = if topology_text.is_empty() {
+        format!(" SYSTEM · {model} ")
+    } else {
+        format!(" SYSTEM · {model} · {topology_text} ")
+    };
+
+    let max_len = width.saturating_sub(2) as usize;
+    if title.chars().count() > max_len && max_len > 4 {
+        title = truncate_title(&title, max_len);
+    }
+    title
+}
+
+fn compact_cpu_model(topology: &CpuTopology) -> String {
+    let model = topology.model.trim();
+    if model.is_empty() {
+        return topology.vendor.label().to_string();
+    }
+
+    if topology.vendor == CpuVendor::Intel {
+        let parts = model.split_whitespace().collect::<Vec<_>>();
+        if let Some(part) = parts.iter().find(|part| {
+            ["i3-", "i5-", "i7-", "i9-"]
+                .iter()
+                .any(|prefix| part.starts_with(prefix))
+        }) {
+            return (*part).to_string();
+        }
+        if let Some(pos) = model.find("Core Ultra") {
+            return model[pos..]
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    }
+
+    if topology.vendor == CpuVendor::Amd {
+        if let Some(pos) = model.find("Ryzen") {
+            return model[pos..]
+                .split_whitespace()
+                .take_while(|part| !part.contains("-Core"))
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        if let Some(pos) = model.find("EPYC") {
+            return model[pos..]
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    }
+
+    model
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_title(title: &str, max_len: usize) -> String {
+    if title.chars().count() <= max_len {
+        return title.to_string();
+    }
+    let mut result = title
+        .chars()
+        .take(max_len.saturating_sub(1))
+        .collect::<String>();
+    result.push('…');
+    result
+}
+
+fn core_heatmap_rows(
     usages: &[f64],
     kinds: &[CpuCoreKind],
-    row: usize,
+    width: u16,
     busiest: Option<usize>,
     show_kind: bool,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if usages.is_empty() || max_rows == 0 {
+        return vec![Line::from(vec![
+            label_span(" CORES "),
+            value_span("—", MUTED),
+        ])];
+    }
+
+    let digits = usages.len().saturating_sub(1).to_string().len().max(2);
+    let cell_width = digits + usize::from(show_kind) + 2;
+    let max_cols = (width.saturating_sub(2) as usize / cell_width).max(1);
+    let preferred_cols = 6.min(max_cols);
+    let cols_for_row_limit = usages.len().div_ceil(max_rows);
+    let cols = preferred_cols.max(cols_for_row_limit);
+
+    if cols <= max_cols {
+        let row_count = usages.len().div_ceil(cols).min(max_rows);
+        return (0..row_count)
+            .map(|row| {
+                core_heatmap_numbered_line(
+                    usages,
+                    kinds,
+                    row * cols,
+                    ((row + 1) * cols).min(usages.len()),
+                    busiest,
+                    show_kind,
+                    digits,
+                )
+            })
+            .collect();
+    }
+
+    compact_core_heatmap_rows(usages, busiest, max_rows, digits)
+}
+
+fn core_heatmap_numbered_line(
+    usages: &[f64],
+    kinds: &[CpuCoreKind],
+    start: usize,
+    end: usize,
+    busiest: Option<usize>,
+    show_kind: bool,
+    digits: usize,
 ) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    let start = row * 6;
-    let end = (start + 6).min(usages.len());
-
-    if start >= end {
-        return Line::from(spans);
-    }
 
     for (index, usage) in usages.iter().copied().enumerate().take(end).skip(start) {
         if index > start {
@@ -881,11 +985,7 @@ fn core_heatmap_line(
         }
 
         spans.push(Span::styled(
-            if show_kind {
-                format!("{index:02}{suffix}")
-            } else {
-                format!("{index:02}")
-            },
+            format!("{index:0digits$}{suffix}"),
             label_style,
         ));
         spans.push(Span::styled(
@@ -895,6 +995,40 @@ fn core_heatmap_line(
     }
 
     Line::from(spans)
+}
+
+fn compact_core_heatmap_rows(
+    usages: &[f64],
+    busiest: Option<usize>,
+    max_rows: usize,
+    digits: usize,
+) -> Vec<Line<'static>> {
+    let rows = usages.len().min(max_rows).max(1);
+    let per_row = usages.len().div_ceil(rows);
+    let mut lines = Vec::with_capacity(rows);
+
+    for row in 0..rows {
+        let start = row * per_row;
+        let end = ((row + 1) * per_row).min(usages.len());
+        if start >= end {
+            break;
+        }
+
+        let mut spans = vec![Span::styled(
+            format!(" {start:0digits$}-{:0digits$} ", end - 1),
+            Style::default().fg(MUTED),
+        )];
+        for (index, usage) in usages.iter().copied().enumerate().take(end).skip(start) {
+            let mut style = Style::default().fg(core_usage_color(usage));
+            if busiest == Some(index) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(core_usage_glyph(usage).to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines
 }
 
 fn core_usage_color(usage: f64) -> Color {
