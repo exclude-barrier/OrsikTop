@@ -128,8 +128,7 @@ impl LlamaMonitor {
                 "prompt_tokens_total",
             ],
         );
-        stats.prompt_cached_total =
-            pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]);
+        stats.prompt_cached_total = pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]);
         stats.generated_total = pick_metric(
             &metrics,
             &[
@@ -155,15 +154,17 @@ impl LlamaMonitor {
                 )
             });
         stats.generation_avg_tps =
-            safe_ratio(stats.generated_total, stats.generation_seconds_total).unwrap_or_else(|| {
-                pick_metric(
-                    &metrics,
-                    &[
-                        "llamacpp:predicted_tokens_seconds",
-                        "llamacpp_predicted_tokens_seconds",
-                    ],
-                )
-            });
+            safe_ratio(stats.generated_total, stats.generation_seconds_total).unwrap_or_else(
+                || {
+                    pick_metric(
+                        &metrics,
+                        &[
+                            "llamacpp:predicted_tokens_seconds",
+                            "llamacpp_predicted_tokens_seconds",
+                        ],
+                    )
+                },
+            );
         stats.active_requests = pick_metric(
             &metrics,
             &[
@@ -184,8 +185,7 @@ impl LlamaMonitor {
             &metrics,
             &["llamacpp:n_tokens_max", "llamacpp_n_tokens_max"],
         ) as u64;
-        stats.spec_drafts_total =
-            pick_metric(&metrics, &["llamacpp:spec_decode_num_drafts_total"]);
+        stats.spec_drafts_total = pick_metric(&metrics, &["llamacpp:spec_decode_num_drafts_total"]);
         stats.spec_draft_tokens =
             pick_metric(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]);
         stats.spec_accepted_tokens = pick_metric(
@@ -475,7 +475,10 @@ not_finite NaN
             .filter(|metric| metric.name == "llamacpp:tokens_predicted_total")
             .collect::<Vec<_>>();
         assert_eq!(labeled.len(), 2);
-        assert_eq!(pick_metric(&metrics, &["llamacpp:tokens_predicted_total"]), 0.0);
+        assert_eq!(
+            pick_metric(&metrics, &["llamacpp:tokens_predicted_total"]),
+            0.0
+        );
         assert_eq!(
             pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]),
             40.0
