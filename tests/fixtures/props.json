@@ -1,0 +1,7 @@
+{
+  "model_path": "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "total_slots": 2,
+  "default_generation_settings": {
+    "n_ctx": 196608
+  }
+}

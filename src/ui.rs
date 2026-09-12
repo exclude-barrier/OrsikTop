@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,15 +17,14 @@ pub const MIN_REFRESH_MS: u64 = 100;
 pub const MAX_REFRESH_MS: u64 = 10_000;
 pub const REFRESH_STEP_MS: u64 = 100;
 
-const HISTORY_LEN: usize = 180;
+const HISTORY_WINDOW: Duration = Duration::from_secs(60);
+const HISTORY_MAX_SAMPLES: usize = 720;
 const REFRESH_CONTROL_WIDTH: u16 = 22;
-const COMPACT_DASHBOARD_HEIGHT: u16 = 29;
 
 const ORK_GREEN: Color = Color::Rgb(105, 210, 70);
 const DIM_GREEN: Color = Color::Rgb(70, 135, 60);
 const INNER_GREEN: Color = Color::Rgb(42, 83, 48);
 const MUTED: Color = Color::Rgb(145, 150, 145);
-const PIXEL_OFF: Color = Color::Rgb(45, 52, 47);
 const YELLOW: Color = Color::Rgb(220, 205, 75);
 const ORANGE: Color = Color::Rgb(230, 145, 60);
 const RED: Color = Color::Rgb(235, 75, 75);
@@ -42,36 +44,43 @@ pub struct RefreshControls {
     pub plus: Rect,
 }
 
+#[derive(Copy, Clone, Debug)]
+struct TimedSample {
+    at: Instant,
+    value: u64,
+}
+
 pub struct UiState {
-    gpu_history: VecDeque<u64>,
-    vram_history: VecDeque<u64>,
-    cpu_history: VecDeque<u64>,
-    ram_history: VecDeque<u64>,
+    gpu_history: VecDeque<TimedSample>,
+    vram_history: VecDeque<TimedSample>,
+    cpu_history: VecDeque<TimedSample>,
+    ram_history: VecDeque<TimedSample>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            gpu_history: VecDeque::with_capacity(HISTORY_LEN),
-            vram_history: VecDeque::with_capacity(HISTORY_LEN),
-            cpu_history: VecDeque::with_capacity(HISTORY_LEN),
-            ram_history: VecDeque::with_capacity(HISTORY_LEN),
+            gpu_history: VecDeque::with_capacity(600),
+            vram_history: VecDeque::with_capacity(600),
+            cpu_history: VecDeque::with_capacity(600),
+            ram_history: VecDeque::with_capacity(600),
         }
     }
 }
 
 impl UiState {
     pub fn push_sample(&mut self, gpu: &GpuStats, system: &SystemStats) {
+        let now = Instant::now();
         let vram = percent(gpu.memory_used_mib, gpu.memory_total_mib);
         let ram = percent(
             system.memory_used_bytes as f64,
             system.memory_total_bytes as f64,
         );
 
-        push_history(&mut self.gpu_history, gpu.utilization);
-        push_history(&mut self.vram_history, vram);
-        push_history(&mut self.cpu_history, system.cpu_usage);
-        push_history(&mut self.ram_history, ram);
+        push_history_at(&mut self.gpu_history, gpu.utilization, now);
+        push_history_at(&mut self.vram_history, vram, now);
+        push_history_at(&mut self.cpu_history, system.cpu_usage, now);
+        push_history_at(&mut self.ram_history, ram, now);
     }
 }
 
@@ -91,18 +100,9 @@ pub fn draw(
         return;
     }
 
-    let show_history = area.height >= COMPACT_DASHBOARD_HEIGHT;
-    let dashboard_height = if show_history {
-        COMPACT_DASHBOARD_HEIGHT
-    } else {
-        22
-    };
-    let dashboard = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.min(dashboard_height),
-    );
+    let llm_height = if llm.connected { 9 } else { 5 };
+    let history_required = 3 + 7 + llm_height + 5 + 3;
+    let show_history = area.height >= history_required;
 
     let rows = if show_history {
         Layout::default()
@@ -110,21 +110,23 @@ pub fn draw(
             .constraints([
                 Constraint::Length(3),
                 Constraint::Length(7),
-                Constraint::Length(9),
-                Constraint::Length(7),
+                Constraint::Length(llm_height),
+                Constraint::Length(5),
+                Constraint::Min(0),
                 Constraint::Length(3),
             ])
-            .split(dashboard)
+            .split(area)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Length(7),
-                Constraint::Length(9),
+                Constraint::Length(llm_height),
+                Constraint::Min(0),
                 Constraint::Length(3),
             ])
-            .split(dashboard)
+            .split(area)
     };
 
     draw_header(frame, rows[0], llm, server, refresh_ms);
@@ -133,9 +135,9 @@ pub fn draw(
 
     if show_history {
         draw_history(frame, rows[3], state);
-        draw_footer(frame, rows[4], llm, gpu, refresh_ms);
+        draw_footer(frame, rows[5], llm, gpu, refresh_ms);
     } else {
-        draw_footer(frame, rows[3], llm, gpu, refresh_ms);
+        draw_footer(frame, rows[4], llm, gpu, refresh_ms);
     }
 }
 
@@ -221,9 +223,9 @@ fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str, refr
 
 fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     let title = if gpu.available {
-        format!(" GPU0 · {} ", gpu.name)
+        format!(" GPU{} · {} ", gpu.index, gpu.name)
     } else {
-        " GPU0 · NVIDIA / NVML unavailable ".to_string()
+        format!(" GPU{} · NVIDIA / NVML unavailable ", gpu.index)
     };
 
     let block = Block::default()
@@ -247,8 +249,21 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     }
 
     let vram_pct = percent(gpu.memory_used_mib, gpu.memory_total_mib);
-    let power_pct = percent(gpu.power_w, gpu.power_limit_w);
+    let power_pct = match (gpu.power_w, gpu.power_limit_w) {
+        (Some(power), Some(limit)) if limit > 0.0 => Some(percent(power, limit)),
+        _ => None,
+    };
     let bar_width = gpu_bar_width(inner.width);
+
+    let power_value = match (gpu.power_w, gpu.power_limit_w) {
+        (Some(power), Some(limit)) => format!("{power:>3.0}/{limit:.0}W"),
+        (Some(power), None) => format!("{power:>3.0}W"),
+        _ => "      —".to_string(),
+    };
+    let temp_text = optional_number(gpu.temperature_c, 0, "°C");
+    let fan_text = optional_number(gpu.fan_percent, 0, "%");
+    let core_text = optional_number(gpu.graphics_clock_mhz, 0, " MHz");
+    let vclk_text = optional_number(gpu.memory_clock_mhz, 0, " MHz");
 
     let mut lines = vec![
         meter_line(
@@ -258,30 +273,22 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
             ORK_GREEN,
             format!("{:>3.0}%", gpu.utilization),
             vec![
-                data_pair(
-                    "CORE",
-                    format!("{:.0} MHz", gpu.graphics_clock_mhz),
-                    ORK_GREEN,
-                ),
+                data_pair("CORE", core_text, ORK_GREEN),
                 data_pair(
                     "TEMP",
-                    format!("{:.0}°C", gpu.temperature_c),
-                    temperature_color(gpu.temperature_c),
+                    temp_text,
+                    gpu.temperature_c.map(temperature_color).unwrap_or(MUTED),
                 ),
                 data_pair("PSTATE", gpu.pstate.clone(), CYAN),
             ],
         ),
         meter_line(
             "PWR",
-            power_pct,
+            power_pct.unwrap_or(0.0),
             bar_width,
-            power_color(power_pct),
-            format!("{:>3.0}/{:.0}W", gpu.power_w, gpu.power_limit_w),
-            vec![data_pair(
-                "FAN",
-                format!("{:.0}%", gpu.fan_percent),
-                ORK_GREEN,
-            )],
+            power_pct.map(power_color).unwrap_or(MUTED),
+            power_value,
+            vec![data_pair("FAN", fan_text, ORK_GREEN)],
         ),
         meter_line(
             "VRAM",
@@ -299,16 +306,28 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
                     ),
                     vram_color(vram_pct),
                 ),
-                data_pair("VCLK", format!("{:.0} MHz", gpu.memory_clock_mhz), CYAN),
+                data_pair("VCLK", vclk_text, CYAN),
             ],
         ),
         Line::from(vec![
             label_span(" BUS    "),
             data_pair("MEMCTRL", format!("{:.0}%", gpu.memory_utilization), CYAN),
-            data_pair("ENC", format!("{:.0}%", gpu.encoder_utilization), WHITE),
-            data_pair("DEC", format!("{:.0}%", gpu.decoder_utilization), WHITE),
-            data_pair("PCIe RX", format!("{:.1} MiB/s", gpu.pcie_rx_mib_s), CYAN),
-            data_pair("TX", format!("{:.1} MiB/s", gpu.pcie_tx_mib_s), CYAN),
+            data_pair(
+                "ENC",
+                optional_number(gpu.encoder_utilization, 0, "%"),
+                WHITE,
+            ),
+            data_pair(
+                "DEC",
+                optional_number(gpu.decoder_utilization, 0, "%"),
+                WHITE,
+            ),
+            data_pair(
+                "PCIe RX",
+                optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                CYAN,
+            ),
+            data_pair("TX", optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"), CYAN),
         ]),
     ];
 
@@ -366,6 +385,17 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         0.0
     };
     let context_bar = inner.width.saturating_sub(46).max(8) as usize;
+    let slots = if llm.slots_available {
+        format!("{}/{}", llm.busy_slots, llm.slot_count)
+    } else if llm.props_slot_count > 0 {
+        format!("—/{}", llm.props_slot_count)
+    } else {
+        "—".to_string()
+    };
+    let (mtp, mtp_color) = match llm.spec_acceptance_pct {
+        Some(value) => (format!("{value:.0}%"), ORK_GREEN),
+        None => ("—".to_string(), MUTED),
+    };
 
     let mut lines = vec![
         Line::from(vec![
@@ -376,34 +406,36 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             ),
         ]),
         Line::from(vec![
-            label_span(" SPEED    "),
+            label_span(" LIVE     "),
             Span::styled(
-                format!("PROMPT {:>7.1} tok/s", llm.prompt_tps),
+                format!("PP {:>7.1} tok/s", llm.prompt_tps),
                 Style::default().fg(CYAN),
             ),
-            Span::styled("    ", Style::default()),
+            Span::raw("    "),
             Span::styled(
-                format!("GENERATE {:>7.1} tok/s", llm.generation_tps),
+                format!("TG {:>7.1} tok/s", llm.generation_tps),
                 Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
             label_span(" AVG      "),
             Span::styled(
-                format!("PROMPT {:>7.1}", llm.prompt_avg_tps),
+                format!("PP {:>7.1} tok/s", llm.prompt_avg_tps),
                 Style::default().fg(MUTED),
             ),
-            Span::styled("    ", Style::default()),
+            Span::raw("    "),
             Span::styled(
-                format!("GENERATE {:>7.1}", llm.generation_avg_tps),
+                format!("TG {:>7.1} tok/s", llm.generation_avg_tps),
                 Style::default().fg(MUTED),
             ),
         ]),
         Line::from(vec![
             label_span(" TOKENS   "),
-            value_span(&format!("{:>10.0} prompt", llm.prompt_total), WHITE),
-            Span::raw("    "),
-            value_span(&format!("{:>10.0} generated", llm.generated_total), WHITE),
+            value_span(&format!("{:.0} PP", llm.prompt_total), WHITE),
+            Span::raw(" + "),
+            value_span(&format!("{:.0} cache", llm.prompt_cached_total), CYAN),
+            Span::raw("  │  "),
+            value_span(&format!("{:.0} generated", llm.generated_total), WHITE),
         ]),
         Line::from(vec![
             label_span(" QUEUE    "),
@@ -412,10 +444,10 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             value_span(&format!("{:.0} deferred", llm.deferred_requests), WHITE),
             Span::raw("    "),
             label_span("SLOTS "),
-            value_span(&format!("{}/{}", llm.busy_slots, llm.slot_count), CYAN),
+            value_span(&slots, CYAN),
             Span::raw("    "),
             label_span("MTP "),
-            value_span(&format!("{:.0}%", llm.spec_acceptance_pct), ORK_GREEN),
+            value_span(&mtp, mtp_color),
         ]),
         meter_line(
             "CTX",
@@ -462,7 +494,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
             system.cpu_usage,
             bar_width,
             ORK_GREEN,
-            format!("{:>4.1}%", system.cpu_usage),
+            format!("{:>4.1}%", clamp_percent(system.cpu_usage)),
             vec![],
         ),
         meter_line(
@@ -495,7 +527,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
 
 fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
     let block = Block::default()
-        .title(" HISTORY · latest samples ")
+        .title(" HISTORY · 60 s ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM_GREEN));
     let inner = block.inner(area);
@@ -525,7 +557,7 @@ fn draw_history_column(
     frame: &mut Frame,
     area: Rect,
     title: &str,
-    history: &VecDeque<u64>,
+    history: &VecDeque<TimedSample>,
     color: Color,
     right_border: bool,
 ) {
@@ -543,7 +575,7 @@ fn draw_history_column(
         return;
     }
 
-    let latest = history.back().copied().unwrap_or(0);
+    let latest = history.back().map(|sample| sample.value).unwrap_or(0);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -679,14 +711,14 @@ fn meter_line(
     value: String,
     suffix: Vec<Span<'static>>,
 ) -> Line<'static> {
-    let pct = percent.clamp(0.0, 100.0);
+    let pct = clamp_percent(percent);
     let filled = ((pct / 100.0) * width as f64).round() as usize;
     let mut spans = vec![
         Span::styled(format!(" {label:<5}"), Style::default().fg(MUTED)),
         Span::styled("▪".repeat(filled), Style::default().fg(color)),
         Span::styled(
             "·".repeat(width.saturating_sub(filled)),
-            Style::default().fg(PIXEL_OFF),
+            Style::default().fg(INNER_GREEN),
         ),
         Span::styled(format!(" {value}"), Style::default().fg(WHITE)),
     ];
@@ -695,21 +727,36 @@ fn meter_line(
 }
 
 fn trend_lines(
-    history: &VecDeque<u64>,
+    history: &VecDeque<TimedSample>,
     width: usize,
     height: usize,
     color: Color,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let height = height.max(1);
-    let start = history.len().saturating_sub(width);
-    let samples: Vec<u64> = history.iter().skip(start).copied().collect();
-    let left_pad = width.saturating_sub(samples.len());
-    let mut rows = vec![vec![false; width]; height];
+    let now = Instant::now();
+    let mut columns = vec![None; width];
 
-    for (sample_index, sample) in samples.iter().enumerate() {
-        let x = left_pad + sample_index;
-        let normalized = (*sample).min(100) as f64 / 100.0;
+    for sample in history {
+        let age = now.saturating_duration_since(sample.at);
+        if age > HISTORY_WINDOW {
+            continue;
+        }
+        let fraction = (age.as_secs_f64() / HISTORY_WINDOW.as_secs_f64()).clamp(0.0, 1.0);
+        let x = if width == 1 {
+            0
+        } else {
+            ((1.0 - fraction) * (width - 1) as f64).round() as usize
+        };
+        columns[x.min(width - 1)] = Some(sample.value.min(100));
+    }
+
+    let mut rows = vec![vec![false; width]; height];
+    for (x, sample) in columns.into_iter().enumerate() {
+        let Some(sample) = sample else {
+            continue;
+        };
+        let normalized = sample as f64 / 100.0;
         let y = ((1.0 - normalized) * (height.saturating_sub(1)) as f64).round() as usize;
         rows[y.min(height - 1)][x] = true;
     }
@@ -721,7 +768,7 @@ fn trend_lines(
                 if active {
                     spans.push(Span::styled("▪", Style::default().fg(color)));
                 } else {
-                    spans.push(Span::styled("·", Style::default().fg(PIXEL_OFF)));
+                    spans.push(Span::raw(" "));
                 }
             }
             Line::from(spans)
@@ -729,16 +776,34 @@ fn trend_lines(
         .collect()
 }
 
-fn push_history(history: &mut VecDeque<u64>, value: f64) {
-    if history.len() >= HISTORY_LEN {
+fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant) {
+    history.push_back(TimedSample {
+        at: now,
+        value: clamp_percent(value) as u64,
+    });
+
+    while history
+        .front()
+        .is_some_and(|sample| now.saturating_duration_since(sample.at) > HISTORY_WINDOW)
+    {
         history.pop_front();
     }
-    history.push_back(value.clamp(0.0, 100.0) as u64);
+    while history.len() > HISTORY_MAX_SAMPLES {
+        history.pop_front();
+    }
 }
 
 fn percent(value: f64, total: f64) -> f64 {
-    if total > 0.0 {
-        value / total * 100.0
+    if value.is_finite() && total.is_finite() && total > 0.0 {
+        clamp_percent(value / total * 100.0)
+    } else {
+        0.0
+    }
+}
+
+fn clamp_percent(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 100.0)
     } else {
         0.0
     }
@@ -755,7 +820,7 @@ fn gpu_bar_width(width: u16) -> usize {
 fn temperature_color(celsius: f64) -> Color {
     match celsius {
         v if v >= 85.0 => RED,
-        v if v >= 78.0 => ORANGE,
+        v if v >= 80.0 => ORANGE,
         v if v >= 70.0 => YELLOW,
         _ => ORK_GREEN,
     }
@@ -764,8 +829,8 @@ fn temperature_color(celsius: f64) -> Color {
 fn power_color(percent: f64) -> Color {
     match percent {
         v if v >= 99.0 => RED,
-        v if v >= 94.0 => ORANGE,
-        v if v >= 82.0 => YELLOW,
+        v if v >= 95.0 => ORANGE,
+        v if v >= 85.0 => YELLOW,
         _ => ORK_GREEN,
     }
 }
@@ -774,14 +839,24 @@ fn vram_color(percent: f64) -> Color {
     match percent {
         v if v >= 99.0 => RED,
         v if v >= 96.0 => ORANGE,
+        v if v >= 90.0 => YELLOW,
         _ => CYAN,
     }
 }
 
 fn context_color(percent: f64) -> Color {
     match percent {
-        v if v >= 95.0 => ORANGE,
+        v if v >= 97.0 => RED,
+        v if v >= 90.0 => ORANGE,
+        v if v >= 80.0 => YELLOW,
         _ => ORK_GREEN,
+    }
+}
+
+fn optional_number(value: Option<f64>, decimals: usize, suffix: &str) -> String {
+    match value {
+        Some(value) if value.is_finite() => format!("{value:.decimals$}{suffix}"),
+        _ => "—".to_string(),
     }
 }
 
@@ -832,12 +907,17 @@ mod tests {
     }
 
     #[test]
-    fn history_is_bounded() {
+    fn history_uses_a_fixed_time_window() {
+        let now = Instant::now();
         let mut history = VecDeque::new();
-        for i in 0..(HISTORY_LEN + 10) {
-            push_history(&mut history, i as f64);
-        }
-        assert_eq!(history.len(), HISTORY_LEN);
+        push_history_at(
+            &mut history,
+            10.0,
+            now - HISTORY_WINDOW - Duration::from_secs(1),
+        );
+        push_history_at(&mut history, 20.0, now);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.back().unwrap().value, 20);
     }
 
     #[test]
@@ -846,10 +926,25 @@ mod tests {
     }
 
     #[test]
-    fn trend_plot_uses_single_pixel_per_sample() {
-        let history = VecDeque::from([0, 25, 50, 75, 100]);
-        let lines = trend_lines(&history, 5, 5, ORK_GREEN);
+    fn trend_plot_keeps_requested_dimensions() {
+        let now = Instant::now();
+        let history = VecDeque::from([
+            TimedSample {
+                at: now - Duration::from_secs(30),
+                value: 25,
+            },
+            TimedSample {
+                at: now,
+                value: 100,
+            },
+        ]);
+        let lines = trend_lines(&history, 5, 3, ORK_GREEN);
         let rendered = lines.iter().map(|line| line.width()).collect::<Vec<_>>();
-        assert_eq!(rendered, vec![5, 5, 5, 5, 5]);
+        assert_eq!(rendered, vec![5, 5, 5]);
+    }
+
+    #[test]
+    fn nan_percent_is_safely_clamped() {
+        assert_eq!(clamp_percent(f64::NAN), 0.0);
     }
 }

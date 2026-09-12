@@ -7,6 +7,7 @@ use std::io;
 
 use clap::Parser;
 use crossterm::{
+    cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -29,12 +30,32 @@ struct Args {
         default_value_t = 1000
     )]
     interval_ms: u64,
+
+    /// NVIDIA GPU index to monitor
+    #[arg(long, env = "ORSIKTOP_GPU_INDEX", default_value_t = 0)]
+    gpu_index: u32,
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     enable_raw_mode()?;
+    let _terminal_guard = TerminalGuard;
+
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
@@ -42,15 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    let app_result = app::run(&mut terminal, &args.server, args.interval_ms);
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-
-    app_result
+    app::run(
+        &mut terminal,
+        &args.server,
+        args.interval_ms,
+        args.gpu_index,
+    )
 }
