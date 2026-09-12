@@ -426,7 +426,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
     } else {
         "—".to_string()
     };
-    let (mtp, mtp_color) = if llm.spec_enabled {
+    let (mtp, mtp_color) = if llm.spec_is_mtp {
         (
             llm.spec_n_max
                 .filter(|value| *value > 0)
@@ -434,6 +434,8 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
                 .unwrap_or_else(|| "MTP".to_string()),
             CYAN,
         )
+    } else if llm.spec_enabled {
+        ("SPEC".to_string(), CYAN)
     } else {
         ("MTP OFF".to_string(), MUTED)
     };
