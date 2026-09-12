@@ -20,8 +20,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply patch
         run: python .github/scripts/apply-system-cpu.py
-      - name: Fix clippy div_ceil
-        run: sed -i 's/(displayed_cores + 1) \/ 2/displayed_cores.div_ceil(2)/' src/ui.rs
+      - name: Fix generated patch
+        run: |
+          sed -i 's/(displayed_cores + 1) \/ 2/displayed_cores.div_ceil(2)/' src/ui.rs
+          sed -i 's/5\.882352941/5.555555556/' src/app.rs
       - name: Format
         run: cargo fmt --all
       - name: Validate
