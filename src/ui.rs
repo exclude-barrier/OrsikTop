@@ -95,6 +95,11 @@ pub fn draw(
 ) {
     let area = frame.area();
 
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
     if area.width < 72 || area.height < 22 {
         draw_too_small(frame, area);
         return;
@@ -734,47 +739,108 @@ fn trend_lines(
     let width = width.max(1);
     let height = height.max(1);
     let now = Instant::now();
-    let mut columns = vec![None; width];
+    let columns = resample_history(history, width * 2, now);
+    let sub_height = height * 4;
 
-    for sample in history {
-        let age = now.saturating_duration_since(sample.at);
-        if age > HISTORY_WINDOW {
-            continue;
-        }
-        let fraction = (age.as_secs_f64() / HISTORY_WINDOW.as_secs_f64()).clamp(0.0, 1.0);
-        let x = if width == 1 {
-            0
-        } else {
-            ((1.0 - fraction) * (width - 1) as f64).round() as usize
-        };
-        columns[x.min(width - 1)] = Some(sample.value.min(100));
-    }
+    (0..height)
+        .map(|cell_y| {
+            let mut row = String::with_capacity(width);
 
-    let mut rows = vec![vec![false; width]; height];
-    for (x, sample) in columns.into_iter().enumerate() {
-        let Some(sample) = sample else {
-            continue;
-        };
-        let filled_rows = ((sample as f64 / 100.0) * height as f64).ceil() as usize;
-        let start = height.saturating_sub(filled_rows.min(height));
-        for row in rows.iter_mut().take(height).skip(start) {
-            row[x] = true;
-        }
-    }
+            for cell_x in 0..width {
+                let mut mask = 0u8;
 
-    rows.into_iter()
-        .map(|row| {
-            let mut spans = Vec::with_capacity(width);
-            for active in row {
-                if active {
-                    spans.push(Span::styled("█", Style::default().fg(color)));
-                } else {
-                    spans.push(Span::raw(" "));
+                for dot_x in 0..2 {
+                    let sample = columns[cell_x * 2 + dot_x];
+                    let Some(sample) = sample else {
+                        continue;
+                    };
+
+                    let mut filled =
+                        ((sample as f64 / 100.0) * sub_height as f64).round() as usize;
+                    if sample > 0 && filled == 0 {
+                        filled = 1;
+                    }
+                    filled = filled.min(sub_height);
+                    let start = sub_height.saturating_sub(filled);
+
+                    for dot_y in 0..4 {
+                        let sub_y = cell_y * 4 + dot_y;
+                        if sub_y >= start {
+                            mask |= braille_bit(dot_x, dot_y);
+                        }
+                    }
                 }
+
+                row.push(braille_char(mask));
             }
-            Line::from(spans)
+
+            Line::from(Span::styled(row, Style::default().fg(color)))
         })
         .collect()
+}
+
+fn resample_history(
+    history: &VecDeque<TimedSample>,
+    columns: usize,
+    now: Instant,
+) -> Vec<Option<u64>> {
+    let columns = columns.max(1);
+    let window_secs = HISTORY_WINDOW.as_secs_f64();
+    let mut points = history
+        .iter()
+        .filter_map(|sample| {
+            let age = now.saturating_duration_since(sample.at);
+            (age <= HISTORY_WINDOW).then_some((
+                window_secs - age.as_secs_f64(),
+                sample.value.min(100),
+            ))
+        })
+        .peekable();
+
+    let mut result = vec![None; columns];
+    let mut current = None;
+
+    for (x, value) in result.iter_mut().enumerate() {
+        let target = if columns == 1 {
+            window_secs
+        } else {
+            x as f64 / (columns - 1) as f64 * window_secs
+        };
+
+        while let Some(&(offset, sample)) = points.peek() {
+            if offset > target {
+                break;
+            }
+            current = Some(sample);
+            points.next();
+        }
+
+        *value = current;
+    }
+
+    result
+}
+
+fn braille_bit(x: usize, y: usize) -> u8 {
+    match (x, y) {
+        (0, 0) => 0x01,
+        (0, 1) => 0x02,
+        (0, 2) => 0x04,
+        (0, 3) => 0x40,
+        (1, 0) => 0x08,
+        (1, 1) => 0x10,
+        (1, 2) => 0x20,
+        (1, 3) => 0x80,
+        _ => 0,
+    }
+}
+
+fn braille_char(mask: u8) -> char {
+    if mask == 0 {
+        ' '
+    } else {
+        char::from_u32(0x2800 + mask as u32).unwrap_or(' ')
+    }
 }
 
 fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant) {
@@ -942,6 +1008,34 @@ mod tests {
         let lines = trend_lines(&history, 5, 3, ORK_GREEN);
         let rendered = lines.iter().map(|line| line.width()).collect::<Vec<_>>();
         assert_eq!(rendered, vec![5, 5, 5]);
+    }
+
+    #[test]
+    fn history_resampling_holds_the_latest_value_between_samples() {
+        let now = Instant::now();
+        let history = VecDeque::from([
+            TimedSample {
+                at: now - Duration::from_secs(30),
+                value: 25,
+            },
+            TimedSample {
+                at: now - Duration::from_secs(10),
+                value: 50,
+            },
+        ]);
+
+        let columns = resample_history(&history, 7, now);
+        assert_eq!(
+            columns,
+            vec![None, None, None, Some(25), Some(25), Some(50), Some(50)]
+        );
+    }
+
+    #[test]
+    fn braille_masks_map_to_expected_cells() {
+        assert_eq!(braille_char(0), ' ');
+        assert_eq!(braille_char(0xc0), '⣀');
+        assert_eq!(braille_char(0xff), '⣿');
     }
 
     #[test]
