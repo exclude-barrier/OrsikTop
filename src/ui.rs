@@ -79,12 +79,38 @@ struct TimedSample {
     value: u64,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProcessSortKey {
+    Pid,
+    Program,
+    Cpu,
+    Memory,
+    Threads,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ProcessHeaderHit {
+    rect: Rect,
+    key: ProcessSortKey,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ProcessRowsHit {
+    rect: Rect,
+    start: usize,
+}
+
 pub struct UiState {
     gpu_history: VecDeque<TimedSample>,
     vram_history: VecDeque<TimedSample>,
     cpu_history: VecDeque<TimedSample>,
     ram_history: VecDeque<TimedSample>,
     process_selected: usize,
+    process_sort_key: ProcessSortKey,
+    process_sort_desc: bool,
+    process_header_hits: Vec<ProcessHeaderHit>,
+    process_pane: Option<Rect>,
+    process_rows: Option<ProcessRowsHit>,
 }
 
 impl Default for UiState {
@@ -95,6 +121,11 @@ impl Default for UiState {
             cpu_history: VecDeque::with_capacity(600),
             ram_history: VecDeque::with_capacity(600),
             process_selected: 0,
+            process_sort_key: ProcessSortKey::Cpu,
+            process_sort_desc: true,
+            process_header_hits: Vec::new(),
+            process_pane: None,
+            process_rows: None,
         }
     }
 }
@@ -140,6 +171,55 @@ impl UiState {
     pub fn clamp_process_selection(&mut self, total: usize) {
         self.process_selected = self.process_selected.min(total.saturating_sub(1));
     }
+
+    pub fn process_pane_contains(&self, x: u16, y: u16) -> bool {
+        self.process_pane
+            .is_some_and(|pane| rect_contains(pane, x, y))
+    }
+
+    pub fn click_process_sort(&mut self, x: u16, y: u16) -> bool {
+        let Some(key) = self
+            .process_header_hits
+            .iter()
+            .find(|hit| rect_contains(hit.rect, x, y))
+            .map(|hit| hit.key)
+        else {
+            return false;
+        };
+
+        if self.process_sort_key == key {
+            self.process_sort_desc = !self.process_sort_desc;
+        } else {
+            self.process_sort_key = key;
+            self.process_sort_desc = matches!(
+                key,
+                ProcessSortKey::Cpu | ProcessSortKey::Memory | ProcessSortKey::Threads
+            );
+        }
+        self.process_selected = 0;
+        true
+    }
+
+    pub fn click_process_row(&mut self, x: u16, y: u16, total: usize) -> bool {
+        let Some(rows) = self.process_rows else {
+            return false;
+        };
+        if !rect_contains(rows.rect, x, y) {
+            return false;
+        }
+        let index = rows.start + y.saturating_sub(rows.rect.y) as usize;
+        if index >= total {
+            return false;
+        }
+        self.process_selected = index;
+        true
+    }
+
+    fn clear_process_interaction(&mut self) {
+        self.process_header_hits.clear();
+        self.process_pane = None;
+        self.process_rows = None;
+    }
 }
 
 pub fn draw(
@@ -147,11 +227,12 @@ pub fn draw(
     system: &SystemStats,
     llm: &LlmStats,
     gpu: &GpuStats,
-    state: &UiState,
+    state: &mut UiState,
     server: &str,
     refresh_ms: u64,
 ) {
     let area = frame.area();
+    state.clear_process_interaction();
 
     frame.render_widget(Block::default().style(Style::default().bg(BG_BLACK)), area);
 
@@ -1250,7 +1331,7 @@ fn core_usage_glyph(usage: f64) -> char {
     }
 }
 
-fn draw_bottom(frame: &mut Frame, area: Rect, state: &UiState, processes: &[ProcessStats]) {
+fn draw_bottom(frame: &mut Frame, area: Rect, state: &mut UiState, processes: &[ProcessStats]) {
     // Keep very narrow terminals useful instead of crushing both panes.
     if area.width < 100 {
         draw_history(frame, area, state);
@@ -1263,7 +1344,7 @@ fn draw_bottom(frame: &mut Frame, area: Rect, state: &UiState, processes: &[Proc
         .split(area);
 
     draw_history(frame, panes[0], state);
-    draw_processes(frame, panes[1], processes, state.process_selected);
+    draw_processes(frame, panes[1], processes, state);
 }
 
 fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
@@ -1387,24 +1468,32 @@ fn draw_history_column(
     );
 }
 
-fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], selected: usize) {
+fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], state: &mut UiState) {
+    state.process_pane = Some(area);
+    let sorted = sorted_processes(processes, state.process_sort_key, state.process_sort_desc);
     let visible = area.height.saturating_sub(3) as usize;
-    let selected = selected.min(processes.len().saturating_sub(1));
-    let max_start = processes.len().saturating_sub(visible);
+    let selected = state.process_selected.min(sorted.len().saturating_sub(1));
+    let max_start = sorted.len().saturating_sub(visible);
     let start = if visible == 0 {
         0
     } else {
         selected.saturating_sub(visible / 2).min(max_start)
     };
-    let end = start.saturating_add(visible).min(processes.len());
-    let title = if processes.is_empty() {
-        " PROCESSES · CPU ↓ · 0 ".to_string()
+    let end = start.saturating_add(visible).min(sorted.len());
+    let sort_name = process_sort_name(state.process_sort_key);
+    let sort_arrow = if state.process_sort_desc {
+        "↓"
+    } else {
+        "↑"
+    };
+    let title = if sorted.is_empty() {
+        format!(" PROCESSES · {sort_name} {sort_arrow} · 0 ")
     } else {
         format!(
-            " PROCESSES · CPU ↓ · {}–{}/{} ",
+            " PROCESSES · {sort_name} {sort_arrow} · {}–{}/{} ",
             start + 1,
             end,
-            processes.len()
+            sorted.len()
         )
     };
     let block = Block::default()
@@ -1418,21 +1507,38 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sel
         return;
     }
 
-    let has_scrollbar = processes.len() > visible && visible > 0;
+    let has_scrollbar = sorted.len() > visible && visible > 0;
     let table_width = inner.width.saturating_sub(u16::from(has_scrollbar));
     let wide = table_width >= 96;
     let header = if wide {
-        process_header_wide(table_width as usize)
+        process_header_wide(
+            table_width as usize,
+            state.process_sort_key,
+            state.process_sort_desc,
+        )
     } else {
-        process_header_compact(table_width as usize)
+        process_header_compact(
+            table_width as usize,
+            state.process_sort_key,
+            state.process_sort_desc,
+        )
     };
     frame.render_widget(
         Paragraph::new(header).style(Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
         Rect::new(inner.x, inner.y, table_width, 1),
     );
+    state.process_header_hits = process_header_hits(inner, table_width, wide);
+
+    let body = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        table_width,
+        inner.height.saturating_sub(1),
+    );
+    state.process_rows = Some(ProcessRowsHit { rect: body, start });
 
     let mut lines = Vec::with_capacity(visible);
-    for (index, process) in processes.iter().enumerate().skip(start).take(visible) {
+    for (index, process) in sorted.iter().enumerate().skip(start).take(visible) {
         let is_selected = index == selected;
         lines.push(if wide {
             process_line_wide(process, table_width as usize, is_selected)
@@ -1448,15 +1554,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sel
         )));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines),
-        Rect::new(
-            inner.x,
-            inner.y.saturating_add(1),
-            table_width,
-            inner.height.saturating_sub(1),
-        ),
-    );
+    frame.render_widget(Paragraph::new(lines), body);
 
     if has_scrollbar {
         draw_process_scrollbar(
@@ -1469,9 +1567,102 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sel
             ),
             start,
             visible,
-            processes.len(),
+            sorted.len(),
         );
     }
+}
+
+fn sorted_processes(
+    processes: &[ProcessStats],
+    key: ProcessSortKey,
+    descending: bool,
+) -> Vec<&ProcessStats> {
+    let mut sorted = processes.iter().collect::<Vec<_>>();
+    sorted.sort_by(|a, b| {
+        let ordering = match key {
+            ProcessSortKey::Pid => a.pid.cmp(&b.pid),
+            ProcessSortKey::Program => a.program.cmp(&b.program),
+            ProcessSortKey::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
+            ProcessSortKey::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+            ProcessSortKey::Threads => a.threads.cmp(&b.threads),
+        };
+        let ordering = if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        ordering.then_with(|| a.pid.cmp(&b.pid))
+    });
+    sorted
+}
+
+fn process_sort_name(key: ProcessSortKey) -> &'static str {
+    match key {
+        ProcessSortKey::Pid => "PID",
+        ProcessSortKey::Program => "PROGRAM",
+        ProcessSortKey::Cpu => "CPU",
+        ProcessSortKey::Memory => "MEM",
+        ProcessSortKey::Threads => "THR",
+    }
+}
+
+fn process_header_label(
+    label: &str,
+    key: ProcessSortKey,
+    active: ProcessSortKey,
+    descending: bool,
+) -> String {
+    if key == active {
+        format!("{label}{}", if descending { "↓" } else { "↑" })
+    } else {
+        label.to_string()
+    }
+}
+
+fn process_header_hits(inner: Rect, table_width: u16, wide: bool) -> Vec<ProcessHeaderHit> {
+    let width = table_width as usize;
+    let mut hits = Vec::with_capacity(5);
+    let mut x = inner.x;
+
+    hits.push(ProcessHeaderHit {
+        rect: Rect::new(x, inner.y, 7, 1),
+        key: ProcessSortKey::Pid,
+    });
+    x = x.saturating_add(7);
+
+    if wide {
+        hits.push(ProcessHeaderHit {
+            rect: Rect::new(x, inner.y, 16, 1),
+            key: ProcessSortKey::Program,
+        });
+        x = x.saturating_add(16);
+        let command_width = width.saturating_sub(7 + 17 + 7 + 9 + 6).max(12) as u16;
+        x = x.saturating_add(command_width);
+    } else {
+        let program_width = width.saturating_sub(7 + 7 + 9 + 6).max(8) as u16;
+        hits.push(ProcessHeaderHit {
+            rect: Rect::new(x, inner.y, program_width, 1),
+            key: ProcessSortKey::Program,
+        });
+        x = x.saturating_add(program_width);
+    }
+
+    hits.push(ProcessHeaderHit {
+        rect: Rect::new(x, inner.y, 6, 1),
+        key: ProcessSortKey::Cpu,
+    });
+    x = x.saturating_add(6);
+    hits.push(ProcessHeaderHit {
+        rect: Rect::new(x, inner.y, 9, 1),
+        key: ProcessSortKey::Memory,
+    });
+    x = x.saturating_add(9);
+    hits.push(ProcessHeaderHit {
+        rect: Rect::new(x, inner.y, 6, 1),
+        key: ProcessSortKey::Threads,
+    });
+
+    hits
 }
 
 fn draw_process_scrollbar(
@@ -1506,21 +1697,28 @@ fn draw_process_scrollbar(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn process_header_compact(width: usize) -> String {
+fn process_header_compact(width: usize, active: ProcessSortKey, descending: bool) -> String {
     let fixed = 7 + 7 + 9 + 6;
     let program_width = width.saturating_sub(fixed).max(8);
-    format!(
-        " {:<6}{:<program_width$}{:>6} {:>8} {:>5}",
-        "PID", "PROGRAM", "CPU%", "MEM", "THR"
-    )
+    let pid = process_header_label("PID", ProcessSortKey::Pid, active, descending);
+    let program = process_header_label("PROGRAM", ProcessSortKey::Program, active, descending);
+    let cpu = process_header_label("CPU%", ProcessSortKey::Cpu, active, descending);
+    let memory = process_header_label("MEM", ProcessSortKey::Memory, active, descending);
+    let threads = process_header_label("THR", ProcessSortKey::Threads, active, descending);
+    format!(" {pid:<6}{program:<program_width$}{cpu:>6} {memory:>8} {threads:>5}")
 }
 
-fn process_header_wide(width: usize) -> String {
+fn process_header_wide(width: usize, active: ProcessSortKey, descending: bool) -> String {
     let fixed = 7 + 17 + 7 + 9 + 6;
     let command_width = width.saturating_sub(fixed).max(12);
+    let pid = process_header_label("PID", ProcessSortKey::Pid, active, descending);
+    let program = process_header_label("PROGRAM", ProcessSortKey::Program, active, descending);
+    let cpu = process_header_label("CPU%", ProcessSortKey::Cpu, active, descending);
+    let memory = process_header_label("MEM", ProcessSortKey::Memory, active, descending);
+    let threads = process_header_label("THR", ProcessSortKey::Threads, active, descending);
     format!(
-        " {:<6}{:<16}{:<command_width$}{:>6} {:>8} {:>5}",
-        "PID", "PROGRAM", "COMMAND", "CPU%", "MEM", "THR"
+        " {pid:<6}{program:<16}{:<command_width$}{cpu:>6} {memory:>8} {threads:>5}",
+        "COMMAND"
     )
 }
 
@@ -1685,7 +1883,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let help = format!(" [q] quit  [-]/[+] refresh  [↑/↓ Pg] proc  {refresh_ms} ms  ");
+    let help =
+        format!(" [q] quit  [-]/[+] refresh  [↑/↓ Pg] proc  [click] sort  {refresh_ms} ms  ");
     let help_width = help.chars().count() as u16;
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(MUTED)),
