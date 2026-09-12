@@ -1,0 +1,19 @@
+[
+  {
+    "id": 0,
+    "n_ctx": 196608,
+    "speculative": true,
+    "is_processing": false,
+    "n_prompt_tokens": 0,
+    "n_prompt_tokens_processed": 0,
+    "n_prompt_tokens_cache": 0,
+    "next_token": [
+      {
+        "has_next_token": false,
+        "has_new_line": false,
+        "n_remain": 0,
+        "n_decoded": 0
+      }
+    ]
+  }
+]
