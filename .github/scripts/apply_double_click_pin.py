@@ -173,13 +173,19 @@ insert_after = '''    fn pinned_process_is_removed_from_sorted_stream() {
     }
 '''
 new_tests = insert_after + '''
+    fn process_click_test_state() -> UiState {
+        UiState {
+            process_rows: Some(ProcessRowsHit {
+                rect: Rect::new(10, 10, 40, 2),
+                pids: vec![10, 20],
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn single_click_selects_process_without_pinning() {
-        let mut state = UiState::default();
-        state.process_rows = Some(ProcessRowsHit {
-            rect: Rect::new(10, 10, 40, 2),
-            pids: vec![10, 20],
-        });
+        let mut state = process_click_test_state();
 
         assert!(state.click_process_row(12, 10));
         assert_eq!(state.process_selected_pid, Some(10));
@@ -188,11 +194,7 @@ new_tests = insert_after + '''
 
     #[test]
     fn double_click_pins_process() {
-        let mut state = UiState::default();
-        state.process_rows = Some(ProcessRowsHit {
-            rect: Rect::new(10, 10, 40, 2),
-            pids: vec![10, 20],
-        });
+        let mut state = process_click_test_state();
 
         assert!(state.click_process_row(12, 10));
         assert!(state.click_process_row(12, 10));
@@ -202,11 +204,7 @@ new_tests = insert_after + '''
 
     #[test]
     fn clicking_another_process_releases_pin_and_selects_new_process() {
-        let mut state = UiState::default();
-        state.process_rows = Some(ProcessRowsHit {
-            rect: Rect::new(10, 10, 40, 2),
-            pids: vec![10, 20],
-        });
+        let mut state = process_click_test_state();
 
         assert!(state.click_process_row(12, 10));
         assert!(state.click_process_row(12, 10));
