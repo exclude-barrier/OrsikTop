@@ -1,0 +1,44 @@
+name: Apply core bars and license cleanup
+
+on:
+  push:
+    branches:
+      - refine/core-bars-license
+    paths:
+      - .github/workflows/apply-core-bars-license.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refine/core-bars-license
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply patch
+        run: python .github/scripts/apply-core-bars-license.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Validate
+        run: |
+          cargo fmt --all -- --check
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo run --locked -- --help >/dev/null
+      - name: Remove temporary patch files
+        run: |
+          rm .github/scripts/apply-core-bars-license.py
+          rm .github/workflows/apply-core-bars-license.yml
+      - name: Commit result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Refine CPU core bars and normalize Apache license"
+          git push origin HEAD:refine/core-bars-license
