@@ -811,17 +811,20 @@ fn meter_line(
     suffix: Vec<Span<'static>>,
 ) -> Line<'static> {
     let pct = clamp_percent(percent);
-    let (filled, empty) = fine_bar(pct, width);
-    let mut spans = vec![
-        Span::styled(format!(" {label:<5}"), Style::default().fg(MUTED)),
-        Span::styled(filled, Style::default().fg(color)),
-        Span::styled(empty, Style::default().fg(BAR_EMPTY)),
-        Span::styled(format!(" {value:<8}"), Style::default().fg(WHITE)),
-    ];
+    let mut spans = vec![Span::styled(
+        format!(" {label:<5}"),
+        Style::default().fg(MUTED),
+    )];
+    spans.extend(fine_bar_spans(label, pct, width, color));
+    spans.push(Span::styled(
+        format!(" {value:<8}"),
+        Style::default().fg(WHITE),
+    ));
     spans.extend(suffix);
     Line::from(spans)
 }
 
+#[cfg(test)]
 fn fine_bar(percent: f64, width: usize) -> (String, String) {
     if width == 0 {
         return (String::new(), String::new());
@@ -841,6 +844,104 @@ fn fine_bar(percent: f64, width: usize) -> (String, String) {
     let used_cells = full + usize::from(half);
     let empty = "⣀".repeat(width.saturating_sub(used_cells));
     (filled, empty)
+}
+
+fn fine_bar_spans(label: &str, percent: f64, width: usize, fallback: Color) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let total_units = width * 2;
+    let units = ((clamp_percent(percent) / 100.0) * total_units as f64).round() as usize;
+    let mut spans = Vec::with_capacity(width);
+
+    for cell in 0..width {
+        let start = cell * 2;
+        let filled_units = units.saturating_sub(start).min(2);
+        if filled_units == 0 {
+            spans.push(Span::styled("⣀", Style::default().fg(BAR_EMPTY)));
+            continue;
+        }
+
+        let glyph = if filled_units == 2 { "⣿" } else { "⣇" };
+        let level = ((start + filled_units) as f64 / total_units as f64 * 100.0).clamp(0.0, 100.0);
+        spans.push(Span::styled(
+            glyph,
+            Style::default().fg(bar_gradient_color(label, level, fallback)),
+        ));
+    }
+
+    spans
+}
+
+fn bar_gradient_color(label: &str, level: f64, fallback: Color) -> Color {
+    const DARK_GREEN: Color = Color::Rgb(35, 90, 38);
+    const DARK_CYAN: Color = Color::Rgb(24, 82, 100);
+
+    let stops: &[(f64, Color)] = match label {
+        "GPU" | "CPU" => &[(0.0, DARK_GREEN), (100.0, ORK_GREEN)],
+        "VRAM" => &[
+            (0.0, DARK_CYAN),
+            (80.0, CYAN),
+            (95.0, YELLOW),
+            (98.0, ORANGE),
+            (100.0, RED),
+        ],
+        "RAM" => &[
+            (0.0, DARK_CYAN),
+            (70.0, CYAN),
+            (85.0, YELLOW),
+            (95.0, ORANGE),
+            (100.0, RED),
+        ],
+        "PWR" => &[
+            (0.0, DARK_GREEN),
+            (65.0, ORK_GREEN),
+            (85.0, YELLOW),
+            (95.0, ORANGE),
+            (100.0, RED),
+        ],
+        "CTX" => &[
+            (0.0, DARK_GREEN),
+            (65.0, ORK_GREEN),
+            (80.0, YELLOW),
+            (90.0, ORANGE),
+            (97.0, RED),
+            (100.0, RED),
+        ],
+        _ => return fallback,
+    };
+
+    interpolate_stops(level, stops)
+}
+
+fn interpolate_stops(level: f64, stops: &[(f64, Color)]) -> Color {
+    let level = clamp_percent(level);
+    for pair in stops.windows(2) {
+        let (start_at, start_color) = pair[0];
+        let (end_at, end_color) = pair[1];
+        if level <= end_at {
+            let span = (end_at - start_at).max(f64::EPSILON);
+            let t = ((level - start_at) / span).clamp(0.0, 1.0);
+            return mix_color(start_color, end_color, t);
+        }
+    }
+    stops.last().map(|(_, color)| *color).unwrap_or(WHITE)
+}
+
+fn mix_color(a: Color, b: Color, t: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let lerp = |x: u8, y: u8| -> u8 {
+                (x as f64 + (y as f64 - x as f64) * t)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            Color::Rgb(lerp(ar, br), lerp(ag, bg), lerp(ab, bb))
+        }
+        _ if t < 0.5 => a,
+        _ => b,
+    }
 }
 
 fn trend_lines(
@@ -1171,6 +1272,21 @@ mod tests {
         assert_eq!(fine_bar(25.0, 2), ("⣇".to_string(), "⣀".to_string()));
         assert_eq!(fine_bar(50.0, 2), ("⣿".to_string(), "⣀".to_string()));
         assert_eq!(fine_bar(100.0, 2), ("⣿⣿".to_string(), "".to_string()));
+    }
+
+    #[test]
+    fn bar_gradients_use_expected_endpoints() {
+        assert_eq!(bar_gradient_color("GPU", 100.0, WHITE), ORK_GREEN);
+        assert_eq!(bar_gradient_color("VRAM", 100.0, WHITE), RED);
+        assert_eq!(bar_gradient_color("PWR", 100.0, WHITE), RED);
+        assert_eq!(bar_gradient_color("CTX", 100.0, WHITE), RED);
+        assert_eq!(bar_gradient_color("OTHER", 50.0, CYAN), CYAN);
+    }
+
+    #[test]
+    fn gradient_bar_preserves_terminal_width() {
+        let spans = fine_bar_spans("GPU", 50.0, 12, ORK_GREEN);
+        assert_eq!(Line::from(spans).width(), 12);
     }
 
     #[test]
