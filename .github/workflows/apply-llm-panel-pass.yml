@@ -18,7 +18,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Apply patch
-        run: python .github/llm_panel_patch.py
+        run: |
+          python .github/llm_panel_patch.py
+          sed -i 's/(raw.len() - index) % 3 == 0/(raw.len() - index).is_multiple_of(3)/' src/ui.rs
       - name: Format
         run: cargo fmt --all
       - name: Validate
