@@ -456,12 +456,18 @@ mod tests {
     fn parses_current_llama_metrics_fixture() {
         let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_current.prom"));
 
-        assert_eq!(pick_metric(&metrics, &["llamacpp:prompt_tokens_total"]), 12000.0);
+        assert_eq!(
+            pick_metric(&metrics, &["llamacpp:prompt_tokens_total"]),
+            12000.0
+        );
         assert_eq!(
             pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]),
             26000.0
         );
-        assert_eq!(pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]), 12.0);
+        assert_eq!(
+            pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]),
+            12.0
+        );
         assert_eq!(
             pick_metric(&metrics, &["llamacpp:tokens_predicted_seconds_total"]),
             20.0
@@ -560,7 +566,8 @@ mod tests {
 
     #[test]
     fn props_fixture_exposes_context_slots_and_model() {
-        let props: Value = serde_json::from_str(include_str!("../tests/fixtures/props.json")).unwrap();
+        let props: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/props.json")).unwrap();
         assert_eq!(
             json_u64_path(&props, &["default_generation_settings", "n_ctx"]),
             Some(196608)
