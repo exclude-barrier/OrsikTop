@@ -142,4 +142,4 @@ OrsikTop should stay fast, readable and boring to operate: one binary, no daemon
 
 ## License
 
-MIT
+Apache License 2.0
