@@ -767,7 +767,7 @@ fn trend_lines(
             let mut spans = Vec::with_capacity(width);
             for active in row {
                 if active {
-                    spans.push(Span::styled("▪", Style::default().fg(color)));
+                    spans.push(Span::styled("█", Style::default().fg(color)));
                 } else {
                     spans.push(Span::raw(" "));
                 }
