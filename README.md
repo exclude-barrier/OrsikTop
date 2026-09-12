@@ -25,23 +25,24 @@ This is deliberate: YAGNI first, adapters later.
 ### llama.cpp
 
 - model and configured context
-- live prompt throughput
-- live generation throughput
-- llama.cpp average prompt / generation throughput
-- prompt and generated token counters
+- live prompt-processing and generation throughput from counter deltas
+- average prompt-processing and generation throughput from monotonic token/time counters
+- processed, prompt-cache and generated token counters
 - active and deferred requests
 - active / total server slots
 - live context usage from `/slots`
-- context high-watermark fallback
-- speculative decoding / MTP acceptance
+- context high-watermark fallback when `/slots` is unavailable
+- speculative decoding / MTP acceptance over the current sampling window
 
-OrsikTop uses the current llama.cpp Prometheus metric names and queries `/slots` for live per-slot context information. `/props` is cached instead of being requested every refresh.
+OrsikTop uses current llama.cpp Prometheus metric names. `/props` is cached instead of being requested every refresh. `/slots` is treated as optional telemetry: when it is unavailable, OrsikTop does not report a misleading `0/0`; it falls back to the configured slot count from `/props` when available.
+
+The average throughput display prefers `prompt_tokens_total / prompt_seconds_total` and `tokens_predicted_total / tokens_predicted_seconds_total`. The older throughput gauges are retained only as compatibility fallbacks because some current llama.cpp builds can report zero from those gauges while inference is active.
 
 ### NVIDIA GPU
 
 GPU telemetry comes directly from NVML. OrsikTop does **not** spawn `nvidia-smi` on every refresh.
 
-- GPU utilization and pixel history
+- GPU utilization and 60-second pixel history
 - VRAM used / total and memory utilization
 - graphics and memory clocks
 - temperature
@@ -49,12 +50,15 @@ GPU telemetry comes directly from NVML. OrsikTop does **not** spawn `nvidia-smi`
 - P-state
 - fan speed
 - encoder / decoder utilization
-- PCIe RX / TX throughput
+- PCIe RX / TX throughput in MB/s
+
+Unsupported NVML fields are shown as unavailable (`—`) instead of being reported as false zeroes.
 
 ### System
 
 - CPU utilization
 - RAM used / total
+- 60-second CPU/RAM history
 
 ## Quick start
 
@@ -82,6 +86,12 @@ For a 500 ms telemetry interval:
 cargo run --release -- --server http://127.0.0.1:8080 --interval-ms 500
 ```
 
+To monitor another NVIDIA GPU:
+
+```bash
+cargo run --release -- --gpu-index 1
+```
+
 ## Controls
 
 | Action | Control |
@@ -90,7 +100,7 @@ cargo run --release -- --server http://127.0.0.1:8080 --interval-ms 500
 | Faster refresh | click `[ - ]`, `-` or `[` |
 | Slower refresh | click `[ + ]`, `+` or `]` |
 
-Refresh can be changed live from **100 ms to 10,000 ms** in 100 ms steps.
+Refresh can be changed live from **100 ms to 10,000 ms** in 100 ms steps. GPU telemetry follows that interval; CPU/RAM are refreshed on a lower-overhead cadence and llama.cpp HTTP polling runs independently so a slow `/metrics` or `/slots` response does not stall GPU updates.
 
 ## Configuration
 
@@ -98,13 +108,14 @@ Refresh can be changed live from **100 ms to 10,000 ms** in 100 ms steps.
 | --- | --- | --- |
 | `--server` | `ORSIKTOP_SERVER` | `http://127.0.0.1:8080` |
 | `--interval-ms`, `-i` | `ORSIKTOP_INTERVAL_MS` | `1000` |
+| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | `0` |
 
 ## Build
 
 ```bash
 git clone https://github.com/exclude-barrier/OrsikTop.git
 cd OrsikTop
-cargo build --release
+cargo build --release --locked
 ./target/release/orsiktop
 ```
 
@@ -117,13 +128,13 @@ The code deliberately stays small:
 ```text
 src/
 ├── main.rs   terminal setup + CLI
-├── app.rs    event loop + background telemetry worker
+├── app.rs    event loop + fast/LLM telemetry workers
 ├── llama.rs  llama.cpp /metrics, /slots and /props
 ├── gpu.rs    NVIDIA NVML telemetry
-└── ui.rs     ratatui rendering + mouse hitboxes
+└── ui.rs     ratatui rendering + mouse hitboxes + 60 s history
 ```
 
-Network and GPU polling run outside the UI event loop so a slow HTTP response does not freeze mouse or keyboard input.
+GPU/system telemetry and llama.cpp HTTP polling run in separate background workers. A slow HTTP response therefore cannot freeze mouse/keyboard input or delay fast GPU sampling.
 
 ## Design goals
 
