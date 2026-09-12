@@ -36,8 +36,17 @@ const WHITE: Color = Color::Rgb(225, 225, 225);
 #[derive(Clone, Debug, Default)]
 pub struct SystemStats {
     pub cpu_usage: f64,
+    pub per_cpu_usage: Vec<f64>,
+    pub cpu_frequency_mhz: Option<f64>,
+    pub cpu_temperature_c: Option<f64>,
+    pub io_wait_pct: Option<f64>,
+    pub load_one: f64,
+    pub load_five: f64,
+    pub load_fifteen: f64,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -650,7 +659,69 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     );
     let bar_width = inner.width.saturating_sub(16).max(8) as usize;
 
-    let mut lines = vec![
+    if inner.width < 34 || inner.height < 8 {
+        let mut lines = vec![
+            meter_line(
+                "CPU",
+                system.cpu_usage,
+                bar_width,
+                ORK_GREEN,
+                format!("{:>4.1}%", clamp_percent(system.cpu_usage)),
+                vec![],
+            ),
+            meter_line(
+                "RAM",
+                ram_pct,
+                bar_width,
+                CYAN,
+                format!("{:>4.1}%", ram_pct),
+                vec![],
+            ),
+            Line::from(vec![
+                label_span(" USED     "),
+                value_span(
+                    &format!("{:.1} GiB", bytes_to_gib(system.memory_used_bytes)),
+                    CYAN,
+                ),
+            ]),
+            Line::from(vec![
+                label_span(" TOTAL    "),
+                value_span(
+                    &format!("{:.1} GiB", bytes_to_gib(system.memory_total_bytes)),
+                    WHITE,
+                ),
+            ]),
+        ];
+        lines.truncate(inner.height as usize);
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let frequency = system
+        .cpu_frequency_mhz
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| format!("{:.2}G", value / 1000.0))
+        .unwrap_or_else(|| "—".to_string());
+    let temperature = system
+        .cpu_temperature_c
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.0}°C"))
+        .unwrap_or_else(|| "—".to_string());
+    let temperature_tint = system
+        .cpu_temperature_c
+        .map(temperature_color)
+        .unwrap_or(MUTED);
+    let io_wait = system
+        .io_wait_pct
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "—".to_string());
+
+    let max_per_row = inner.width.saturating_sub(11).max(1) as usize;
+    let displayed_cores = system.per_cpu_usage.len().min(max_per_row * 2);
+    let first_end = displayed_cores.div_ceil(2);
+
+    let lines = vec![
         meter_line(
             "CPU",
             system.cpu_usage,
@@ -659,6 +730,33 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
             format!("{:>4.1}%", clamp_percent(system.cpu_usage)),
             vec![],
         ),
+        Line::from(vec![
+            label_span(" FREQ "),
+            value_span(&frequency, CYAN),
+            label_span("  TEMP "),
+            value_span(&temperature, temperature_tint),
+            label_span("  IOW "),
+            value_span(
+                &io_wait,
+                if system.io_wait_pct.unwrap_or(0.0) >= 10.0 {
+                    YELLOW
+                } else {
+                    MUTED
+                },
+            ),
+        ]),
+        Line::from(vec![
+            label_span(" LOAD "),
+            value_span(
+                &format!(
+                    "{:.2} / {:.2} / {:.2}",
+                    system.load_one, system.load_five, system.load_fifteen
+                ),
+                WHITE,
+            ),
+        ]),
+        core_usage_line(&system.per_cpu_usage, 0, first_end),
+        core_usage_line(&system.per_cpu_usage, first_end, displayed_cores),
         meter_line(
             "RAM",
             ram_pct,
@@ -668,23 +766,65 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
             vec![],
         ),
         Line::from(vec![
-            label_span(" USED     "),
+            label_span(" USED "),
             value_span(
-                &format!("{:.1} GiB", bytes_to_gib(system.memory_used_bytes)),
+                &format!(
+                    "{:.1} / {:.1} GiB",
+                    bytes_to_gib(system.memory_used_bytes),
+                    bytes_to_gib(system.memory_total_bytes)
+                ),
                 CYAN,
             ),
         ]),
         Line::from(vec![
-            label_span(" TOTAL    "),
+            label_span(" SWAP "),
             value_span(
-                &format!("{:.1} GiB", bytes_to_gib(system.memory_total_bytes)),
-                WHITE,
+                &format!(
+                    "{:.1} / {:.1} GiB",
+                    bytes_to_gib(system.swap_used_bytes),
+                    bytes_to_gib(system.swap_total_bytes)
+                ),
+                if system.swap_used_bytes > 0 {
+                    YELLOW
+                } else {
+                    MUTED
+                },
             ),
         ]),
     ];
 
-    lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn core_usage_line(usages: &[f64], start: usize, end: usize) -> Line<'static> {
+    if start >= end || start >= usages.len() {
+        return Line::from(vec![label_span(" CORES     "), value_span("—", MUTED)]);
+    }
+
+    let end = end.min(usages.len());
+    let mut spans = vec![Span::styled(
+        format!(" C{start:02}-{:02}  ", end - 1),
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )];
+    for usage in &usages[start..end] {
+        spans.push(Span::styled(
+            core_usage_glyph(*usage).to_string(),
+            Style::default().fg(bar_gradient_color("CPU", clamp_percent(*usage), ORK_GREEN)),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn core_usage_glyph(usage: f64) -> char {
+    match clamp_percent(usage) {
+        value if value >= 92.0 => '⣿',
+        value if value >= 75.0 => '⣷',
+        value if value >= 58.0 => '⣶',
+        value if value >= 42.0 => '⣦',
+        value if value >= 25.0 => '⣤',
+        value if value >= 8.0 => '⣄',
+        _ => '⣀',
+    }
 }
 
 fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
@@ -1238,6 +1378,13 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_usage_glyph_scales_with_utilization() {
+        assert_eq!(core_usage_glyph(0.0), '⣀');
+        assert_eq!(core_usage_glyph(50.0), '⣦');
+        assert_eq!(core_usage_glyph(100.0), '⣿');
+    }
 
     #[test]
     fn refresh_buttons_match_rendered_positions() {
