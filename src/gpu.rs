@@ -1,4 +1,5 @@
 use nvml_wrapper::{
+    bitmasks::device::ThrottleReasons,
     enum_wrappers::device::{Clock, PcieUtilCounter, TemperatureSensor},
     Nvml,
 };
@@ -16,6 +17,7 @@ pub struct GpuStats {
     pub power_w: Option<f64>,
     pub power_limit_w: Option<f64>,
     pub pstate: String,
+    pub limit_reason: String,
     pub graphics_clock_mhz: Option<f64>,
     pub memory_clock_mhz: Option<f64>,
     pub encoder_utilization: Option<f64>,
@@ -97,6 +99,10 @@ impl GpuMonitor {
                 .performance_state()
                 .map(|state| normalize_pstate(&format!("{state:?}")))
                 .unwrap_or_else(|_| "—".to_string()),
+            limit_reason: device
+                .current_throttle_reasons()
+                .map(format_throttle_reasons)
+                .unwrap_or_else(|_| "—".to_string()),
             graphics_clock_mhz: device
                 .clock_info(Clock::Graphics)
                 .ok()
@@ -161,6 +167,47 @@ fn normalize_pstate(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
+fn format_throttle_reasons(reasons: ThrottleReasons) -> String {
+    if reasons.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut labels = Vec::new();
+
+    if reasons.contains(ThrottleReasons::SW_POWER_CAP) {
+        labels.push("power");
+    }
+    if reasons
+        .intersects(ThrottleReasons::SW_THERMAL_SLOWDOWN | ThrottleReasons::HW_THERMAL_SLOWDOWN)
+    {
+        labels.push("thermal");
+    }
+    if reasons.contains(ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN) {
+        labels.push("power-brake");
+    }
+    if reasons.contains(ThrottleReasons::HW_SLOWDOWN) {
+        labels.push("hw");
+    }
+    if reasons.contains(ThrottleReasons::SYNC_BOOST) {
+        labels.push("sync");
+    }
+    if reasons.contains(ThrottleReasons::APPLICATIONS_CLOCKS_SETTING) {
+        labels.push("app-clock");
+    }
+    if reasons.contains(ThrottleReasons::DISPLAY_CLOCK_SETTING) {
+        labels.push("display");
+    }
+    if reasons.contains(ThrottleReasons::GPU_IDLE) {
+        labels.push("idle");
+    }
+
+    if labels.is_empty() {
+        "other".to_string()
+    } else {
+        labels.join("+")
+    }
+}
+
 fn sanitize(stats: &mut GpuStats) {
     stats.utilization = clamp_percent(stats.utilization);
     stats.memory_utilization = clamp_percent(stats.memory_utilization);
@@ -215,6 +262,22 @@ mod tests {
         assert_eq!(normalize_pstate("Two"), "P2");
         assert_eq!(normalize_pstate("Fifteen"), "P15");
         assert_eq!(normalize_pstate("Unknown"), "Unknown");
+    }
+
+    #[test]
+    fn formats_nvml_throttle_reasons() {
+        assert_eq!(format_throttle_reasons(ThrottleReasons::empty()), "none");
+        assert_eq!(
+            format_throttle_reasons(ThrottleReasons::SW_POWER_CAP),
+            "power"
+        );
+        assert_eq!(
+            format_throttle_reasons(
+                ThrottleReasons::SW_POWER_CAP | ThrottleReasons::HW_THERMAL_SLOWDOWN
+            ),
+            "power+thermal"
+        );
+        assert_eq!(format_throttle_reasons(ThrottleReasons::GPU_IDLE), "idle");
     }
 
     #[test]

@@ -21,6 +21,8 @@ const HISTORY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_MAX_SAMPLES: usize = 720;
 const REFRESH_CONTROL_WIDTH: u16 = 22;
 
+const BG_BLACK: Color = Color::Rgb(0, 0, 0);
+const BAR_EMPTY: Color = Color::Rgb(48, 52, 48);
 const ORK_GREEN: Color = Color::Rgb(105, 210, 70);
 const DIM_GREEN: Color = Color::Rgb(70, 135, 60);
 const INNER_GREEN: Color = Color::Rgb(42, 83, 48);
@@ -95,10 +97,7 @@ pub fn draw(
 ) {
     let area = frame.area();
 
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(BG_BLACK)), area);
 
     if area.width < 72 || area.height < 22 {
         draw_too_small(frame, area);
@@ -259,15 +258,17 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     };
     let bar_width = gpu_bar_width(inner.width);
 
-    let power_value = match (gpu.power_w, gpu.power_limit_w) {
-        (Some(power), Some(limit)) => format!("{power:>3.0}/{limit:.0}W"),
-        (Some(power), None) => format!("{power:>3.0}W"),
-        _ => "      —".to_string(),
+    let draw_text = match (gpu.power_w, gpu.power_limit_w) {
+        (Some(power), Some(limit)) => format!("{power:.0}/{limit:.0} W"),
+        (Some(power), None) => format!("{power:.0} W"),
+        _ => "—".to_string(),
     };
     let temp_text = optional_number(gpu.temperature_c, 0, "°C");
     let fan_text = optional_number(gpu.fan_percent, 0, "%");
     let core_text = optional_number(gpu.graphics_clock_mhz, 0, " MHz");
     let vclk_text = optional_number(gpu.memory_clock_mhz, 0, " MHz");
+    let power_pct_value = power_pct.unwrap_or(0.0);
+    let power_tint = power_pct.map(power_color).unwrap_or(MUTED);
 
     let mut lines = vec![
         meter_line(
@@ -277,22 +278,9 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
             ORK_GREEN,
             format!("{:>3.0}%", gpu.utilization),
             vec![
-                data_pair("CORE", core_text, ORK_GREEN),
-                data_pair(
-                    "TEMP",
-                    temp_text,
-                    gpu.temperature_c.map(temperature_color).unwrap_or(MUTED),
-                ),
-                data_pair("PSTATE", gpu.pstate.clone(), CYAN),
+                fixed_data_pair("CORE", core_text, ORK_GREEN, 21),
+                fixed_data_pair("PSTATE", gpu.pstate.clone(), CYAN, 16),
             ],
-        ),
-        meter_line(
-            "PWR",
-            power_pct.unwrap_or(0.0),
-            bar_width,
-            power_pct.map(power_color).unwrap_or(MUTED),
-            power_value,
-            vec![data_pair("FAN", fan_text, ORK_GREEN)],
         ),
         meter_line(
             "VRAM",
@@ -301,7 +289,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
             vram_color(vram_pct),
             format!("{:>3.0}%", vram_pct),
             vec![
-                data_pair(
+                fixed_data_pair(
                     "USED",
                     format!(
                         "{:.1}/{:.1} GiB",
@@ -309,29 +297,67 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
                         gpu.memory_total_mib / 1024.0
                     ),
                     vram_color(vram_pct),
+                    25,
                 ),
-                data_pair("VCLK", vclk_text, CYAN),
+                fixed_data_pair("VCLK", vclk_text, CYAN, 20),
+            ],
+        ),
+        meter_line(
+            "PWR",
+            power_pct_value,
+            bar_width,
+            power_tint,
+            format!("{:>3.0}%", power_pct_value),
+            vec![
+                fixed_data_pair("DRAW", draw_text, power_tint, 21),
+                fixed_data_pair(
+                    "TEMP",
+                    temp_text,
+                    gpu.temperature_c.map(temperature_color).unwrap_or(MUTED),
+                    16,
+                ),
+                fixed_data_pair("FAN", fan_text, ORK_GREEN, 13),
             ],
         ),
         Line::from(vec![
-            label_span(" BUS    "),
-            data_pair("MEMCTRL", format!("{:.0}%", gpu.memory_utilization), CYAN),
-            data_pair(
-                "ENC",
-                optional_number(gpu.encoder_utilization, 0, "%"),
-                WHITE,
+            label_span(" I/O    "),
+            Span::raw(" ".repeat(bar_width + 9)),
+            fixed_data_pair(
+                "MEMCTRL",
+                format!("{:.0}%", gpu.memory_utilization),
+                CYAN,
+                17,
             ),
-            data_pair(
-                "DEC",
-                optional_number(gpu.decoder_utilization, 0, "%"),
-                WHITE,
-            ),
-            data_pair(
+            fixed_data_pair(
                 "PCIe RX",
                 optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
                 CYAN,
+                22,
             ),
-            data_pair("TX", optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"), CYAN),
+            fixed_data_pair(
+                "TX",
+                optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                CYAN,
+                18,
+            ),
+            fixed_data_pair(
+                "ENC",
+                optional_number(gpu.encoder_utilization, 0, "%"),
+                WHITE,
+                11,
+            ),
+            fixed_data_pair(
+                "DEC",
+                optional_number(gpu.decoder_utilization, 0, "%"),
+                WHITE,
+                11,
+            ),
+            fixed_data_pair(
+                "LIMIT",
+                gpu.limit_reason.clone(),
+                limit_reason_color(&gpu.limit_reason),
+                20,
+            ),
         ]),
     ];
 
@@ -703,8 +729,14 @@ fn value_span(text: &str, color: Color) -> Span<'static> {
     Span::styled(text.to_string(), Style::default().fg(color))
 }
 
-fn data_pair(label: &'static str, value: String, color: Color) -> Span<'static> {
-    Span::styled(format!("  {label} {value}"), Style::default().fg(color))
+fn fixed_data_pair(
+    label: &'static str,
+    value: String,
+    color: Color,
+    width: usize,
+) -> Span<'static> {
+    let text = format!("  {label:<7}{value}");
+    Span::styled(format!("{text:<width$}"), Style::default().fg(color))
 }
 
 fn meter_line(
@@ -716,18 +748,36 @@ fn meter_line(
     suffix: Vec<Span<'static>>,
 ) -> Line<'static> {
     let pct = clamp_percent(percent);
-    let filled = ((pct / 100.0) * width as f64).round() as usize;
+    let (filled, empty) = fine_bar(pct, width);
     let mut spans = vec![
         Span::styled(format!(" {label:<5}"), Style::default().fg(MUTED)),
-        Span::styled("▪".repeat(filled), Style::default().fg(color)),
-        Span::styled(
-            "·".repeat(width.saturating_sub(filled)),
-            Style::default().fg(INNER_GREEN),
-        ),
-        Span::styled(format!(" {value}"), Style::default().fg(WHITE)),
+        Span::styled(filled, Style::default().fg(color)),
+        Span::styled(empty, Style::default().fg(BAR_EMPTY)),
+        Span::styled(format!(" {value:<8}"), Style::default().fg(WHITE)),
     ];
     spans.extend(suffix);
     Line::from(spans)
+}
+
+fn fine_bar(percent: f64, width: usize) -> (String, String) {
+    const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+
+    if width == 0 {
+        return (String::new(), String::new());
+    }
+
+    let units = ((clamp_percent(percent) / 100.0) * (width * 8) as f64).round() as usize;
+    let full = (units / 8).min(width);
+    let remainder = if full < width { units % 8 } else { 0 };
+
+    let mut filled = "█".repeat(full);
+    if remainder > 0 {
+        filled.push(PARTIAL[remainder]);
+    }
+
+    let used_cells = full + usize::from(remainder > 0);
+    let empty = "·".repeat(width.saturating_sub(used_cells));
+    (filled, empty)
 }
 
 fn trend_lines(
@@ -902,9 +952,22 @@ fn power_color(percent: f64) -> Color {
 fn vram_color(percent: f64) -> Color {
     match percent {
         v if v >= 99.0 => RED,
-        v if v >= 96.0 => ORANGE,
-        v if v >= 90.0 => YELLOW,
+        v if v >= 98.0 => ORANGE,
+        v if v >= 95.0 => YELLOW,
         _ => CYAN,
+    }
+}
+
+fn limit_reason_color(reason: &str) -> Color {
+    if reason == "none" || reason == "idle" || reason == "—" {
+        MUTED
+    } else if reason.contains("thermal") || reason.contains("power-brake") || reason.contains("hw")
+    {
+        RED
+    } else if reason.contains("power") {
+        ORANGE
+    } else {
+        YELLOW
     }
 }
 
@@ -1033,6 +1096,14 @@ mod tests {
         assert_eq!(braille_char(0), ' ');
         assert_eq!(braille_char(0xc0), '⣀');
         assert_eq!(braille_char(0xff), '⣿');
+    }
+
+    #[test]
+    fn fine_bar_has_subcell_resolution() {
+        assert_eq!(fine_bar(0.0, 4), ("".to_string(), "····".to_string()));
+        assert_eq!(fine_bar(12.5, 1), ("▏".to_string(), "".to_string()));
+        assert_eq!(fine_bar(50.0, 2), ("█".to_string(), "·".to_string()));
+        assert_eq!(fine_bar(100.0, 2), ("██".to_string(), "".to_string()));
     }
 
     #[test]
