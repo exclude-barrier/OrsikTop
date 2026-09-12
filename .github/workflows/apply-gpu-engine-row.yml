@@ -1,0 +1,103 @@
+name: Apply GPU engine row patch
+
+on:
+  push:
+    branches: [fix/gpu-engine-row]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gpu-engine-row
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Move engine metrics to their own row
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/ui.rs')
+          s = p.read_text()
+          old = '''            fixed_data_pair(
+                "TX",
+                optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                CYAN,
+                18,
+            ),
+            fixed_data_pair(
+                "ENC",
+                optional_number(gpu.encoder_utilization, 0, "%"),
+                WHITE,
+                11,
+            ),
+            fixed_data_pair(
+                "DEC",
+                optional_number(gpu.decoder_utilization, 0, "%"),
+                WHITE,
+                11,
+            ),
+            fixed_data_pair(
+                "LIMIT",
+                gpu.limit_reason.clone(),
+                limit_reason_color(&gpu.limit_reason),
+                20,
+            ),
+        ]),
+    ];
+'''
+          new = '''            fixed_data_pair(
+                "TX",
+                optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                CYAN,
+                18,
+            ),
+        ]),
+        Line::from(vec![
+            label_span("        "),
+            Span::raw(" ".repeat(bar_width + 9)),
+            fixed_data_pair(
+                "ENC",
+                optional_number(gpu.encoder_utilization, 0, "%"),
+                WHITE,
+                11,
+            ),
+            fixed_data_pair(
+                "DEC",
+                optional_number(gpu.decoder_utilization, 0, "%"),
+                WHITE,
+                11,
+            ),
+            fixed_data_pair(
+                "LIMIT",
+                gpu.limit_reason.clone(),
+                limit_reason_color(&gpu.limit_reason),
+                20,
+            ),
+        ]),
+    ];
+'''
+          if old not in s:
+              raise SystemExit('target block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+      - name: Format and test
+        run: |
+          cargo fmt --all -- --check || cargo fmt --all
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+      - name: Remove temporary workflow
+        run: rm .github/workflows/apply-gpu-engine-row.yml
+      - name: Commit result
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ui.rs .github/workflows/apply-gpu-engine-row.yml
+          git commit -m 'Move ENC DEC and LIMIT to dedicated GPU row'
+          git push origin HEAD:fix/gpu-engine-row
