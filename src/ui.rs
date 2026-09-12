@@ -120,7 +120,9 @@ pub fn draw(
     }
 
     let llm_height = if llm.connected { 12 } else { 5 };
-    let history_required = 3 + 7 + llm_height + 5 + 3;
+    let system_height = system_panel_height(system);
+    let middle_height = llm_height.max(system_height);
+    let history_required = 3 + 7 + middle_height + 5 + 3;
     let show_history = area.height >= history_required;
 
     let rows = if show_history {
@@ -129,7 +131,7 @@ pub fn draw(
             .constraints([
                 Constraint::Length(3),
                 Constraint::Length(7),
-                Constraint::Length(llm_height),
+                Constraint::Length(middle_height),
                 Constraint::Min(5),
                 Constraint::Length(3),
             ])
@@ -140,7 +142,7 @@ pub fn draw(
             .constraints([
                 Constraint::Length(3),
                 Constraint::Length(7),
-                Constraint::Length(llm_height),
+                Constraint::Length(middle_height),
                 Constraint::Min(0),
                 Constraint::Length(3),
             ])
@@ -647,6 +649,26 @@ fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     }
 }
 
+fn system_panel_height(system: &SystemStats) -> u16 {
+    if system.cpu_topology.is_hybrid() && !system.cpu_topology.physical_core_groups.is_empty() {
+        let p = system
+            .cpu_topology
+            .physical_core_groups
+            .iter()
+            .filter(|core| core.kind == CpuCoreKind::Performance)
+            .count();
+        let e = system
+            .cpu_topology
+            .physical_core_groups
+            .iter()
+            .filter(|core| core.kind == CpuCoreKind::Efficiency)
+            .count();
+        let rows = p.max(e).max(1);
+        return (rows as u16 + 9).max(12);
+    }
+    12
+}
+
 fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     let block = Block::default()
         .title(system_panel_title(&system.cpu_topology, area.width))
@@ -665,7 +687,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     );
     let bar_width = inner.width.saturating_sub(16).max(8) as usize;
 
-    if inner.width < 35 || inner.height < 10 {
+    if inner.width < 35 || inner.height < 15 {
         let mut lines = vec![
             meter_line(
                 "CPU",
@@ -767,12 +789,10 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     ];
 
     if system.cpu_topology.is_hybrid() && !system.cpu_topology.physical_core_groups.is_empty() {
-        lines.extend(physical_core_rows(
+        lines.extend(physical_core_minibar_rows(
             &system.per_cpu_usage,
             &system.cpu_topology.physical_core_groups,
             inner.width,
-            busiest,
-            4,
         ));
     } else {
         lines.extend(core_heatmap_rows(
@@ -919,17 +939,11 @@ fn truncate_title(title: &str, max_len: usize) -> String {
     result
 }
 
-fn physical_core_rows(
+fn physical_core_minibar_rows(
     usages: &[f64],
     cores: &[CpuPhysicalCore],
     width: u16,
-    busiest: Option<usize>,
-    max_rows: usize,
 ) -> Vec<Line<'static>> {
-    if max_rows < 2 {
-        return Vec::new();
-    }
-
     let performance = cores
         .iter()
         .filter(|core| core.kind == CpuCoreKind::Performance)
@@ -939,97 +953,117 @@ fn physical_core_rows(
         .filter(|core| core.kind == CpuCoreKind::Efficiency)
         .collect::<Vec<_>>();
 
-    if performance.is_empty() || efficiency.is_empty() {
+    if performance.is_empty() || efficiency.is_empty() || width < 30 {
         return Vec::new();
     }
 
-    let p_rows = (max_rows / 2).max(1);
-    let e_rows = max_rows.saturating_sub(p_rows).max(1);
-    let mut lines = physical_kind_rows(
-        usages,
-        &performance,
-        "P",
-        BRIGHT_GREEN,
-        width,
-        busiest,
-        p_rows,
-    );
-    lines.extend(physical_kind_rows(
-        usages,
-        &efficiency,
-        "E",
-        CYAN,
-        width,
-        busiest,
-        e_rows,
-    ));
-    lines.truncate(max_rows);
-    lines
-}
+    let rows = performance.len().max(efficiency.len());
+    let mut lines = Vec::with_capacity(rows + 1);
+    lines.push(Line::from(vec![
+        Span::styled(
+            " P-CORES",
+            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("            "),
+        Span::styled(
+            "E-CORES",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ),
+    ]));
 
-fn physical_kind_rows(
-    usages: &[f64],
-    cores: &[&CpuPhysicalCore],
-    prefix: &'static str,
-    label_color: Color,
-    width: u16,
-    busiest: Option<usize>,
-    max_rows: usize,
-) -> Vec<Line<'static>> {
-    if cores.is_empty() || max_rows == 0 {
-        return Vec::new();
-    }
+    for row in 0..rows {
+        let mut spans = Vec::new();
 
-    // Typical hybrid cores fit in ~7 terminal cells ("P0 ░·  "), so size
-    // rows from the actual panel width while preferring two rows per core class.
-    let max_cols = (width.saturating_sub(2) as usize / 7).max(1);
-    let cols = cores.len().div_ceil(max_rows).max(1).min(max_cols);
-    let visible = (cols * max_rows).min(cores.len());
-    let mut lines = Vec::new();
-
-    for row in 0..max_rows {
-        let start = row * cols;
-        let end = ((row + 1) * cols).min(visible);
-        if start >= end {
-            break;
+        if let Some(core) = performance.get(row) {
+            let usage = physical_core_average(core, usages);
+            let color = physical_core_color(usage, ORK_GREEN);
+            spans.push(Span::styled(
+                format!(" P{row}  "),
+                Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+            ));
+            spans.extend(mini_core_bar_spans(usage, 4, color));
+            spans.push(Span::styled(
+                format!(" {:>3.0}%", clamp_percent(usage)),
+                Style::default().fg(color),
+            ));
+        } else {
+            spans.push(Span::raw("              "));
         }
 
-        let mut spans = vec![Span::raw(" ")];
-        for (offset, core) in cores[start..end].iter().enumerate() {
-            let core_index = start + offset;
-            if offset > 0 {
-                spans.push(Span::raw("  "));
-            }
-
-            let core_is_busiest = busiest
-                .map(|cpu| core.logical_cpus.contains(&cpu))
-                .unwrap_or(false);
-            let mut label_style = Style::default().fg(label_color);
-            if core_is_busiest {
-                label_style = label_style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(format!("{prefix}{core_index} "), label_style));
-
-            let mut rendered_threads = 0usize;
-            for &logical_cpu in core.logical_cpus.iter().take(2) {
-                let usage = usages.get(logical_cpu).copied().unwrap_or(0.0);
-                let mut style = Style::default().fg(core_usage_color(usage));
-                if busiest == Some(logical_cpu) {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                spans.push(Span::styled(core_usage_glyph(usage).to_string(), style));
-                rendered_threads += 1;
-            }
-
-            // Align single-thread E-cores with the two-thread P-core cells.
-            if rendered_threads < 2 {
-                spans.push(Span::raw(" "));
-            }
+        let current_width = spans.iter().map(Span::width).sum::<usize>();
+        let e_column = 20usize;
+        if current_width < e_column {
+            spans.push(Span::raw(" ".repeat(e_column - current_width)));
+        } else {
+            spans.push(Span::raw("  "));
         }
+
+        if let Some(core) = efficiency.get(row) {
+            let usage = physical_core_average(core, usages);
+            let color = physical_core_color(usage, CYAN);
+            spans.push(Span::styled(
+                format!("E{row}  "),
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ));
+            spans.extend(mini_core_bar_spans(usage, 3, color));
+            spans.push(Span::styled(
+                format!(" {:>3.0}%", clamp_percent(usage)),
+                Style::default().fg(color),
+            ));
+        }
+
         lines.push(Line::from(spans));
     }
 
     lines
+}
+
+fn physical_core_average(core: &CpuPhysicalCore, usages: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for &cpu in &core.logical_cpus {
+        if let Some(usage) = usages.get(cpu).copied() {
+            sum += usage;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        clamp_percent(sum / count as f64)
+    }
+}
+
+fn physical_core_color(usage: f64, base: Color) -> Color {
+    if clamp_percent(usage) >= 90.0 {
+        ORANGE
+    } else {
+        base
+    }
+}
+
+fn mini_core_bar_spans(percent: f64, width: usize, color: Color) -> Vec<Span<'static>> {
+    let percent = clamp_percent(percent);
+    let scaled = percent / 100.0 * width as f64;
+    let (full, half) = if percent < 5.0 {
+        (0usize, false)
+    } else if scaled < 0.5 {
+        (0usize, true)
+    } else {
+        (scaled.ceil().min(width as f64) as usize, false)
+    };
+
+    let mut spans = Vec::with_capacity(width);
+    for cell in 0..width {
+        if cell < full {
+            spans.push(Span::styled("⣿", Style::default().fg(color)));
+        } else if cell == full && half {
+            spans.push(Span::styled("⣇", Style::default().fg(color)));
+        } else {
+            spans.push(Span::styled("⣀", Style::default().fg(BAR_EMPTY)));
+        }
+    }
+    spans
 }
 
 fn core_heatmap_rows(
@@ -1726,6 +1760,22 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_core_average_combines_smt_threads() {
+        let core = CpuPhysicalCore {
+            kind: CpuCoreKind::Performance,
+            logical_cpus: vec![0, 1],
+        };
+        assert_eq!(physical_core_average(&core, &[80.0, 20.0]), 50.0);
+    }
+
+    #[test]
+    fn physical_core_color_only_warns_near_saturation() {
+        assert_eq!(physical_core_color(89.9, ORK_GREEN), ORK_GREEN);
+        assert_eq!(physical_core_color(90.0, ORK_GREEN), ORANGE);
+        assert_eq!(physical_core_color(95.0, CYAN), ORANGE);
+    }
 
     #[test]
     fn core_usage_glyph_uses_heatmap_levels() {
