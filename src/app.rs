@@ -12,16 +12,19 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::{
     cpu::{detect_cpu_topology, CpuTopology},
     gpu::{GpuMonitor, GpuStats},
     llama::{LlamaMonitor, LlmStats},
-    ui::{self, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS},
+    ui::{
+        self, ProcessStats, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
+    },
 };
 
 const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Debug, Default)]
 struct DashboardSnapshot {
@@ -144,11 +147,29 @@ fn spawn_fast_worker(
         let mut system = System::new();
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
+        let mut last_process_refresh: Option<Instant> = None;
+        let mut process_stats = Vec::<ProcessStats>::new();
         let mut previous_cpu_times = read_cpu_times();
         let mut cpu_topology: Option<CpuTopology> = None;
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
+
+            if last_process_refresh
+                .map(|at| at.elapsed() >= PROCESS_REFRESH_INTERVAL)
+                .unwrap_or(true)
+            {
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::All,
+                    true,
+                    ProcessRefreshKind::nothing()
+                        .with_memory()
+                        .with_cpu()
+                        .with_exe(UpdateKind::OnlyIfNotSet),
+                );
+                process_stats = collect_process_stats(&system);
+                last_process_refresh = Some(Instant::now());
+            }
 
             if last_system_refresh
                 .map(|at| at.elapsed() >= SYSTEM_REFRESH_INTERVAL)
@@ -189,6 +210,7 @@ fn spawn_fast_worker(
                     memory_total_bytes: system.total_memory(),
                     swap_used_bytes: system.used_swap(),
                     swap_total_bytes: system.total_swap(),
+                    processes: process_stats.clone(),
                 };
                 last_system_refresh = Some(Instant::now());
             }
@@ -206,6 +228,47 @@ fn spawn_fast_worker(
             sleep_until_next_cycle(cycle_started, &refresh_ms, &stop);
         }
     });
+}
+
+fn collect_process_stats(system: &System) -> Vec<ProcessStats> {
+    let mut processes = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            let program = process.name().to_string_lossy().into_owned();
+            let command = process
+                .exe()
+                .map(|path| path.display().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| program.clone());
+            let pid_u32 = pid.as_u32();
+            ProcessStats {
+                pid: pid_u32,
+                program,
+                command,
+                cpu_pct: process.cpu_usage() as f64,
+                memory_bytes: process.memory(),
+                threads: read_process_thread_count(pid_u32).unwrap_or(1),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    processes.sort_by(|a, b| {
+        b.cpu_pct
+            .total_cmp(&a.cpu_pct)
+            .then_with(|| b.memory_bytes.cmp(&a.memory_bytes))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    processes.truncate(256);
+    processes
+}
+
+fn read_process_thread_count(pid: u32) -> Option<usize> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("Threads:")?;
+        value.trim().parse().ok()
+    })
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

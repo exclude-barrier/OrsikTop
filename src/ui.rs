@@ -39,6 +39,16 @@ const CYAN: Color = Color::Rgb(70, 195, 220);
 const WHITE: Color = Color::Rgb(225, 225, 225);
 
 #[derive(Clone, Debug, Default)]
+pub struct ProcessStats {
+    pub pid: u32,
+    pub program: String,
+    pub command: String,
+    pub cpu_pct: f64,
+    pub memory_bytes: u64,
+    pub threads: usize,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct SystemStats {
     pub cpu_usage: f64,
     pub per_cpu_usage: Vec<f64>,
@@ -53,6 +63,7 @@ pub struct SystemStats {
     pub memory_total_bytes: u64,
     pub swap_used_bytes: u64,
     pub swap_total_bytes: u64,
+    pub processes: Vec<ProcessStats>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -154,7 +165,7 @@ pub fn draw(
     draw_llm_and_system(frame, rows[2], system, llm);
 
     if show_history {
-        draw_history(frame, rows[3], state);
+        draw_bottom(frame, rows[3], state, &system.processes);
         draw_footer(frame, rows[4], llm, gpu, refresh_ms);
     } else {
         draw_footer(frame, rows[4], llm, gpu, refresh_ms);
@@ -1209,6 +1220,22 @@ fn core_usage_glyph(usage: f64) -> char {
     }
 }
 
+fn draw_bottom(frame: &mut Frame, area: Rect, state: &UiState, processes: &[ProcessStats]) {
+    // Keep very narrow terminals useful instead of crushing both panes.
+    if area.width < 100 {
+        draw_history(frame, area, state);
+        return;
+    }
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+
+    draw_history(frame, panes[0], state);
+    draw_processes(frame, panes[1], processes);
+}
+
 fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
     let block = Block::default()
         .title(" HISTORY · 60 s ")
@@ -1217,24 +1244,61 @@ fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.width < 32 || inner.height < 3 {
+    if inner.width < 32 || inner.height < 5 {
         return;
     }
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
+    // A 2x2 grid gives time-series data horizontal resolution while leaving the
+    // right side of the dashboard available for the btop-style process table.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
 
-    draw_history_column(frame, cols[0], "GPU", &state.gpu_history, ORK_GREEN, true);
-    draw_history_column(frame, cols[1], "VRAM", &state.vram_history, CYAN, true);
-    draw_history_column(frame, cols[2], "CPU", &state.cpu_history, ORK_GREEN, true);
-    draw_history_column(frame, cols[3], "RAM", &state.ram_history, CYAN, false);
+    draw_history_column(
+        frame,
+        top[0],
+        "GPU",
+        &state.gpu_history,
+        ORK_GREEN,
+        true,
+        true,
+    );
+    draw_history_column(
+        frame,
+        top[1],
+        "VRAM",
+        &state.vram_history,
+        CYAN,
+        false,
+        true,
+    );
+    draw_history_column(
+        frame,
+        bottom[0],
+        "CPU",
+        &state.cpu_history,
+        ORK_GREEN,
+        true,
+        false,
+    );
+    draw_history_column(
+        frame,
+        bottom[1],
+        "RAM",
+        &state.ram_history,
+        CYAN,
+        false,
+        false,
+    );
 }
 
 fn draw_history_column(
@@ -1244,14 +1308,17 @@ fn draw_history_column(
     history: &VecDeque<TimedSample>,
     color: Color,
     right_border: bool,
+    bottom_border: bool,
 ) {
-    let block = if right_border {
-        Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(INNER_GREEN))
-    } else {
-        Block::default()
+    let borders = match (right_border, bottom_border) {
+        (true, true) => Borders::RIGHT | Borders::BOTTOM,
+        (true, false) => Borders::RIGHT,
+        (false, true) => Borders::BOTTOM,
+        (false, false) => Borders::NONE,
     };
+    let block = Block::default()
+        .borders(borders)
+        .border_style(Style::default().fg(INNER_GREEN));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1288,6 +1355,190 @@ fn draw_history_column(
         )),
         rows[1],
     );
+}
+
+fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats]) {
+    let title = format!(" PROCESSES · CPU ↓ · {} ", processes.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DIM_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 30 || inner.height < 2 {
+        return;
+    }
+
+    let wide = inner.width >= 78;
+    let header = if wide {
+        process_header_wide(inner.width as usize)
+    } else {
+        process_header_compact(inner.width as usize)
+    };
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let visible = inner.height.saturating_sub(1) as usize;
+    let mut lines = Vec::with_capacity(visible);
+    for process in processes.iter().take(visible) {
+        lines.push(if wide {
+            process_line_wide(process, inner.width as usize)
+        } else {
+            process_line_compact(process, inner.width as usize)
+        });
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " waiting for process samples…",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+    );
+}
+
+fn process_header_compact(width: usize) -> String {
+    let fixed = 7 + 7 + 9 + 6;
+    let program_width = width.saturating_sub(fixed).max(8);
+    format!(
+        " {:<6}{:<program_width$}{:>6} {:>8} {:>5}",
+        "PID", "PROGRAM", "CPU%", "MEM", "THR"
+    )
+}
+
+fn process_header_wide(width: usize) -> String {
+    let fixed = 7 + 17 + 7 + 9 + 6;
+    let command_width = width.saturating_sub(fixed).max(12);
+    format!(
+        " {:<6}{:<16}{:<command_width$}{:>6} {:>8} {:>5}",
+        "PID", "PROGRAM", "COMMAND", "CPU%", "MEM", "THR"
+    )
+}
+
+fn process_line_compact(process: &ProcessStats, width: usize) -> Line<'static> {
+    let fixed = 7 + 7 + 9 + 6;
+    let program_width = width.saturating_sub(fixed).max(8);
+    let program = fit_cell(&process.program, program_width);
+    let cpu = process_cpu_color(process.cpu_pct);
+    let mut program_style = Style::default().fg(DIM_GREEN);
+    if is_llm_process(&process.program, &process.command) {
+        program_style = Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD);
+    }
+
+    Line::from(vec![
+        Span::styled(format!(" {:<6}", process.pid), Style::default().fg(MUTED)),
+        Span::styled(format!("{program:<program_width$}"), program_style),
+        Span::styled(
+            format!("{:>6.1}", process.cpu_pct),
+            Style::default().fg(cpu),
+        ),
+        Span::styled(
+            format!(" {:>8}", compact_memory(process.memory_bytes)),
+            Style::default().fg(CYAN),
+        ),
+        Span::styled(
+            format!(" {:>5}", process.threads),
+            Style::default().fg(MUTED),
+        ),
+    ])
+}
+
+fn process_line_wide(process: &ProcessStats, width: usize) -> Line<'static> {
+    let fixed = 7 + 17 + 7 + 9 + 6;
+    let command_width = width.saturating_sub(fixed).max(12);
+    let program = fit_cell(&process.program, 16);
+    let command = fit_cell(&process.command, command_width);
+    let cpu = process_cpu_color(process.cpu_pct);
+    let mut program_style = Style::default().fg(DIM_GREEN);
+    if is_llm_process(&process.program, &process.command) {
+        program_style = Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD);
+    }
+
+    Line::from(vec![
+        Span::styled(format!(" {:<6}", process.pid), Style::default().fg(MUTED)),
+        Span::styled(format!("{program:<16}"), program_style),
+        Span::styled(
+            format!("{command:<command_width$}"),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            format!("{:>6.1}", process.cpu_pct),
+            Style::default().fg(cpu),
+        ),
+        Span::styled(
+            format!(" {:>8}", compact_memory(process.memory_bytes)),
+            Style::default().fg(CYAN),
+        ),
+        Span::styled(
+            format!(" {:>5}", process.threads),
+            Style::default().fg(MUTED),
+        ),
+    ])
+}
+
+fn fit_cell(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut out = text.chars().take(width - 1).collect::<String>();
+    out.push('…');
+    out
+}
+
+fn compact_memory(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1}G", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.0}M", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.0}K", bytes / KIB)
+    } else {
+        format!("{}B", bytes as u64)
+    }
+}
+
+fn process_cpu_color(cpu_pct: f64) -> Color {
+    if cpu_pct >= 100.0 {
+        ORANGE
+    } else if cpu_pct >= 50.0 {
+        YELLOW
+    } else if cpu_pct >= 10.0 {
+        BRIGHT_GREEN
+    } else {
+        ORK_GREEN
+    }
+}
+
+fn is_llm_process(program: &str, command: &str) -> bool {
+    let program = program.to_ascii_lowercase();
+    let command = command.to_ascii_lowercase();
+    program.contains("llama")
+        || program.contains("orsiktop")
+        || command.contains("llama")
+        || command.contains("orsiktop")
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, refresh_ms: u64) {
