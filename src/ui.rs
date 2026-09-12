@@ -755,8 +755,7 @@ fn trend_lines(
                         continue;
                     };
 
-                    let mut filled =
-                        ((sample as f64 / 100.0) * sub_height as f64).round() as usize;
+                    let mut filled = ((sample as f64 / 100.0) * sub_height as f64).round() as usize;
                     if sample > 0 && filled == 0 {
                         filled = 1;
                     }
@@ -790,10 +789,8 @@ fn resample_history(
         .iter()
         .filter_map(|sample| {
             let age = now.saturating_duration_since(sample.at);
-            (age <= HISTORY_WINDOW).then_some((
-                window_secs - age.as_secs_f64(),
-                sample.value.min(100),
-            ))
+            (age <= HISTORY_WINDOW)
+                .then_some((window_secs - age.as_secs_f64(), sample.value.min(100)))
         })
         .peekable();
 
