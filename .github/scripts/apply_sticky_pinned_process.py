@@ -140,12 +140,12 @@ new_draw = '''fn draw_processes(frame: &mut Frame, area: Rect, processes: &[Proc
 text = text[:start] + new_draw + text[end:]
 
 needle = "fn process_sort_name(key: ProcessSortKey) -> &'static str {"
-helper = '''fn sorted_processes_with_pin<'a>(
-    processes: &'a [ProcessStats],
+helper = '''fn sorted_processes_with_pin(
+    processes: &[ProcessStats],
     key: ProcessSortKey,
     descending: bool,
     pinned_pid: Option<u32>,
-) -> (Option<&'a ProcessStats>, Vec<&'a ProcessStats>) {
+) -> (Option<&ProcessStats>, Vec<&ProcessStats>) {
     let mut sorted = sorted_processes(processes, key, descending);
     let pinned = pinned_pid.and_then(|pid| {
         let index = sorted.iter().position(|process| process.pid == pid)?;
