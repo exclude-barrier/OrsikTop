@@ -111,8 +111,7 @@ pub fn draw(
                 Constraint::Length(3),
                 Constraint::Length(7),
                 Constraint::Length(llm_height),
-                Constraint::Length(5),
-                Constraint::Min(0),
+                Constraint::Min(5),
                 Constraint::Length(3),
             ])
             .split(area)
@@ -135,7 +134,7 @@ pub fn draw(
 
     if show_history {
         draw_history(frame, rows[3], state);
-        draw_footer(frame, rows[5], llm, gpu, refresh_ms);
+        draw_footer(frame, rows[4], llm, gpu, refresh_ms);
     } else {
         draw_footer(frame, rows[4], llm, gpu, refresh_ms);
     }
