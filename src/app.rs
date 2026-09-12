@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::Stdout,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -142,6 +143,7 @@ fn spawn_fast_worker(
         let mut system = System::new();
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
+        let mut previous_cpu_times = read_cpu_times();
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
@@ -152,10 +154,34 @@ fn spawn_fast_worker(
             {
                 system.refresh_cpu_usage();
                 system.refresh_memory();
+
+                let current_cpu_times = read_cpu_times();
+                let io_wait_pct = previous_cpu_times
+                    .zip(current_cpu_times)
+                    .and_then(|(previous, current)| io_wait_percent(previous, current));
+                if current_cpu_times.is_some() {
+                    previous_cpu_times = current_cpu_times;
+                }
+
+                let (load_one, load_five, load_fifteen) =
+                    read_load_average().unwrap_or((0.0, 0.0, 0.0));
                 system_stats = SystemStats {
                     cpu_usage: system.global_cpu_usage() as f64,
+                    per_cpu_usage: system
+                        .cpus()
+                        .iter()
+                        .map(|cpu| cpu.cpu_usage() as f64)
+                        .collect(),
+                    cpu_frequency_mhz: read_cpu_frequency_mhz(),
+                    cpu_temperature_c: read_cpu_temperature_c(),
+                    io_wait_pct,
+                    load_one,
+                    load_five,
+                    load_fifteen,
                     memory_used_bytes: system.used_memory(),
                     memory_total_bytes: system.total_memory(),
+                    swap_used_bytes: system.used_swap(),
+                    swap_total_bytes: system.total_swap(),
                 };
                 last_system_refresh = Some(Instant::now());
             }
@@ -173,6 +199,138 @@ fn spawn_fast_worker(
             sleep_until_next_cycle(cycle_started, &refresh_ms, &stop);
         }
     });
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct CpuTimes {
+    total: u64,
+    io_wait: u64,
+}
+
+fn read_cpu_times() -> Option<CpuTimes> {
+    let text = fs::read_to_string("/proc/stat").ok()?;
+    parse_cpu_times(&text)
+}
+
+fn parse_cpu_times(text: &str) -> Option<CpuTimes> {
+    let line = text.lines().find(|line| line.starts_with("cpu "))?;
+    let values = line
+        .split_whitespace()
+        .skip(1)
+        .take(8)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() < 5 {
+        return None;
+    }
+
+    Some(CpuTimes {
+        total: values.iter().copied().sum(),
+        io_wait: values[4],
+    })
+}
+
+fn io_wait_percent(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
+    let total_delta = current.total.saturating_sub(previous.total);
+    if total_delta == 0 {
+        return None;
+    }
+    let io_wait_delta = current.io_wait.saturating_sub(previous.io_wait);
+    Some(io_wait_delta as f64 / total_delta as f64 * 100.0)
+}
+
+fn read_load_average() -> Option<(f64, f64, f64)> {
+    let text = fs::read_to_string("/proc/loadavg").ok()?;
+    let mut fields = text.split_whitespace();
+    Some((
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    ))
+}
+
+fn read_cpu_frequency_mhz() -> Option<f64> {
+    let text = fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut total = 0.0;
+    let mut count = 0u64;
+
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() != "cpu MHz" {
+            continue;
+        }
+        let Ok(mhz) = value.trim().parse::<f64>() else {
+            continue;
+        };
+        if mhz.is_finite() && mhz > 0.0 {
+            total += mhz;
+            count += 1;
+        }
+    }
+
+    (count > 0).then_some(total / count as f64)
+}
+
+fn read_cpu_temperature_c() -> Option<f64> {
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    let hwmons = fs::read_dir("/sys/class/hwmon").ok()?;
+
+    for entry in hwmons.flatten() {
+        let path = entry.path();
+        let name = fs::read_to_string(path.join("name"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let cpu_sensor = name.contains("coretemp")
+            || name.contains("k10temp")
+            || name.contains("zenpower")
+            || name.contains("cpu")
+            || name.contains("x86_pkg");
+        if !cpu_sensor {
+            continue;
+        }
+
+        let Ok(sensors) = fs::read_dir(&path) else {
+            continue;
+        };
+        for sensor in sensors.flatten() {
+            let filename = sensor.file_name();
+            let filename = filename.to_string_lossy();
+            if !filename.starts_with("temp") || !filename.ends_with("_input") {
+                continue;
+            }
+
+            let Ok(raw) = fs::read_to_string(sensor.path()) else {
+                continue;
+            };
+            let Ok(millidegrees) = raw.trim().parse::<f64>() else {
+                continue;
+            };
+            let celsius = millidegrees / 1000.0;
+            if !(-20.0..=150.0).contains(&celsius) {
+                continue;
+            }
+
+            let stem = filename.trim_end_matches("_input");
+            let label = fs::read_to_string(path.join(format!("{stem}_label")))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if label.contains("package") || label.contains("tctl") || label.contains("cpu") {
+                preferred.push(celsius);
+            } else {
+                fallback.push(celsius);
+            }
+        }
+    }
+
+    preferred
+        .into_iter()
+        .reduce(f64::max)
+        .or_else(|| fallback.into_iter().reduce(f64::max))
 }
 
 fn spawn_llm_worker(
@@ -252,5 +410,23 @@ mod tests {
         change_refresh(&mut value, false, &shared);
         assert_eq!(value, 900);
         assert_eq!(shared.load(Ordering::Relaxed), 900);
+    }
+
+    #[test]
+    fn parses_linux_cpu_times_and_iowait_delta() {
+        let previous = parse_cpu_times(
+            "cpu  100 0 50 800 20 0 10 0 0 0
+",
+        )
+        .unwrap();
+        let current = parse_cpu_times(
+            "cpu  120 0 60 850 25 0 15 0 0 0
+",
+        )
+        .unwrap();
+        assert_eq!(previous.io_wait, 20);
+        assert_eq!(current.io_wait, 25);
+        let io_wait = io_wait_percent(previous, current).unwrap();
+        assert!((io_wait - 5.555555556).abs() < 0.001);
     }
 }
