@@ -340,6 +340,10 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
                 CYAN,
                 18,
             ),
+        ]),
+        Line::from(vec![
+            label_span("        "),
+            Span::raw(" ".repeat(bar_width + 9)),
             fixed_data_pair(
                 "ENC",
                 optional_number(gpu.encoder_utilization, 0, "%"),
