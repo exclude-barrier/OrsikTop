@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::Path,
     time::{Duration, Instant},
 };
@@ -38,6 +39,7 @@ pub struct LlmStats {
     pub spec_draft_tokens: f64,
     pub spec_accepted_tokens: f64,
     pub spec_enabled: bool,
+    pub spec_is_mtp: bool,
     pub spec_n_max: Option<u64>,
     pub spec_acceptance_pct: Option<f64>,
     pub error: String,
@@ -72,6 +74,7 @@ struct CachedProps {
     context_size: u64,
     total_slots: u64,
     spec_enabled: bool,
+    spec_is_mtp: bool,
     spec_n_max: Option<u64>,
     last_refresh: Option<Instant>,
 }
@@ -120,7 +123,16 @@ impl LlamaMonitor {
         stats.context_size = self.props.context_size;
         stats.props_slot_count = self.props.total_slots;
         stats.spec_enabled = self.props.spec_enabled;
+        stats.spec_is_mtp = self.props.spec_is_mtp;
         stats.spec_n_max = self.props.spec_n_max;
+
+        if let Some(local_spec) = local_speculative_process_config(&self.base) {
+            stats.spec_enabled |= local_spec.enabled;
+            stats.spec_is_mtp |= local_spec.is_mtp;
+            if stats.spec_n_max.is_none() {
+                stats.spec_n_max = local_spec.n_max;
+            }
+        }
 
         let metrics_text = match self.client.get(format!("{}/metrics", self.base)).send() {
             Ok(response) if response.status().is_success() => match response.text() {
@@ -275,16 +287,25 @@ impl LlamaMonitor {
             .unwrap_or(self.props.total_slots);
 
         if let Some(defaults) = props.get("default_generation_settings") {
-            let (enabled, n_max) = speculative_config(defaults);
-            if let Some(enabled) = enabled {
+            let spec = speculative_config(defaults);
+            if let Some(enabled) = spec.enabled {
                 self.props.spec_enabled = enabled;
             }
-            if let Some(n_max) = n_max {
+            self.props.spec_is_mtp |= spec.is_mtp;
+            if let Some(n_max) = spec.n_max {
                 self.props.spec_n_max = (n_max > 0).then_some(n_max);
                 if n_max > 0 {
                     self.props.spec_enabled = true;
                 }
             }
+        }
+        let root_spec = speculative_config(&props);
+        if let Some(enabled) = root_spec.enabled {
+            self.props.spec_enabled |= enabled;
+        }
+        self.props.spec_is_mtp |= root_spec.is_mtp;
+        if self.props.spec_n_max.is_none() {
+            self.props.spec_n_max = root_spec.n_max.filter(|value| *value > 0);
         }
 
         let model = json_string(&props, &["model_name", "model_alias", "model_path"])
@@ -410,11 +431,12 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             busy += 1;
         }
 
-        let (slot_spec_enabled, slot_spec_n_max) = speculative_config(slot);
-        if slot_spec_enabled.unwrap_or(false) || slot_spec_n_max.is_some_and(|value| value > 0) {
+        let slot_spec = speculative_config(slot);
+        if slot_spec.enabled.unwrap_or(false) || slot_spec.n_max.is_some_and(|value| value > 0) {
             stats.spec_enabled = true;
         }
-        if let Some(n_max) = slot_spec_n_max.filter(|value| *value > 0) {
+        stats.spec_is_mtp |= slot_spec.is_mtp;
+        if let Some(n_max) = slot_spec.n_max.filter(|value| *value > 0) {
             stats.spec_n_max = Some(stats.spec_n_max.map_or(n_max, |current| current.max(n_max)));
         }
 
@@ -461,13 +483,130 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     Ok(counters)
 }
 
-fn speculative_config(value: &Value) -> (Option<bool>, Option<u64>) {
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct SpeculativeConfig {
+    enabled: Option<bool>,
+    is_mtp: bool,
+    n_max: Option<u64>,
+}
+
+fn speculative_config(value: &Value) -> SpeculativeConfig {
     let enabled = value.get("speculative").and_then(Value::as_bool);
-    let n_max = value
-        .get("params")
+    let params = value.get("params");
+    let n_max = params
         .and_then(|params| params.get("speculative.n_max"))
+        .or_else(|| value.get("speculative.n_max"))
         .and_then(Value::as_u64);
-    (enabled, n_max)
+    let types = params
+        .and_then(|params| params.get("speculative.types"))
+        .or_else(|| value.get("speculative.types"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    SpeculativeConfig {
+        enabled,
+        is_mtp: types.split(',').any(|kind| kind.trim() == "draft-mtp"),
+        n_max,
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct LocalSpeculativeConfig {
+    enabled: bool,
+    is_mtp: bool,
+    n_max: Option<u64>,
+}
+
+fn local_speculative_process_config(base: &str) -> Option<LocalSpeculativeConfig> {
+    let url = reqwest::Url::parse(base).ok()?;
+    let host = url.host_str()?;
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return None;
+    }
+    let target_port = url.port_or_known_default()?;
+
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let pid = entry.file_name();
+        if !pid.to_string_lossy().chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline = match fs::read(entry.path().join("cmdline")) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        if args.is_empty() || !args.iter().any(|arg| arg.contains("llama-server")) {
+            continue;
+        }
+        if !command_targets_port(&args, target_port) {
+            continue;
+        }
+        let env = fs::read(entry.path().join("environ")).ok();
+        return Some(speculative_from_process(&args, env.as_deref()));
+    }
+    None
+}
+
+fn command_targets_port(args: &[String], target_port: u16) -> bool {
+    let mut saw_port = false;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--port" {
+            saw_port = true;
+            if args.get(index + 1).and_then(|v| v.parse::<u16>().ok()) == Some(target_port) {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = args[index].strip_prefix("--port=") {
+            saw_port = true;
+            if value.parse::<u16>().ok() == Some(target_port) {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    !saw_port && target_port == 8080
+}
+
+fn speculative_from_process(args: &[String], env_bytes: Option<&[u8]>) -> LocalSpeculativeConfig {
+    let spec_type = cli_value(args, "--spec-type").unwrap_or_default();
+    let is_mtp = spec_type.split(',').any(|kind| kind.trim() == "draft-mtp");
+    let n_max = cli_value(args, "--spec-draft-n-max")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            env_value(env_bytes, "LLAMA_ARG_SPEC_DRAFT_N_MAX").and_then(|value| value.parse().ok())
+        });
+    let env_type = env_value(env_bytes, "LLAMA_ARG_SPEC_TYPE").unwrap_or_default();
+    let env_mtp = env_type.split(',').any(|kind| kind.trim() == "draft-mtp");
+    LocalSpeculativeConfig {
+        enabled: is_mtp || env_mtp || n_max.is_some(),
+        is_mtp: is_mtp || env_mtp,
+        n_max,
+    }
+}
+
+fn cli_value(args: &[String], flag: &str) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn env_value(env_bytes: Option<&[u8]>, key: &str) -> Option<String> {
+    env_bytes?
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix(&format!("{key}=")).map(str::to_string))
 }
 
 fn slot_delta_tps(previous: &[SlotCounter], current: &[SlotCounter], seconds: f64) -> (f64, f64) {
@@ -834,7 +973,14 @@ mod speculative_status_tests {
             "speculative": true,
             "params": {"speculative.n_max": 3}
         });
-        assert_eq!(speculative_config(&slot), (Some(true), Some(3)));
+        assert_eq!(
+            speculative_config(&slot),
+            SpeculativeConfig {
+                enabled: Some(true),
+                is_mtp: false,
+                n_max: Some(3)
+            }
+        );
     }
 
     #[test]
@@ -854,5 +1000,50 @@ mod speculative_status_tests {
         apply_slots_json(&mut stats, &slots).unwrap();
         assert!(stats.spec_enabled);
         assert_eq!(stats.spec_n_max, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod local_speculative_process_tests {
+    use super::*;
+
+    #[test]
+    fn reads_draft_mtp_type_from_custom_slot_shape() {
+        let value = serde_json::json!({
+            "speculative": true,
+            "params": {"speculative.types": "none,draft-mtp"}
+        });
+        let spec = speculative_config(&value);
+        assert_eq!(spec.enabled, Some(true));
+        assert!(spec.is_mtp);
+        assert_eq!(spec.n_max, None);
+    }
+
+    #[test]
+    fn reads_n_max_from_cli() {
+        let args = vec![
+            "llama-server".to_string(),
+            "--port".to_string(),
+            "8081".to_string(),
+            "--spec-type".to_string(),
+            "draft-mtp".to_string(),
+            "--spec-draft-n-max".to_string(),
+            "3".to_string(),
+        ];
+        let spec = speculative_from_process(&args, None);
+        assert!(spec.enabled);
+        assert!(spec.is_mtp);
+        assert_eq!(spec.n_max, Some(3));
+        assert!(command_targets_port(&args, 8081));
+    }
+
+    #[test]
+    fn reads_n_max_from_environment() {
+        let args = vec!["llama-server".to_string(), "--port=8081".to_string()];
+        let env = b"LLAMA_ARG_SPEC_TYPE=draft-mtp\0LLAMA_ARG_SPEC_DRAFT_N_MAX=3\0";
+        let spec = speculative_from_process(&args, Some(env));
+        assert!(spec.enabled);
+        assert!(spec.is_mtp);
+        assert_eq!(spec.n_max, Some(3));
     }
 }
