@@ -101,10 +101,7 @@ impl GpuMonitor {
                 .clock_info(Clock::Graphics)
                 .ok()
                 .map(|mhz| mhz as f64),
-            memory_clock_mhz: device
-                .clock_info(Clock::Memory)
-                .ok()
-                .map(|mhz| mhz as f64),
+            memory_clock_mhz: device.clock_info(Clock::Memory).ok().map(|mhz| mhz as f64),
             encoder_utilization: encoder.as_ref().map(|info| info.utilization as f64),
             decoder_utilization: decoder.as_ref().map(|info| info.utilization as f64),
             fan_percent: device.fan_speed(0).ok().map(|speed| speed as f64),
