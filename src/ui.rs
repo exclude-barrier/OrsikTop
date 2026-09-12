@@ -34,10 +34,19 @@ const RED: Color = Color::Rgb(235, 75, 75);
 const CYAN: Color = Color::Rgb(70, 195, 220);
 const WHITE: Color = Color::Rgb(225, 225, 225);
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CpuCoreKind {
+    Performance,
+    Efficiency,
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SystemStats {
     pub cpu_usage: f64,
     pub per_cpu_usage: Vec<f64>,
+    pub cpu_core_kinds: Vec<CpuCoreKind>,
     pub cpu_frequency_mhz: Option<f64>,
     pub cpu_temperature_c: Option<f64>,
     pub io_wait_pct: Option<f64>,
@@ -382,7 +391,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
 fn draw_llm_and_system(frame: &mut Frame, area: Rect, system: &SystemStats, llm: &LlmStats) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
     draw_llm(frame, cols[0], llm);
@@ -718,7 +727,25 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "—".to_string());
 
-    let lines = vec![
+    let busiest = system
+        .per_cpu_usage
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(index, _)| index);
+    let p_threads = system
+        .cpu_core_kinds
+        .iter()
+        .filter(|kind| matches!(kind, CpuCoreKind::Performance))
+        .count();
+    let e_threads = system
+        .cpu_core_kinds
+        .iter()
+        .filter(|kind| matches!(kind, CpuCoreKind::Efficiency))
+        .count();
+    let hybrid_known = p_threads > 0 && e_threads > 0;
+
+    let mut lines = vec![
         meter_line(
             "CPU",
             system.cpu_usage,
@@ -742,10 +769,6 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                 },
             ),
         ]),
-        core_matrix_line(&system.per_cpu_usage, 0),
-        core_matrix_line(&system.per_cpu_usage, 1),
-        core_matrix_line(&system.per_cpu_usage, 2),
-        core_matrix_line(&system.per_cpu_usage, 3),
         Line::from(vec![
             label_span(" LOAD "),
             value_span(
@@ -756,6 +779,30 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                 WHITE,
             ),
         ]),
+    ];
+
+    if hybrid_known {
+        lines.push(Line::from(vec![
+            label_span(" THREADS "),
+            value_span(&format!("P {p_threads}T"), BRIGHT_GREEN),
+            Span::raw("   "),
+            value_span(&format!("E {e_threads}T"), CYAN),
+        ]));
+    } else {
+        lines.push(Line::from(vec![label_span(" THREADS ")]));
+    }
+
+    for row in 0..4 {
+        lines.push(core_heatmap_line(
+            &system.per_cpu_usage,
+            &system.cpu_core_kinds,
+            row,
+            busiest,
+            hybrid_known,
+        ));
+    }
+
+    lines.extend([
         meter_line(
             "RAM",
             ram_pct,
@@ -790,40 +837,63 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                 },
             ),
         ]),
-    ];
+    ]);
 
+    lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn core_matrix_line(usages: &[f64], row: usize) -> Line<'static> {
+fn core_heatmap_line(
+    usages: &[f64],
+    kinds: &[CpuCoreKind],
+    row: usize,
+    busiest: Option<usize>,
+    show_kind: bool,
+) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    let mut rendered = false;
+    let start = row * 6;
+    let end = (start + 6).min(usages.len());
 
-    for column in 0..6 {
-        let index = row + column * 4;
-        let Some(usage) = usages.get(index).copied() else {
-            continue;
-        };
+    if start >= end {
+        return Line::from(spans);
+    }
 
-        if rendered {
-            spans.push(Span::raw("  "));
+    for (index, usage) in usages.iter().copied().enumerate().take(end).skip(start) {
+        if index > start {
+            spans.push(Span::raw(" "));
         }
+
+        let kind = kinds.get(index).copied().unwrap_or_default();
+        let suffix = if show_kind {
+            match kind {
+                CpuCoreKind::Performance => "P",
+                CpuCoreKind::Efficiency => "E",
+                CpuCoreKind::Unknown => "?",
+            }
+        } else {
+            ""
+        };
+        let mut label_style = Style::default().fg(MUTED);
+        let mut heat_style = Style::default().fg(core_usage_color(usage));
+        if busiest == Some(index) {
+            label_style = label_style.add_modifier(Modifier::BOLD);
+            heat_style = heat_style.add_modifier(Modifier::BOLD);
+        }
+
         spans.push(Span::styled(
-            format!("{index:02} "),
-            Style::default().fg(MUTED),
+            if show_kind {
+                format!("{index:02}{suffix}")
+            } else {
+                format!("{index:02}")
+            },
+            label_style,
         ));
         spans.push(Span::styled(
             core_usage_glyph(usage).to_string(),
-            Style::default()
-                .fg(core_usage_color(usage))
-                .add_modifier(Modifier::BOLD),
+            heat_style,
         ));
-        rendered = true;
     }
 
-    if !rendered {
-        spans.push(value_span("CORES —", MUTED));
-    }
     Line::from(spans)
 }
 
@@ -833,20 +903,18 @@ fn core_usage_color(usage: f64) -> Color {
         value if value >= 75.0 => YELLOW,
         value if value >= 50.0 => BRIGHT_GREEN,
         value if value >= 25.0 => ORK_GREEN,
-        _ => DIM_GREEN,
+        value if value >= 2.0 => DIM_GREEN,
+        _ => BAR_EMPTY,
     }
 }
 
 fn core_usage_glyph(usage: f64) -> char {
     match clamp_percent(usage) {
-        value if value >= 87.5 => '█',
-        value if value >= 75.0 => '▇',
-        value if value >= 62.5 => '▆',
-        value if value >= 50.0 => '▅',
-        value if value >= 37.5 => '▄',
-        value if value >= 25.0 => '▃',
-        value if value >= 12.5 => '▂',
-        _ => '▁',
+        value if value >= 75.0 => '█',
+        value if value >= 50.0 => '▓',
+        value if value >= 25.0 => '▒',
+        value if value >= 2.0 => '░',
+        _ => '·',
     }
 }
 
@@ -1403,17 +1471,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_usage_glyph_scales_with_utilization() {
-        assert_eq!(core_usage_glyph(0.0), '▁');
-        assert_eq!(core_usage_glyph(12.5), '▂');
-        assert_eq!(core_usage_glyph(50.0), '▅');
-        assert_eq!(core_usage_glyph(87.5), '█');
+    fn core_usage_glyph_uses_heatmap_levels() {
+        assert_eq!(core_usage_glyph(0.0), '·');
+        assert_eq!(core_usage_glyph(2.0), '░');
+        assert_eq!(core_usage_glyph(25.0), '▒');
+        assert_eq!(core_usage_glyph(50.0), '▓');
+        assert_eq!(core_usage_glyph(75.0), '█');
         assert_eq!(core_usage_glyph(100.0), '█');
     }
 
     #[test]
     fn core_usage_color_uses_non_red_load_scale() {
-        assert_eq!(core_usage_color(0.0), DIM_GREEN);
+        assert_eq!(core_usage_color(0.0), BAR_EMPTY);
+        assert_eq!(core_usage_color(2.0), DIM_GREEN);
         assert_eq!(core_usage_color(25.0), ORK_GREEN);
         assert_eq!(core_usage_color(50.0), BRIGHT_GREEN);
         assert_eq!(core_usage_color(75.0), YELLOW);
