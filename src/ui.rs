@@ -321,7 +321,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         ),
         Line::from(vec![
             label_span(" I/O    "),
-            Span::raw(" ".repeat(bar_width + 9)),
+            Span::raw(" ".repeat(bar_width + 7)),
             fixed_data_pair(
                 "MEMCTRL",
                 format!("{:.0}%", gpu.memory_utilization),
@@ -343,7 +343,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         ]),
         Line::from(vec![
             label_span("        "),
-            Span::raw(" ".repeat(bar_width + 9)),
+            Span::raw(" ".repeat(bar_width + 7)),
             fixed_data_pair(
                 "ENC",
                 optional_number(gpu.encoder_utilization, 0, "%"),
