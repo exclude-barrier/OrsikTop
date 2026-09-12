@@ -1507,46 +1507,52 @@ fn draw_history_column(
 
 fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], state: &mut UiState) {
     state.process_pane = Some(area);
-    let sorted = sorted_processes(processes, state.process_sort_key, state.process_sort_desc);
-    let visible = area.height.saturating_sub(3) as usize;
-    let mut selected_index = state
-        .process_selected_pid
-        .and_then(|pid| sorted.iter().position(|process| process.pid == pid));
-    if state.process_selected_pid.is_some() && selected_index.is_none() {
+    let (pinned, sorted) = sorted_processes_with_pin(
+        processes,
+        state.process_sort_key,
+        state.process_sort_desc,
+        state.process_selected_pid,
+    );
+    if state.process_selected_pid.is_some() && pinned.is_none() {
         state.process_selected_pid = None;
-        selected_index = None;
     }
-    let max_start = sorted.len().saturating_sub(visible);
-    let mut start = state.process_scroll.min(max_start);
-    if visible > 0 {
-        if let Some(selected) = selected_index {
-            if selected < start {
-                start = selected;
-            } else if selected >= start.saturating_add(visible) {
-                start = selected.saturating_add(1).saturating_sub(visible);
-            }
-        }
-    } else {
-        start = 0;
-    }
+
+    let visible = area.height.saturating_sub(3) as usize;
+    let pinned_rows = usize::from(pinned.is_some() && visible > 0);
+    let scroll_visible = visible.saturating_sub(pinned_rows);
+    let max_start = sorted.len().saturating_sub(scroll_visible);
+    let start = state.process_scroll.min(max_start);
     state.process_scroll = start;
-    let end = start.saturating_add(visible).min(sorted.len());
+    let end = start.saturating_add(scroll_visible).min(sorted.len());
+
     let sort_name = process_sort_name(state.process_sort_key);
     let sort_arrow = if state.process_sort_desc {
         "↓"
     } else {
         "↑"
     };
-    let title = if sorted.is_empty() {
+    let total = processes.len();
+    let title = if total == 0 {
         format!(" PROCESSES · SORT {sort_name} {sort_arrow} · 0 ")
+    } else if let Some(process) = pinned {
+        let range = if scroll_visible == 0 || sorted.is_empty() {
+            "0".to_string()
+        } else {
+            format!("{}–{}", start + 1, end)
+        };
+        format!(
+            " PROCESSES · PIN {} · SORT {sort_name} {sort_arrow} · {range}/{total} ",
+            process.pid
+        )
     } else {
         format!(
             " PROCESSES · SORT {sort_name} {sort_arrow} · {}–{}/{} ",
             start + 1,
             end,
-            sorted.len()
+            total
         )
     };
+
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -1558,7 +1564,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         return;
     }
 
-    let has_scrollbar = sorted.len() > visible && visible > 0;
+    let has_scrollbar = sorted.len() > scroll_visible && scroll_visible > 0;
     let table_width = inner.width.saturating_sub(u16::from(has_scrollbar));
     let wide = table_width >= 96;
     let header = if wide {
@@ -1586,18 +1592,23 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         table_width,
         inner.height.saturating_sub(1),
     );
+
+    let mut visible_processes = Vec::with_capacity(visible);
+    if let Some(process) = pinned {
+        visible_processes.push(process);
+    }
+    visible_processes.extend(sorted.iter().skip(start).take(scroll_visible).copied());
+
     state.process_rows = Some(ProcessRowsHit {
         rect: body,
-        pids: sorted
+        pids: visible_processes
             .iter()
-            .skip(start)
-            .take(visible)
             .map(|process| process.pid)
             .collect(),
     });
 
     let mut lines = Vec::with_capacity(visible);
-    for process in sorted.iter().skip(start).take(visible) {
+    for process in visible_processes {
         let is_selected = state.process_selected_pid == Some(process.pid);
         lines.push(if wide {
             process_line_wide(process, table_width as usize, is_selected)
@@ -1620,12 +1631,12 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
             frame,
             Rect::new(
                 inner.x.saturating_add(inner.width.saturating_sub(1)),
-                inner.y.saturating_add(1),
+                body.y.saturating_add(pinned_rows as u16),
                 1,
-                inner.height.saturating_sub(1),
+                body.height.saturating_sub(pinned_rows as u16),
             ),
             start,
-            visible,
+            scroll_visible,
             sorted.len(),
         );
     }
@@ -1653,6 +1664,20 @@ fn sorted_processes(
         ordering.then_with(|| a.pid.cmp(&b.pid))
     });
     sorted
+}
+
+fn sorted_processes_with_pin(
+    processes: &[ProcessStats],
+    key: ProcessSortKey,
+    descending: bool,
+    pinned_pid: Option<u32>,
+) -> (Option<&ProcessStats>, Vec<&ProcessStats>) {
+    let mut sorted = sorted_processes(processes, key, descending);
+    let pinned = pinned_pid.and_then(|pid| {
+        let index = sorted.iter().position(|process| process.pid == pid)?;
+        Some(sorted.remove(index))
+    });
+    (pinned, sorted)
 }
 
 fn process_sort_name(key: ProcessSortKey) -> &'static str {
@@ -2438,6 +2463,35 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_process_is_removed_from_sorted_stream() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                cpu_pct: 90.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                cpu_pct: 40.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 30,
+                cpu_pct: 70.0,
+                ..ProcessStats::default()
+            },
+        ];
+
+        let (pinned, rest) =
+            sorted_processes_with_pin(&processes, ProcessSortKey::Cpu, true, Some(30));
+        assert_eq!(pinned.map(|process| process.pid), Some(30));
+        assert_eq!(
+            rest.iter().map(|process| process.pid).collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+    }
 
     #[test]
     fn physical_core_average_combines_smt_threads() {
