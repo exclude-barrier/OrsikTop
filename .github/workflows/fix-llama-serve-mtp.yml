@@ -1,0 +1,44 @@
+name: Fix llama serve MTP detection
+
+on:
+  push:
+    branches: [fix/llama-serve-mtp-detection]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/llama-serve-mtp-detection
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply patch
+        run: python .github/scripts/fix_llama_serve_mtp.py
+
+      - name: Validate
+        run: |
+          cargo fmt --all
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+
+      - name: Remove temporary patch files
+        run: |
+          rm .github/scripts/fix_llama_serve_mtp.py
+          rm .github/workflows/fix-llama-serve-mtp.yml
+
+      - name: Commit result
+        run: |
+          git config user.name "exclude-barrier"
+          git config user.email "christopher@cloudfiebig.de"
+          git add -A
+          git commit -m "Recognize llama serve for local MTP detection"
+          git push origin HEAD:fix/llama-serve-mtp-detection
