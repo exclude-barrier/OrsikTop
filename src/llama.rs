@@ -39,12 +39,26 @@ pub struct LlmStats {
 }
 
 #[derive(Default)]
-struct PreviousCounters {
+struct PreviousMetricCounters {
     at: Option<Instant>,
     prompt_total: f64,
     generated_total: f64,
     draft_total: f64,
     accepted_total: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlotCounter {
+    slot_id: u64,
+    task_id: Option<i64>,
+    prompt_processed: u64,
+    decoded: u64,
+}
+
+#[derive(Default)]
+struct PreviousSlotCounters {
+    at: Option<Instant>,
+    slots: Vec<SlotCounter>,
 }
 
 #[derive(Default)]
@@ -65,7 +79,8 @@ pub(crate) struct MetricSample {
 pub struct LlamaMonitor {
     client: Client,
     base: String,
-    previous: PreviousCounters,
+    previous_metrics: PreviousMetricCounters,
+    previous_slots: PreviousSlotCounters,
     props: CachedProps,
 }
 
@@ -78,7 +93,8 @@ impl LlamaMonitor {
         Ok(Self {
             client,
             base: server.trim_end_matches('/').to_string(),
-            previous: PreviousCounters::default(),
+            previous_metrics: PreviousMetricCounters::default(),
+            previous_slots: PreviousSlotCounters::default(),
             props: CachedProps::default(),
         })
     }
@@ -193,8 +209,15 @@ impl LlamaMonitor {
             &["llamacpp:spec_decode_num_accepted_tokens_total"],
         );
 
-        self.update_live_counters(&mut stats);
-        self.apply_slots(&mut stats);
+        let metric_live = self.update_metric_counters(&mut stats);
+        match self.apply_slots(&mut stats) {
+            Some(slots) => self.update_live_slot_throughput(&mut stats, slots),
+            None => {
+                stats.prompt_tps = metric_live.0;
+                stats.generation_tps = metric_live.1;
+                self.previous_slots = PreviousSlotCounters::default();
+            }
+        }
 
         if stats.model.is_empty() {
             stats.model = "llama.cpp model".to_string();
@@ -238,61 +261,87 @@ impl LlamaMonitor {
         }
     }
 
-    fn update_live_counters(&mut self, stats: &mut LlmStats) {
-        if let Some(previous_at) = self.previous.at {
-            let seconds = previous_at.elapsed().as_secs_f64();
+    fn update_metric_counters(&mut self, stats: &mut LlmStats) -> (f64, f64) {
+        let now = Instant::now();
+        let mut live = (0.0, 0.0);
+
+        if let Some(previous_at) = self.previous_metrics.at {
+            let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
             if seconds > 0.0 {
-                stats.prompt_tps =
-                    counter_delta(stats.prompt_total, self.previous.prompt_total) / seconds;
-                stats.generation_tps =
-                    counter_delta(stats.generated_total, self.previous.generated_total) / seconds;
+                live.0 = counter_delta(stats.prompt_total, self.previous_metrics.prompt_total)
+                    / seconds;
+                live.1 = counter_delta(stats.generated_total, self.previous_metrics.generated_total)
+                    / seconds;
             }
 
-            let draft_delta = counter_delta(stats.spec_draft_tokens, self.previous.draft_total);
+            let draft_delta =
+                counter_delta(stats.spec_draft_tokens, self.previous_metrics.draft_total);
             if draft_delta > 0.0 {
-                let accepted_delta =
-                    counter_delta(stats.spec_accepted_tokens, self.previous.accepted_total);
+                let accepted_delta = counter_delta(
+                    stats.spec_accepted_tokens,
+                    self.previous_metrics.accepted_total,
+                );
                 stats.spec_acceptance_pct =
                     Some((accepted_delta / draft_delta * 100.0).clamp(0.0, 100.0));
             }
         }
 
-        self.previous.at = Some(Instant::now());
-        self.previous.prompt_total = stats.prompt_total;
-        self.previous.generated_total = stats.generated_total;
-        self.previous.draft_total = stats.spec_draft_tokens;
-        self.previous.accepted_total = stats.spec_accepted_tokens;
+        self.previous_metrics.at = Some(now);
+        self.previous_metrics.prompt_total = stats.prompt_total;
+        self.previous_metrics.generated_total = stats.generated_total;
+        self.previous_metrics.draft_total = stats.spec_draft_tokens;
+        self.previous_metrics.accepted_total = stats.spec_accepted_tokens;
+        live
     }
 
-    fn apply_slots(&self, stats: &mut LlmStats) {
+    fn update_live_slot_throughput(&mut self, stats: &mut LlmStats, slots: Vec<SlotCounter>) {
+        let now = Instant::now();
+
+        if let Some(previous_at) = self.previous_slots.at {
+            let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
+            let (prompt_tps, generation_tps) =
+                slot_delta_tps(&self.previous_slots.slots, &slots, seconds);
+            stats.prompt_tps = prompt_tps;
+            stats.generation_tps = generation_tps;
+        }
+
+        self.previous_slots.at = Some(now);
+        self.previous_slots.slots = slots;
+    }
+
+    fn apply_slots(&self, stats: &mut LlmStats) -> Option<Vec<SlotCounter>> {
         let response = match self.client.get(format!("{}/slots", self.base)).send() {
             Ok(response) => response,
             Err(err) => {
                 stats.slots_error = format!("cannot reach /slots: {err}");
-                return;
+                return None;
             }
         };
 
         if !response.status().is_success() {
             stats.slots_error = format!("/slots returned HTTP {}", response.status());
-            return;
+            return None;
         }
 
         let value = match response.json::<Value>() {
             Ok(value) => value,
             Err(err) => {
                 stats.slots_error = format!("invalid /slots response: {err}");
-                return;
+                return None;
             }
         };
 
-        if let Err(err) = apply_slots_json(stats, &value) {
-            stats.slots_error = err;
+        match apply_slots_json(stats, &value) {
+            Ok(slots) => Some(slots),
+            Err(err) => {
+                stats.slots_error = err;
+                None
+            }
         }
     }
 }
 
-fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<(), String> {
+fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCounter>, String> {
     let slots = value
         .as_array()
         .ok_or_else(|| "/slots response is not an array".to_string())?;
@@ -304,8 +353,9 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<(), String> {
     let mut max_context_size = stats.context_size;
     let mut max_context_used = 0u64;
     let mut busy = 0u64;
+    let mut counters = Vec::with_capacity(slots.len());
 
-    for slot in slots {
+    for (index, slot) in slots.iter().enumerate() {
         let n_ctx = slot.get("n_ctx").and_then(Value::as_u64).unwrap_or(0);
         max_context_size = max_context_size.max(n_ctx);
 
@@ -324,7 +374,7 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<(), String> {
         let prompt_processed = slot
             .get("n_prompt_tokens_processed")
             .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .unwrap_or(prompt_tokens);
         let decoded = slot_decoded_tokens(slot);
 
         // Current llama.cpp exposes n_prompt_tokens as the slot's current prompt/context
@@ -335,12 +385,60 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<(), String> {
             prompt_processed.saturating_add(decoded)
         };
         max_context_used = max_context_used.max(used);
+
+        counters.push(SlotCounter {
+            slot_id: slot
+                .get("id")
+                .and_then(Value::as_u64)
+                .unwrap_or(index as u64),
+            task_id: slot.get("id_task").and_then(Value::as_i64),
+            prompt_processed,
+            decoded,
+        });
     }
 
     stats.busy_slots = busy;
     stats.context_size = max_context_size;
     stats.context_used = max_context_used;
-    Ok(())
+    Ok(counters)
+}
+
+fn slot_delta_tps(previous: &[SlotCounter], current: &[SlotCounter], seconds: f64) -> (f64, f64) {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let mut prompt_delta = 0u64;
+    let mut decoded_delta = 0u64;
+
+    for current_slot in current {
+        let Some(previous_slot) = previous.iter().find(|previous_slot| {
+            previous_slot.slot_id == current_slot.slot_id
+                && task_ids_match(previous_slot.task_id, current_slot.task_id)
+        }) else {
+            continue;
+        };
+
+        prompt_delta = prompt_delta.saturating_add(
+            current_slot
+                .prompt_processed
+                .saturating_sub(previous_slot.prompt_processed),
+        );
+        decoded_delta = decoded_delta
+            .saturating_add(current_slot.decoded.saturating_sub(previous_slot.decoded));
+    }
+
+    (
+        prompt_delta as f64 / seconds,
+        decoded_delta as f64 / seconds,
+    )
+}
+
+fn task_ids_match(previous: Option<i64>, current: Option<i64>) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => previous == current,
+        _ => true,
+    }
 }
 
 fn slot_decoded_tokens(slot: &Value) -> u64 {
@@ -544,13 +642,53 @@ mod tests {
         let slots: Value =
             serde_json::from_str(include_str!("../tests/fixtures/slots_active.json")).unwrap();
 
-        apply_slots_json(&mut stats, &slots).unwrap();
+        let counters = apply_slots_json(&mut stats, &slots).unwrap();
 
         assert!(stats.slots_available);
         assert_eq!(stats.slot_count, 2);
         assert_eq!(stats.busy_slots, 1);
         assert_eq!(stats.context_size, 196608);
         assert_eq!(stats.context_used, 38779);
+        assert_eq!(counters[0].prompt_processed, 12000);
+        assert_eq!(counters[0].decoded, 779);
+    }
+
+    #[test]
+    fn derives_live_throughput_from_matching_slot_task() {
+        let previous = vec![SlotCounter {
+            slot_id: 0,
+            task_id: Some(42),
+            prompt_processed: 1000,
+            decoded: 100,
+        }];
+        let current = vec![SlotCounter {
+            slot_id: 0,
+            task_id: Some(42),
+            prompt_processed: 1250,
+            decoded: 130,
+        }];
+
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 0.5);
+        assert_eq!(prompt_tps, 500.0);
+        assert_eq!(generation_tps, 60.0);
+    }
+
+    #[test]
+    fn new_slot_task_does_not_create_false_live_spike() {
+        let previous = vec![SlotCounter {
+            slot_id: 0,
+            task_id: Some(42),
+            prompt_processed: 1000,
+            decoded: 500,
+        }];
+        let current = vec![SlotCounter {
+            slot_id: 0,
+            task_id: Some(43),
+            prompt_processed: 100,
+            decoded: 5,
+        }];
+
+        assert_eq!(slot_delta_tps(&previous, &current, 0.5), (0.0, 0.0));
     }
 
     #[test]
