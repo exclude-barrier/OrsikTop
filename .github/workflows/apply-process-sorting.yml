@@ -16,7 +16,9 @@ jobs:
           ref: feat/clickable-process-sorting
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply patch
-        run: python .github/scripts/apply_process_sorting.py
+        run: |
+          python .github/scripts/apply_process_sorting.py
+          python .github/scripts/fix_process_sorting_clippy.py
       - name: Format
         run: cargo fmt --all
       - name: Validate
@@ -28,6 +30,7 @@ jobs:
       - name: Remove temporary patch files
         run: |
           rm .github/scripts/apply_process_sorting.py
+          rm .github/scripts/fix_process_sorting_clippy.py
           rm .github/workflows/apply-process-sorting.yml
       - name: Commit result
         run: |
