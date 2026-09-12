@@ -19,9 +19,17 @@ use crate::{
     ui::{self, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS},
 };
 
+const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Debug, Default)]
-struct TelemetrySnapshot {
+struct DashboardSnapshot {
     llm: LlmStats,
+    gpu: GpuStats,
+    system: SystemStats,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FastSnapshot {
     gpu: GpuStats,
     system: SystemStats,
 }
@@ -30,26 +38,38 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     server: &str,
     initial_refresh_ms: u64,
+    gpu_index: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut refresh_ms = initial_refresh_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
     let refresh_shared = Arc::new(AtomicU64::new(refresh_ms));
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::sync_channel::<TelemetrySnapshot>(2);
+    let (fast_tx, fast_rx) = mpsc::sync_channel::<FastSnapshot>(2);
+    let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmStats>(2);
 
-    spawn_telemetry_worker(
+    spawn_fast_worker(
+        gpu_index,
+        Arc::clone(&refresh_shared),
+        Arc::clone(&stop),
+        fast_tx,
+    );
+    spawn_llm_worker(
         server.to_string(),
         Arc::clone(&refresh_shared),
         Arc::clone(&stop),
-        tx,
+        llm_tx,
     );
 
-    let mut snapshot = TelemetrySnapshot::default();
+    let mut snapshot = DashboardSnapshot::default();
     let mut ui_state = UiState::default();
 
     loop {
-        while let Ok(next) = rx.try_recv() {
+        while let Ok(next) = fast_rx.try_recv() {
             ui_state.push_sample(&next.gpu, &next.system);
-            snapshot = next;
+            snapshot.gpu = next.gpu;
+            snapshot.system = next.system;
+        }
+        while let Ok(next) = llm_rx.try_recv() {
+            snapshot.llm = next;
         }
 
         terminal.draw(|frame| {
@@ -111,11 +131,55 @@ fn change_refresh(refresh_ms: &mut u64, increase: bool, shared: &AtomicU64) {
     shared.store(*refresh_ms, Ordering::Relaxed);
 }
 
-fn spawn_telemetry_worker(
+fn spawn_fast_worker(
+    gpu_index: u32,
+    refresh_ms: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    tx: SyncSender<FastSnapshot>,
+) {
+    thread::spawn(move || {
+        let gpu = GpuMonitor::new(gpu_index);
+        let mut system = System::new();
+        let mut system_stats = SystemStats::default();
+        let mut last_system_refresh: Option<Instant> = None;
+
+        while !stop.load(Ordering::Relaxed) {
+            let cycle_started = Instant::now();
+
+            if last_system_refresh
+                .map(|at| at.elapsed() >= SYSTEM_REFRESH_INTERVAL)
+                .unwrap_or(true)
+            {
+                system.refresh_cpu_usage();
+                system.refresh_memory();
+                system_stats = SystemStats {
+                    cpu_usage: system.global_cpu_usage() as f64,
+                    memory_used_bytes: system.used_memory(),
+                    memory_total_bytes: system.total_memory(),
+                };
+                last_system_refresh = Some(Instant::now());
+            }
+
+            let snapshot = FastSnapshot {
+                gpu: gpu.sample(),
+                system: system_stats.clone(),
+            };
+
+            match tx.try_send(snapshot) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+
+            sleep_until_next_cycle(cycle_started, &refresh_ms, &stop);
+        }
+    });
+}
+
+fn spawn_llm_worker(
     server: String,
     refresh_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    tx: SyncSender<TelemetrySnapshot>,
+    tx: SyncSender<LlmStats>,
 ) {
     thread::spawn(move || {
         let mut llama = LlamaMonitor::new(&server).ok();
@@ -124,35 +188,18 @@ fn spawn_telemetry_worker(
         } else {
             String::new()
         };
-        let gpu = GpuMonitor::new();
-        let mut system = System::new_all();
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
-
-            system.refresh_all();
-            let system_stats = SystemStats {
-                cpu_usage: system.global_cpu_usage() as f64,
-                memory_used_bytes: system.used_memory(),
-                memory_total_bytes: system.total_memory(),
-            };
-
-            let llm = match llama.as_mut() {
+            let stats = match llama.as_mut() {
                 Some(monitor) => monitor.sample(),
                 None => LlmStats {
                     error: llama_init_error.clone(),
                     ..Default::default()
                 },
             };
-            let gpu_stats = gpu.sample();
 
-            let snapshot = TelemetrySnapshot {
-                llm,
-                gpu: gpu_stats,
-                system: system_stats,
-            };
-
-            match tx.try_send(snapshot) {
+            match tx.try_send(stats) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Disconnected(_)) => break,
             }
