@@ -735,7 +735,7 @@ fn fixed_data_pair(
     color: Color,
     width: usize,
 ) -> Span<'static> {
-    let text = format!("  {label:<7}{value}");
+    let text = format!("  {label:<7} {value}");
     Span::styled(format!("{text:<width$}"), Style::default().fg(color))
 }
 
@@ -760,23 +760,23 @@ fn meter_line(
 }
 
 fn fine_bar(percent: f64, width: usize) -> (String, String) {
-    const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-
     if width == 0 {
         return (String::new(), String::new());
     }
 
-    let units = ((clamp_percent(percent) / 100.0) * (width * 8) as f64).round() as usize;
-    let full = (units / 8).min(width);
-    let remainder = if full < width { units % 8 } else { 0 };
+    // Braille gives two horizontal subcells per terminal cell.
+    // Full = ⣿, half = ⣇ (left column filled + baseline), empty = ⣀.
+    let units = ((clamp_percent(percent) / 100.0) * (width * 2) as f64).round() as usize;
+    let full = (units / 2).min(width);
+    let half = full < width && units % 2 == 1;
 
-    let mut filled = "█".repeat(full);
-    if remainder > 0 {
-        filled.push(PARTIAL[remainder]);
+    let mut filled = "⣿".repeat(full);
+    if half {
+        filled.push('⣇');
     }
 
-    let used_cells = full + usize::from(remainder > 0);
-    let empty = "·".repeat(width.saturating_sub(used_cells));
+    let used_cells = full + usize::from(half);
+    let empty = "⣀".repeat(width.saturating_sub(used_cells));
     (filled, empty)
 }
 
@@ -1100,10 +1100,14 @@ mod tests {
 
     #[test]
     fn fine_bar_has_subcell_resolution() {
-        assert_eq!(fine_bar(0.0, 4), ("".to_string(), "····".to_string()));
-        assert_eq!(fine_bar(12.5, 1), ("▏".to_string(), "".to_string()));
-        assert_eq!(fine_bar(50.0, 2), ("█".to_string(), "·".to_string()));
-        assert_eq!(fine_bar(100.0, 2), ("██".to_string(), "".to_string()));
+        assert_eq!(fine_bar(0.0, 4), ("".to_string(), "⣀⣀⣀⣀".to_string()));
+        assert_eq!(
+            fine_bar(10.0, 10),
+            ("⣿".to_string(), "⣀⣀⣀⣀⣀⣀⣀⣀⣀".to_string())
+        );
+        assert_eq!(fine_bar(25.0, 2), ("⣇".to_string(), "⣀".to_string()));
+        assert_eq!(fine_bar(50.0, 2), ("⣿".to_string(), "⣀".to_string()));
+        assert_eq!(fine_bar(100.0, 2), ("⣿⣿".to_string(), "".to_string()));
     }
 
     #[test]
