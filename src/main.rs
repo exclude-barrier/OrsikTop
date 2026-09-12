@@ -1,4 +1,5 @@
 mod app;
+mod cpu;
 mod gpu;
 mod llama;
 mod ui;

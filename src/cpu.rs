@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs,
-};
+use std::{collections::HashSet, fs};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum CpuVendor {
@@ -98,16 +95,8 @@ pub fn detect_cpu_topology(logical_cpus: usize) -> CpuTopology {
         core_kinds.fill(CpuCoreKind::Unknown);
     }
 
-    let performance_cores = count_kind_groups(
-        &core_groups,
-        &core_kinds,
-        CpuCoreKind::Performance,
-    );
-    let efficiency_cores = count_kind_groups(
-        &core_groups,
-        &core_kinds,
-        CpuCoreKind::Efficiency,
-    );
+    let performance_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::Performance);
+    let efficiency_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::Efficiency);
 
     CpuTopology {
         vendor,
@@ -189,11 +178,7 @@ fn apply_kind(kinds: &mut [CpuCoreKind], cpus: &[usize], kind: CpuCoreKind) {
 
 fn detect_capacity_classes(logical_cpus: usize) -> Option<Vec<CpuCoreKind>> {
     let capacities = (0..logical_cpus)
-        .map(|cpu| {
-            read_u64(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"
-            ))
-        })
+        .map(|cpu| read_u64(format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity")))
         .collect::<Vec<_>>();
 
     classify_capacity_values(&capacities)
@@ -274,7 +259,9 @@ fn classify_sibling_counts(counts: &[Option<usize>]) -> Option<Vec<CpuCoreKind>>
         })
         .collect::<Vec<_>>();
 
-    (!kinds.iter().any(|kind| matches!(kind, CpuCoreKind::Unknown))
+    (!kinds
+        .iter()
+        .any(|kind| matches!(kind, CpuCoreKind::Unknown))
         && has_both_core_kinds(&kinds))
     .then_some(kinds)
 }
@@ -282,9 +269,7 @@ fn classify_sibling_counts(counts: &[Option<usize>]) -> Option<Vec<CpuCoreKind>>
 fn read_core_groups(logical_cpus: usize) -> Vec<Option<String>> {
     (0..logical_cpus)
         .map(|cpu| {
-            let list_path = format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
-            );
+            let list_path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list");
             if let Some(cpus) = read_cpu_list_file(&list_path) {
                 return Some(
                     cpus.into_iter()
@@ -298,10 +283,9 @@ fn read_core_groups(logical_cpus: usize) -> Vec<Option<String>> {
                 "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
             ))
             .ok()?;
-            let core = fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
-            ))
-            .ok()?;
+            let core =
+                fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_id"))
+                    .ok()?;
             Some(format!("{}:{}", package.trim(), core.trim()))
         })
         .collect()
