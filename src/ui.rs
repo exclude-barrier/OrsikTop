@@ -24,6 +24,7 @@ pub const REFRESH_STEP_MS: u64 = 100;
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_MAX_SAMPLES: usize = 720;
 const REFRESH_CONTROL_WIDTH: u16 = 22;
+const PROCESS_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 const BG_BLACK: Color = Color::Rgb(0, 0, 0);
 const BAR_EMPTY: Color = Color::Rgb(48, 52, 48);
@@ -106,6 +107,8 @@ pub struct UiState {
     cpu_history: VecDeque<TimedSample>,
     ram_history: VecDeque<TimedSample>,
     process_selected_pid: Option<u32>,
+    process_pinned_pid: Option<u32>,
+    last_process_click: Option<(u32, Instant)>,
     process_scroll: usize,
     process_sort_key: ProcessSortKey,
     process_sort_desc: bool,
@@ -122,6 +125,8 @@ impl Default for UiState {
             cpu_history: VecDeque::with_capacity(600),
             ram_history: VecDeque::with_capacity(600),
             process_selected_pid: None,
+            process_pinned_pid: None,
+            last_process_click: None,
             process_scroll: 0,
             process_sort_key: ProcessSortKey::Cpu,
             process_sort_desc: true,
@@ -186,6 +191,12 @@ impl UiState {
         {
             self.process_selected_pid = None;
         }
+        if self
+            .process_pinned_pid
+            .is_some_and(|pid| !processes.iter().any(|process| process.pid == pid))
+        {
+            self.process_pinned_pid = None;
+        }
         self.process_scroll = self.process_scroll.min(processes.len().saturating_sub(1));
     }
 
@@ -205,6 +216,8 @@ impl UiState {
 
     pub fn clear_process_selection(&mut self) {
         self.process_selected_pid = None;
+        self.process_pinned_pid = None;
+        self.last_process_click = None;
     }
 
     pub fn process_pane_contains(&self, x: u16, y: u16) -> bool {
@@ -248,7 +261,22 @@ impl UiState {
         let Some(pid) = rows.pids.get(row).copied() else {
             return false;
         };
+
+        let now = Instant::now();
+        let is_double_click = self.last_process_click.is_some_and(|(last_pid, at)| {
+            last_pid == pid && now.saturating_duration_since(at) <= PROCESS_DOUBLE_CLICK_WINDOW
+        });
+
         self.process_selected_pid = Some(pid);
+        if is_double_click {
+            self.process_pinned_pid = Some(pid);
+            self.last_process_click = None;
+        } else {
+            if self.process_pinned_pid.is_some() && self.process_pinned_pid != Some(pid) {
+                self.process_pinned_pid = None;
+            }
+            self.last_process_click = Some((pid, now));
+        }
         true
     }
 
@@ -1511,10 +1539,10 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         processes,
         state.process_sort_key,
         state.process_sort_desc,
-        state.process_selected_pid,
+        state.process_pinned_pid,
     );
-    if state.process_selected_pid.is_some() && pinned.is_none() {
-        state.process_selected_pid = None;
+    if state.process_pinned_pid.is_some() && pinned.is_none() {
+        state.process_pinned_pid = None;
     }
 
     let visible = area.height.saturating_sub(3) as usize;
@@ -1609,7 +1637,8 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
 
     let mut lines = Vec::with_capacity(visible);
     for process in visible_processes {
-        let is_selected = state.process_selected_pid == Some(process.pid);
+        let is_selected = state.process_selected_pid == Some(process.pid)
+            || state.process_pinned_pid == Some(process.pid);
         lines.push(if wide {
             process_line_wide(process, table_width as usize, is_selected)
         } else {
@@ -2013,7 +2042,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
     frame.render_widget(block, area);
 
     let help = format!(
-        " [q] quit  [-]/[+] refresh  [↑/↓ Pg] proc  [click header] sort  {refresh_ms} ms  "
+        " [q] quit  [-]/[+] refresh  [↑/↓ Pg] proc  [click] select  [2x] pin  [header] sort  {refresh_ms} ms  "
     );
     let help_width = help.chars().count() as u16;
     frame.render_widget(
@@ -2491,6 +2520,48 @@ mod tests {
             rest.iter().map(|process| process.pid).collect::<Vec<_>>(),
             vec![10, 20]
         );
+    }
+
+    fn process_click_test_state() -> UiState {
+        UiState {
+            process_rows: Some(ProcessRowsHit {
+                rect: Rect::new(10, 10, 40, 2),
+                pids: vec![10, 20],
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn single_click_selects_process_without_pinning() {
+        let mut state = process_click_test_state();
+
+        assert!(state.click_process_row(12, 10));
+        assert_eq!(state.process_selected_pid, Some(10));
+        assert_eq!(state.process_pinned_pid, None);
+    }
+
+    #[test]
+    fn double_click_pins_process() {
+        let mut state = process_click_test_state();
+
+        assert!(state.click_process_row(12, 10));
+        assert!(state.click_process_row(12, 10));
+        assert_eq!(state.process_selected_pid, Some(10));
+        assert_eq!(state.process_pinned_pid, Some(10));
+    }
+
+    #[test]
+    fn clicking_another_process_releases_pin_and_selects_new_process() {
+        let mut state = process_click_test_state();
+
+        assert!(state.click_process_row(12, 10));
+        assert!(state.click_process_row(12, 10));
+        assert_eq!(state.process_pinned_pid, Some(10));
+
+        assert!(state.click_process_row(12, 11));
+        assert_eq!(state.process_selected_pid, Some(20));
+        assert_eq!(state.process_pinned_pid, None);
     }
 
     #[test]
