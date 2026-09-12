@@ -755,9 +755,11 @@ fn trend_lines(
         let Some(sample) = sample else {
             continue;
         };
-        let normalized = sample as f64 / 100.0;
-        let y = ((1.0 - normalized) * (height.saturating_sub(1)) as f64).round() as usize;
-        rows[y.min(height - 1)][x] = true;
+        let filled_rows = ((sample as f64 / 100.0) * height as f64).ceil() as usize;
+        let start = height.saturating_sub(filled_rows.min(height));
+        for row in rows.iter_mut().take(height).skip(start) {
+            row[x] = true;
+        }
     }
 
     rows.into_iter()
