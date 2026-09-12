@@ -37,6 +37,8 @@ pub struct LlmStats {
     pub spec_drafts_total: f64,
     pub spec_draft_tokens: f64,
     pub spec_accepted_tokens: f64,
+    pub spec_enabled: bool,
+    pub spec_n_max: Option<u64>,
     pub spec_acceptance_pct: Option<f64>,
     pub error: String,
 }
@@ -69,6 +71,8 @@ struct CachedProps {
     model: String,
     context_size: u64,
     total_slots: u64,
+    spec_enabled: bool,
+    spec_n_max: Option<u64>,
     last_refresh: Option<Instant>,
 }
 
@@ -115,6 +119,8 @@ impl LlamaMonitor {
         stats.model = self.props.model.clone();
         stats.context_size = self.props.context_size;
         stats.props_slot_count = self.props.total_slots;
+        stats.spec_enabled = self.props.spec_enabled;
+        stats.spec_n_max = self.props.spec_n_max;
 
         let metrics_text = match self.client.get(format!("{}/metrics", self.base)).send() {
             Ok(response) if response.status().is_success() => match response.text() {
@@ -216,6 +222,12 @@ impl LlamaMonitor {
             &metrics,
             &["llamacpp:spec_decode_num_accepted_tokens_total"],
         );
+        if stats.spec_drafts_total > 0.0
+            || stats.spec_draft_tokens > 0.0
+            || stats.spec_accepted_tokens > 0.0
+        {
+            stats.spec_enabled = true;
+        }
 
         let metric_live = self.update_metric_counters(&mut stats);
         match self.apply_slots(&mut stats) {
@@ -261,6 +273,19 @@ impl LlamaMonitor {
             .get("total_slots")
             .and_then(Value::as_u64)
             .unwrap_or(self.props.total_slots);
+
+        if let Some(defaults) = props.get("default_generation_settings") {
+            let (enabled, n_max) = speculative_config(defaults);
+            if let Some(enabled) = enabled {
+                self.props.spec_enabled = enabled;
+            }
+            if let Some(n_max) = n_max {
+                self.props.spec_n_max = (n_max > 0).then_some(n_max);
+                if n_max > 0 {
+                    self.props.spec_enabled = true;
+                }
+            }
+        }
 
         let model = json_string(&props, &["model_name", "model_alias", "model_path"])
             .map(|value| model_display_name(&value));
@@ -385,6 +410,14 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             busy += 1;
         }
 
+        let (slot_spec_enabled, slot_spec_n_max) = speculative_config(slot);
+        if slot_spec_enabled.unwrap_or(false) || slot_spec_n_max.is_some_and(|value| value > 0) {
+            stats.spec_enabled = true;
+        }
+        if let Some(n_max) = slot_spec_n_max.filter(|value| *value > 0) {
+            stats.spec_n_max = Some(stats.spec_n_max.map_or(n_max, |current| current.max(n_max)));
+        }
+
         let prompt_tokens = slot
             .get("n_prompt_tokens")
             .and_then(Value::as_u64)
@@ -426,6 +459,15 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     stats.context_size = max_context_size;
     stats.context_used = max_context_used;
     Ok(counters)
+}
+
+fn speculative_config(value: &Value) -> (Option<bool>, Option<u64>) {
+    let enabled = value.get("speculative").and_then(Value::as_bool);
+    let n_max = value
+        .get("params")
+        .and_then(|params| params.get("speculative.n_max"))
+        .and_then(Value::as_u64);
+    (enabled, n_max)
 }
 
 fn slot_delta_tps(previous: &[SlotCounter], current: &[SlotCounter], seconds: f64) -> (f64, f64) {
@@ -778,5 +820,39 @@ mod tests {
             model_display_name("/models/Qwen3.8-27B-UD-Q4_K_M.gguf"),
             "Qwen3.8-27B-UD-Q4_K_M"
         );
+    }
+}
+
+#[cfg(test)]
+mod speculative_status_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_speculative_status_and_n_max_from_slot_shape() {
+        let slot = json!({
+            "speculative": true,
+            "params": {"speculative.n_max": 3}
+        });
+        assert_eq!(speculative_config(&slot), (Some(true), Some(3)));
+    }
+
+    #[test]
+    fn slot_telemetry_marks_speculative_enabled() {
+        let mut stats = LlmStats::default();
+        let slots = json!([{
+            "id": 0,
+            "id_task": 11,
+            "n_ctx": 4096,
+            "speculative": true,
+            "is_processing": true,
+            "params": {"speculative.n_max": 3},
+            "n_prompt_tokens": 128,
+            "n_prompt_tokens_processed": 128,
+            "next_token": {"n_decoded": 9}
+        }]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert!(stats.spec_enabled);
+        assert_eq!(stats.spec_n_max, Some(3));
     }
 }

@@ -426,7 +426,18 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
     } else {
         "—".to_string()
     };
-    let (mtp, mtp_color) = match llm.spec_acceptance_pct {
+    let (mtp, mtp_color) = if llm.spec_enabled {
+        (
+            llm.spec_n_max
+                .filter(|value| *value > 0)
+                .map(|value| format!("MTP{value}"))
+                .unwrap_or_else(|| "MTP".to_string()),
+            CYAN,
+        )
+    } else {
+        ("MTP OFF".to_string(), MUTED)
+    };
+    let (acc, acc_color) = match llm.spec_acceptance_pct {
         Some(value) => (format!("{value:.0}%"), ORK_GREEN),
         None => ("—".to_string(), MUTED),
     };
@@ -474,8 +485,10 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             label_span("QUEUED "),
             value_span(&format!("{:.0}", llm.deferred_requests), WHITE),
             Span::raw("    "),
-            label_span("MTP "),
             value_span(&mtp, mtp_color),
+            Span::raw("    "),
+            label_span("ACC "),
+            value_span(&acc, acc_color),
         ]),
         Line::from(vec![
             label_span(" LIVE     "),
