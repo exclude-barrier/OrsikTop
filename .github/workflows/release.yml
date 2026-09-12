@@ -21,6 +21,15 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Verify tag matches Cargo version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$TAG" = "$PKG"
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
       - name: Build release binary
         run: cargo build --release --locked
 
