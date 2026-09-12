@@ -7,6 +7,7 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 
 const PROPS_REFRESH: Duration = Duration::from_secs(30);
+const SPEC_ACCEPTANCE_HOLD: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
@@ -21,8 +22,10 @@ pub struct LlmStats {
     pub busy_slots: u64,
     pub slots_error: String,
     pub prompt_total: f64,
-    pub prompt_cached_total: f64,
+    pub prompt_cached_total: Option<f64>,
     pub generated_total: f64,
+    pub request_prompt_tokens: u64,
+    pub request_generated_tokens: u64,
     pub prompt_seconds_total: f64,
     pub generation_seconds_total: f64,
     pub prompt_tps: f64,
@@ -82,6 +85,8 @@ pub struct LlamaMonitor {
     previous_metrics: PreviousMetricCounters,
     previous_slots: PreviousSlotCounters,
     props: CachedProps,
+    last_spec_acceptance_pct: Option<f64>,
+    last_spec_acceptance_at: Option<Instant>,
 }
 
 impl LlamaMonitor {
@@ -96,6 +101,8 @@ impl LlamaMonitor {
             previous_metrics: PreviousMetricCounters::default(),
             previous_slots: PreviousSlotCounters::default(),
             props: CachedProps::default(),
+            last_spec_acceptance_pct: None,
+            last_spec_acceptance_at: None,
         })
     }
 
@@ -144,7 +151,8 @@ impl LlamaMonitor {
                 "prompt_tokens_total",
             ],
         );
-        stats.prompt_cached_total = pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]);
+        stats.prompt_cached_total =
+            pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_cached_total"]);
         stats.generated_total = pick_metric(
             &metrics,
             &[
@@ -282,8 +290,15 @@ impl LlamaMonitor {
                     stats.spec_accepted_tokens,
                     self.previous_metrics.accepted_total,
                 );
-                stats.spec_acceptance_pct =
-                    Some((accepted_delta / draft_delta * 100.0).clamp(0.0, 100.0));
+                let acceptance = (accepted_delta / draft_delta * 100.0).clamp(0.0, 100.0);
+                self.last_spec_acceptance_pct = Some(acceptance);
+                self.last_spec_acceptance_at = Some(now);
+                stats.spec_acceptance_pct = Some(acceptance);
+            } else if self
+                .last_spec_acceptance_at
+                .is_some_and(|at| now.saturating_duration_since(at) <= SPEC_ACCEPTANCE_HOLD)
+            {
+                stats.spec_acceptance_pct = self.last_spec_acceptance_pct;
             }
         }
 
@@ -354,17 +369,19 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     let mut max_context_size = stats.context_size;
     let mut max_context_used = 0u64;
     let mut busy = 0u64;
+    let mut request_prompt_tokens = 0u64;
+    let mut request_generated_tokens = 0u64;
     let mut counters = Vec::with_capacity(slots.len());
 
     for (index, slot) in slots.iter().enumerate() {
         let n_ctx = slot.get("n_ctx").and_then(Value::as_u64).unwrap_or(0);
         max_context_size = max_context_size.max(n_ctx);
 
-        if slot
+        let is_processing = slot
             .get("is_processing")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if is_processing {
             busy += 1;
         }
 
@@ -377,6 +394,11 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             .and_then(Value::as_u64)
             .unwrap_or(prompt_tokens);
         let decoded = slot_decoded_tokens(slot);
+
+        if is_processing {
+            request_prompt_tokens = request_prompt_tokens.saturating_add(prompt_processed);
+            request_generated_tokens = request_generated_tokens.saturating_add(decoded);
+        }
 
         // Current llama.cpp exposes n_prompt_tokens as the slot's current prompt/context
         // token count. Older responses may only expose processed prompt + decoded tokens.
@@ -399,6 +421,8 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     }
 
     stats.busy_slots = busy;
+    stats.request_prompt_tokens = request_prompt_tokens;
+    stats.request_generated_tokens = request_generated_tokens;
     stats.context_size = max_context_size;
     stats.context_used = max_context_used;
     Ok(counters)
@@ -496,16 +520,17 @@ pub(crate) fn parse_prometheus(input: &str) -> Vec<MetricSample> {
     metrics
 }
 
-fn pick_metric(metrics: &[MetricSample], names: &[&str]) -> f64 {
-    for name in names {
-        if let Some(sample) = metrics
+fn pick_metric_opt(metrics: &[MetricSample], names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| {
+        metrics
             .iter()
-            .find(|sample| sample.name == *name && sample.labels.is_none())
-        {
-            return sample.value;
-        }
-    }
-    0.0
+            .find(|sample| sample.name == **name && sample.labels.is_none())
+            .map(|sample| sample.value)
+    })
+}
+
+fn pick_metric(metrics: &[MetricSample], names: &[&str]) -> f64 {
+    pick_metric_opt(metrics, names).unwrap_or(0.0)
 }
 
 fn safe_ratio(value: f64, seconds: f64) -> Option<f64> {
@@ -619,6 +644,8 @@ mod tests {
             2
         );
         assert_eq!(pick_metric(&metrics, &["llamacpp:test"]), 0.0);
+        assert_eq!(pick_metric_opt(&metrics, &["llamacpp:test"]), None);
+        assert_eq!(pick_metric_opt(&metrics, &["missing"]), None);
         assert!(!metrics.iter().any(|metric| metric.name == "not_finite"));
     }
 
@@ -652,6 +679,8 @@ mod tests {
         assert_eq!(stats.context_used, 38779);
         assert_eq!(counters[0].prompt_processed, 12000);
         assert_eq!(counters[0].decoded, 779);
+        assert_eq!(stats.request_prompt_tokens, 12000);
+        assert_eq!(stats.request_generated_tokens, 779);
     }
 
     #[test]
@@ -700,6 +729,8 @@ mod tests {
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.slot_count, 1);
         assert_eq!(stats.busy_slots, 0);
+        assert_eq!(stats.request_prompt_tokens, 0);
+        assert_eq!(stats.request_generated_tokens, 0);
         assert_eq!(stats.context_used, 0);
     }
 

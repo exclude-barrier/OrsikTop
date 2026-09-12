@@ -430,6 +430,31 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         Some(value) => (format!("{value:.0}%"), ORK_GREEN),
         None => ("—".to_string(), MUTED),
     };
+    let (phase, phase_color) = llm_phase(llm);
+    let live_pp = if llm.prompt_tps > 0.05 {
+        format!("{:>7.1} tok/s", llm.prompt_tps)
+    } else {
+        "      — tok/s".to_string()
+    };
+    let live_tg = if llm.generation_tps > 0.05 {
+        format!("{:>7.1} tok/s", llm.generation_tps)
+    } else {
+        "      — tok/s".to_string()
+    };
+    let request_pp = if llm.busy_slots > 0 {
+        llm.request_prompt_tokens.to_string()
+    } else {
+        "—".to_string()
+    };
+    let request_tg = if llm.busy_slots > 0 {
+        llm.request_generated_tokens.to_string()
+    } else {
+        "—".to_string()
+    };
+    let cache = llm
+        .prompt_cached_total
+        .map(|value| format!("{value:.0}"))
+        .unwrap_or_else(|| "—".to_string());
 
     let mut lines = vec![
         Line::from(vec![
@@ -440,19 +465,29 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             ),
         ]),
         Line::from(vec![
+            label_span(" STATE    "),
+            value_span(phase, phase_color),
+            Span::raw("    "),
+            label_span("SLOT "),
+            value_span(&slots, CYAN),
+            Span::raw("    "),
+            label_span("QUEUED "),
+            value_span(&format!("{:.0}", llm.deferred_requests), WHITE),
+            Span::raw("    "),
+            label_span("MTP "),
+            value_span(&mtp, mtp_color),
+        ]),
+        Line::from(vec![
             label_span(" LIVE     "),
-            Span::styled(
-                format!("PP {:>7.1} tok/s", llm.prompt_tps),
-                Style::default().fg(CYAN),
-            ),
+            Span::styled(format!("PP {live_pp}"), Style::default().fg(CYAN)),
             Span::raw("    "),
             Span::styled(
-                format!("TG {:>7.1} tok/s", llm.generation_tps),
+                format!("TG {live_tg}"),
                 Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            label_span(" AVG      "),
+            label_span(" SERVER   "),
             Span::styled(
                 format!("PP {:>7.1} tok/s", llm.prompt_avg_tps),
                 Style::default().fg(MUTED),
@@ -464,24 +499,19 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             ),
         ]),
         Line::from(vec![
-            label_span(" TOKENS   "),
-            value_span(&format!("{:.0} PP", llm.prompt_total), WHITE),
-            Span::raw(" + "),
-            value_span(&format!("{:.0} cache", llm.prompt_cached_total), CYAN),
-            Span::raw("  │  "),
-            value_span(&format!("{:.0} generated", llm.generated_total), WHITE),
+            label_span(" REQUEST  "),
+            value_span(&format!("PP {request_pp}"), WHITE),
+            Span::raw("    "),
+            value_span(&format!("TG {request_tg}"), WHITE),
         ]),
         Line::from(vec![
-            label_span(" QUEUE    "),
-            value_span(&format!("{:.0} active", llm.active_requests), WHITE),
-            Span::raw(" / "),
-            value_span(&format!("{:.0} deferred", llm.deferred_requests), WHITE),
+            label_span(" TOTAL    "),
+            value_span(&format!("PP {:.0}", llm.prompt_total), WHITE),
             Span::raw("    "),
-            label_span("SLOTS "),
-            value_span(&slots, CYAN),
+            value_span(&format!("TG {:.0}", llm.generated_total), WHITE),
             Span::raw("    "),
-            label_span("MTP "),
-            value_span(&mtp, mtp_color),
+            label_span("CACHE "),
+            value_span(&cache, CYAN),
         ]),
         meter_line(
             "CTX",
@@ -502,6 +532,20 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
 
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
+    if llm.generation_tps > 0.05 {
+        ("GENERATING", ORK_GREEN)
+    } else if llm.prompt_tps > 0.05 {
+        ("PREFILL", CYAN)
+    } else if llm.busy_slots > 0 || llm.active_requests > 0.0 {
+        ("PROCESSING", YELLOW)
+    } else if llm.deferred_requests > 0.0 {
+        ("QUEUED", YELLOW)
+    } else {
+        ("IDLE", MUTED)
+    }
 }
 
 fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
