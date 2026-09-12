@@ -538,7 +538,7 @@ fn local_speculative_process_config(base: &str) -> Option<LocalSpeculativeConfig
             .filter(|arg| !arg.is_empty())
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect();
-        if args.is_empty() || !args.iter().any(|arg| arg.contains("llama-server")) {
+        if args.is_empty() || !is_llama_server_process(&args) {
             continue;
         }
         if !command_targets_port(&args, target_port) {
@@ -548,6 +548,19 @@ fn local_speculative_process_config(base: &str) -> Option<LocalSpeculativeConfig
         return Some(speculative_from_process(&args, env.as_deref()));
     }
     None
+}
+
+fn is_llama_server_process(args: &[String]) -> bool {
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let executable = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable);
+
+    executable.contains("llama-server")
+        || (executable == "llama" && args.get(1).is_some_and(|arg| arg == "serve"))
 }
 
 fn command_targets_port(args: &[String], target_port: u16) -> bool {
@@ -1017,6 +1030,29 @@ mod local_speculative_process_tests {
         assert_eq!(spec.enabled, Some(true));
         assert!(spec.is_mtp);
         assert_eq!(spec.n_max, None);
+    }
+
+    #[test]
+    fn recognizes_llama_serve_subcommand_and_reads_n_max() {
+        let args = vec![
+            "/home/christopherf/.local/bin/llama".to_string(),
+            "serve".to_string(),
+            "-hf".to_string(),
+            "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M".to_string(),
+            "--port".to_string(),
+            "8081".to_string(),
+            "--spec-type".to_string(),
+            "draft-mtp".to_string(),
+            "--spec-draft-n-max".to_string(),
+            "3".to_string(),
+        ];
+
+        assert!(is_llama_server_process(&args));
+        assert!(command_targets_port(&args, 8081));
+        let spec = speculative_from_process(&args, None);
+        assert!(spec.enabled);
+        assert!(spec.is_mtp);
+        assert_eq!(spec.n_max, Some(3));
     }
 
     #[test]
