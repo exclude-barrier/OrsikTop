@@ -94,10 +94,10 @@ struct ProcessHeaderHit {
     key: ProcessSortKey,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct ProcessRowsHit {
     rect: Rect,
-    start: usize,
+    pids: Vec<u32>,
 }
 
 pub struct UiState {
@@ -105,7 +105,8 @@ pub struct UiState {
     vram_history: VecDeque<TimedSample>,
     cpu_history: VecDeque<TimedSample>,
     ram_history: VecDeque<TimedSample>,
-    process_selected: usize,
+    process_selected_pid: Option<u32>,
+    process_scroll: usize,
     process_sort_key: ProcessSortKey,
     process_sort_desc: bool,
     process_header_hits: Vec<ProcessHeaderHit>,
@@ -120,7 +121,8 @@ impl Default for UiState {
             vram_history: VecDeque::with_capacity(600),
             cpu_history: VecDeque::with_capacity(600),
             ram_history: VecDeque::with_capacity(600),
-            process_selected: 0,
+            process_selected_pid: None,
+            process_scroll: 0,
             process_sort_key: ProcessSortKey::Cpu,
             process_sort_desc: true,
             process_header_hits: Vec::new(),
@@ -145,31 +147,64 @@ impl UiState {
         push_history_at(&mut self.ram_history, ram, now);
     }
 
-    pub fn move_process_selection(&mut self, delta: isize, total: usize) {
-        if total == 0 {
-            self.process_selected = 0;
+    pub fn move_process_selection(&mut self, delta: isize, processes: &[ProcessStats]) {
+        let sorted = sorted_processes(processes, self.process_sort_key, self.process_sort_desc);
+        if sorted.is_empty() {
+            self.process_selected_pid = None;
+            self.process_scroll = 0;
             return;
         }
-        let max = total - 1;
-        self.process_selected = if delta.is_negative() {
-            self.process_selected.saturating_sub(delta.unsigned_abs())
+
+        let current = self
+            .process_selected_pid
+            .and_then(|pid| sorted.iter().position(|process| process.pid == pid))
+            .unwrap_or_else(|| self.process_scroll.min(sorted.len() - 1));
+        let target = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
         } else {
-            self.process_selected
+            current.saturating_add(delta as usize).min(sorted.len() - 1)
+        };
+        self.process_selected_pid = Some(sorted[target].pid);
+    }
+
+    pub fn process_home(&mut self, processes: &[ProcessStats]) {
+        let sorted = sorted_processes(processes, self.process_sort_key, self.process_sort_desc);
+        self.process_selected_pid = sorted.first().map(|process| process.pid);
+        self.process_scroll = 0;
+    }
+
+    pub fn process_end(&mut self, processes: &[ProcessStats]) {
+        let sorted = sorted_processes(processes, self.process_sort_key, self.process_sort_desc);
+        self.process_selected_pid = sorted.last().map(|process| process.pid);
+        self.process_scroll = sorted.len().saturating_sub(1);
+    }
+
+    pub fn clamp_process_selection(&mut self, processes: &[ProcessStats]) {
+        if self
+            .process_selected_pid
+            .is_some_and(|pid| !processes.iter().any(|process| process.pid == pid))
+        {
+            self.process_selected_pid = None;
+        }
+        self.process_scroll = self.process_scroll.min(processes.len().saturating_sub(1));
+    }
+
+    pub fn scroll_processes(&mut self, delta: isize, total: usize) {
+        if total == 0 {
+            self.process_scroll = 0;
+            return;
+        }
+        self.process_scroll = if delta.is_negative() {
+            self.process_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.process_scroll
                 .saturating_add(delta as usize)
-                .min(max)
+                .min(total.saturating_sub(1))
         };
     }
 
-    pub fn process_home(&mut self) {
-        self.process_selected = 0;
-    }
-
-    pub fn process_end(&mut self, total: usize) {
-        self.process_selected = total.saturating_sub(1);
-    }
-
-    pub fn clamp_process_selection(&mut self, total: usize) {
-        self.process_selected = self.process_selected.min(total.saturating_sub(1));
+    pub fn clear_process_selection(&mut self) {
+        self.process_selected_pid = None;
     }
 
     pub fn process_pane_contains(&self, x: u16, y: u16) -> bool {
@@ -196,22 +231,24 @@ impl UiState {
                 ProcessSortKey::Cpu | ProcessSortKey::Memory | ProcessSortKey::Threads
             );
         }
-        self.process_selected = 0;
+        if self.process_selected_pid.is_none() {
+            self.process_scroll = 0;
+        }
         true
     }
 
-    pub fn click_process_row(&mut self, x: u16, y: u16, total: usize) -> bool {
-        let Some(rows) = self.process_rows else {
+    pub fn click_process_row(&mut self, x: u16, y: u16) -> bool {
+        let Some(rows) = self.process_rows.as_ref() else {
             return false;
         };
         if !rect_contains(rows.rect, x, y) {
             return false;
         }
-        let index = rows.start + y.saturating_sub(rows.rect.y) as usize;
-        if index >= total {
+        let row = y.saturating_sub(rows.rect.y) as usize;
+        let Some(pid) = rows.pids.get(row).copied() else {
             return false;
-        }
-        self.process_selected = index;
+        };
+        self.process_selected_pid = Some(pid);
         true
     }
 
@@ -1472,13 +1509,27 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
     state.process_pane = Some(area);
     let sorted = sorted_processes(processes, state.process_sort_key, state.process_sort_desc);
     let visible = area.height.saturating_sub(3) as usize;
-    let selected = state.process_selected.min(sorted.len().saturating_sub(1));
+    let mut selected_index = state
+        .process_selected_pid
+        .and_then(|pid| sorted.iter().position(|process| process.pid == pid));
+    if state.process_selected_pid.is_some() && selected_index.is_none() {
+        state.process_selected_pid = None;
+        selected_index = None;
+    }
     let max_start = sorted.len().saturating_sub(visible);
-    let start = if visible == 0 {
-        0
+    let mut start = state.process_scroll.min(max_start);
+    if visible > 0 {
+        if let Some(selected) = selected_index {
+            if selected < start {
+                start = selected;
+            } else if selected >= start.saturating_add(visible) {
+                start = selected.saturating_add(1).saturating_sub(visible);
+            }
+        }
     } else {
-        selected.saturating_sub(visible / 2).min(max_start)
-    };
+        start = 0;
+    }
+    state.process_scroll = start;
     let end = start.saturating_add(visible).min(sorted.len());
     let sort_name = process_sort_name(state.process_sort_key);
     let sort_arrow = if state.process_sort_desc {
@@ -1535,11 +1586,19 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         table_width,
         inner.height.saturating_sub(1),
     );
-    state.process_rows = Some(ProcessRowsHit { rect: body, start });
+    state.process_rows = Some(ProcessRowsHit {
+        rect: body,
+        pids: sorted
+            .iter()
+            .skip(start)
+            .take(visible)
+            .map(|process| process.pid)
+            .collect(),
+    });
 
     let mut lines = Vec::with_capacity(visible);
-    for (index, process) in sorted.iter().enumerate().skip(start).take(visible) {
-        let is_selected = index == selected;
+    for process in sorted.iter().skip(start).take(visible) {
+        let is_selected = state.process_selected_pid == Some(process.pid);
         lines.push(if wide {
             process_line_wide(process, table_width as usize, is_selected)
         } else {
