@@ -18,6 +18,11 @@ text = text.replace(
     '    if inner.width < 35 || inner.height < 10 {',
     1,
 )
+text = text.replace(
+    '.map(|value| format!("{:.2}G", value / 1000.0))',
+    '.map(|value| format!("{:.2} GHz", value / 1000.0))',
+    1,
+)
 
 start = text.index('    let max_per_row = inner.width.saturating_sub(11).max(1) as usize;')
 end = text.index('fn core_usage_glyph(usage: f64) -> char {', start)
@@ -32,7 +37,7 @@ replacement = '''    let lines = vec![
         ),
         Line::from(vec![
             label_span("      "),
-            value_span(&format!("{frequency} GHz"), CYAN),
+            value_span(&frequency, CYAN),
             label_span("   "),
             value_span(&temperature, temperature_tint),
             label_span("   IOW "),
