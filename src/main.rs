@@ -67,12 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    app::run(
-        &mut terminal,
-        &server,
-        args.interval_ms,
-        args.gpu_index,
-    )
+    app::run(&mut terminal, &server, args.interval_ms, args.gpu_index)
 }
 
 fn resolve_server(explicit: Option<String>) -> String {
@@ -86,11 +81,7 @@ fn discover_local_llama_server() -> Option<String> {
     let mut candidates = Vec::new();
 
     for entry in fs::read_dir("/proc").ok()?.flatten() {
-        let pid = entry
-            .file_name()
-            .to_string_lossy()
-            .parse::<u32>()
-            .ok();
+        let pid = entry.file_name().to_string_lossy().parse::<u32>().ok();
         let Some(pid) = pid else {
             continue;
         };
