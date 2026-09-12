@@ -12,7 +12,7 @@ use ratatui::{
 };
 
 use crate::{
-    cpu::{CpuCoreKind, CpuTopology, CpuVendor},
+    cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     gpu::GpuStats,
     llama::LlmStats,
 };
@@ -766,14 +766,24 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         ]),
     ];
 
-    lines.extend(core_heatmap_rows(
-        &system.per_cpu_usage,
-        &system.cpu_topology.core_kinds,
-        inner.width,
-        busiest,
-        system.cpu_topology.is_hybrid(),
-        4,
-    ));
+    if system.cpu_topology.is_hybrid() && !system.cpu_topology.physical_core_groups.is_empty() {
+        lines.extend(physical_core_rows(
+            &system.per_cpu_usage,
+            &system.cpu_topology.physical_core_groups,
+            inner.width,
+            busiest,
+            4,
+        ));
+    } else {
+        lines.extend(core_heatmap_rows(
+            &system.per_cpu_usage,
+            &system.cpu_topology.core_kinds,
+            inner.width,
+            busiest,
+            system.cpu_topology.is_hybrid(),
+            4,
+        ));
+    }
 
     lines.extend([
         meter_line(
@@ -907,6 +917,119 @@ fn truncate_title(title: &str, max_len: usize) -> String {
         .collect::<String>();
     result.push('…');
     result
+}
+
+fn physical_core_rows(
+    usages: &[f64],
+    cores: &[CpuPhysicalCore],
+    width: u16,
+    busiest: Option<usize>,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if max_rows < 2 {
+        return Vec::new();
+    }
+
+    let performance = cores
+        .iter()
+        .filter(|core| core.kind == CpuCoreKind::Performance)
+        .collect::<Vec<_>>();
+    let efficiency = cores
+        .iter()
+        .filter(|core| core.kind == CpuCoreKind::Efficiency)
+        .collect::<Vec<_>>();
+
+    if performance.is_empty() || efficiency.is_empty() {
+        return Vec::new();
+    }
+
+    let p_rows = (max_rows / 2).max(1);
+    let e_rows = max_rows.saturating_sub(p_rows).max(1);
+    let mut lines = physical_kind_rows(
+        usages,
+        &performance,
+        "P",
+        BRIGHT_GREEN,
+        width,
+        busiest,
+        p_rows,
+    );
+    lines.extend(physical_kind_rows(
+        usages,
+        &efficiency,
+        "E",
+        CYAN,
+        width,
+        busiest,
+        e_rows,
+    ));
+    lines.truncate(max_rows);
+    lines
+}
+
+fn physical_kind_rows(
+    usages: &[f64],
+    cores: &[&CpuPhysicalCore],
+    prefix: &'static str,
+    label_color: Color,
+    width: u16,
+    busiest: Option<usize>,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if cores.is_empty() || max_rows == 0 {
+        return Vec::new();
+    }
+
+    // Typical hybrid cores fit in ~7 terminal cells ("P0 ░·  "), so size
+    // rows from the actual panel width while preferring two rows per core class.
+    let max_cols = (width.saturating_sub(2) as usize / 7).max(1);
+    let cols = cores.len().div_ceil(max_rows).max(1).min(max_cols);
+    let visible = (cols * max_rows).min(cores.len());
+    let mut lines = Vec::new();
+
+    for row in 0..max_rows {
+        let start = row * cols;
+        let end = ((row + 1) * cols).min(visible);
+        if start >= end {
+            break;
+        }
+
+        let mut spans = vec![Span::raw(" ")];
+        for (offset, core) in cores[start..end].iter().enumerate() {
+            let core_index = start + offset;
+            if offset > 0 {
+                spans.push(Span::raw("  "));
+            }
+
+            let core_is_busiest = busiest
+                .map(|cpu| core.logical_cpus.contains(&cpu))
+                .unwrap_or(false);
+            let mut label_style = Style::default().fg(label_color);
+            if core_is_busiest {
+                label_style = label_style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(format!("{prefix}{core_index} "), label_style));
+
+            let mut rendered_threads = 0usize;
+            for &logical_cpu in core.logical_cpus.iter().take(2) {
+                let usage = usages.get(logical_cpu).copied().unwrap_or(0.0);
+                let mut style = Style::default().fg(core_usage_color(usage));
+                if busiest == Some(logical_cpu) {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                spans.push(Span::styled(core_usage_glyph(usage).to_string(), style));
+                rendered_threads += 1;
+            }
+
+            // Align single-thread E-cores with the two-thread P-core cells.
+            if rendered_threads < 2 {
+                spans.push(Span::raw(" "));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines
 }
 
 fn core_heatmap_rows(

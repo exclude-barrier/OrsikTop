@@ -28,6 +28,12 @@ pub enum CpuCoreKind {
     Unknown,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuPhysicalCore {
+    pub kind: CpuCoreKind,
+    pub logical_cpus: Vec<usize>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CpuTopology {
     pub vendor: CpuVendor,
@@ -37,6 +43,7 @@ pub struct CpuTopology {
     pub performance_cores: Option<usize>,
     pub efficiency_cores: Option<usize>,
     pub core_kinds: Vec<CpuCoreKind>,
+    pub physical_core_groups: Vec<CpuPhysicalCore>,
 }
 
 impl CpuTopology {
@@ -97,6 +104,7 @@ pub fn detect_cpu_topology(logical_cpus: usize) -> CpuTopology {
 
     let performance_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::Performance);
     let efficiency_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::Efficiency);
+    let physical_core_groups = build_physical_core_groups(&core_groups, &core_kinds);
 
     CpuTopology {
         vendor,
@@ -106,6 +114,7 @@ pub fn detect_cpu_topology(logical_cpus: usize) -> CpuTopology {
         performance_cores,
         efficiency_cores,
         core_kinds,
+        physical_core_groups,
     }
 }
 
@@ -291,6 +300,45 @@ fn read_core_groups(logical_cpus: usize) -> Vec<Option<String>> {
         .collect()
 }
 
+fn build_physical_core_groups(
+    groups: &[Option<String>],
+    kinds: &[CpuCoreKind],
+) -> Vec<CpuPhysicalCore> {
+    if groups.len() != kinds.len() || groups.is_empty() || groups.iter().any(Option::is_none) {
+        return Vec::new();
+    }
+
+    let mut keyed = Vec::<(String, CpuPhysicalCore)>::new();
+    for (logical_cpu, (group, kind)) in groups.iter().zip(kinds).enumerate() {
+        let Some(key) = group.as_ref() else {
+            return Vec::new();
+        };
+
+        if let Some((_, core)) = keyed.iter_mut().find(|(existing, _)| existing == key) {
+            if core.kind != *kind {
+                core.kind = CpuCoreKind::Unknown;
+            }
+            core.logical_cpus.push(logical_cpu);
+        } else {
+            keyed.push((
+                key.clone(),
+                CpuPhysicalCore {
+                    kind: *kind,
+                    logical_cpus: vec![logical_cpu],
+                },
+            ));
+        }
+    }
+
+    keyed
+        .into_iter()
+        .map(|(_, mut core)| {
+            core.logical_cpus.sort_unstable();
+            core
+        })
+        .collect()
+}
+
 fn count_unique_groups(groups: &[Option<String>]) -> Option<usize> {
     if groups.is_empty() || groups.iter().any(Option::is_none) {
         return None;
@@ -386,6 +434,47 @@ mod tests {
         let (vendor, model) = parse_cpu_identity(text);
         assert_eq!(vendor, CpuVendor::Amd);
         assert_eq!(model, "AMD Ryzen 9 9950X 16-Core");
+    }
+
+    #[test]
+    fn groups_logical_threads_into_physical_cores() {
+        let groups = vec![
+            Some("0,4".to_string()),
+            Some("1,5".to_string()),
+            Some("2".to_string()),
+            Some("3".to_string()),
+            Some("0,4".to_string()),
+            Some("1,5".to_string()),
+        ];
+        let kinds = vec![
+            CpuCoreKind::Performance,
+            CpuCoreKind::Performance,
+            CpuCoreKind::Efficiency,
+            CpuCoreKind::Efficiency,
+            CpuCoreKind::Performance,
+            CpuCoreKind::Performance,
+        ];
+        assert_eq!(
+            build_physical_core_groups(&groups, &kinds),
+            vec![
+                CpuPhysicalCore {
+                    kind: CpuCoreKind::Performance,
+                    logical_cpus: vec![0, 4],
+                },
+                CpuPhysicalCore {
+                    kind: CpuCoreKind::Performance,
+                    logical_cpus: vec![1, 5],
+                },
+                CpuPhysicalCore {
+                    kind: CpuCoreKind::Efficiency,
+                    logical_cpus: vec![2],
+                },
+                CpuPhysicalCore {
+                    kind: CpuCoreKind::Efficiency,
+                    logical_cpus: vec![3],
+                },
+            ]
+        );
     }
 
     #[test]
