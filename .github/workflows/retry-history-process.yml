@@ -1,0 +1,53 @@
+name: Retry history process pane
+
+on:
+  push:
+    branches:
+      - feat/history-process-pane
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/history-process-pane
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Fix sysinfo 0.33 process refresh
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/apply_history_process.py')
+          s = p.read_text()
+          s = s.replace("                        .with_exe(UpdateKind::OnlyIfNotSet)\n                        .without_tasks(),", "                        .with_exe(UpdateKind::OnlyIfNotSet),")
+          p.write_text(s)
+          PY
+      - name: Apply patch
+        run: python .github/scripts/apply_history_process.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Validate
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo run --locked -- --help >/dev/null
+      - name: Remove temporary patch files
+        run: |
+          rm -f .github/scripts/apply_history_process.py
+          rm -f .github/workflows/apply-history-process.yml
+          rm -f .github/workflows/retry-history-process.yml
+      - name: Commit result
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Split history and process monitor panes'
+          git push origin HEAD:feat/history-process-pane
