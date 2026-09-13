@@ -80,6 +80,7 @@ pub fn run(
             snapshot.system = next.system;
         }
         while let Ok(next) = llm_rx.try_recv() {
+            ui_state.observe_llm_sample(&next);
             snapshot.llm = next;
         }
 
@@ -131,6 +132,7 @@ pub fn run(
                                 Ok(()) => {
                                     server = endpoint.clone();
                                     snapshot.llm = LlmStats::default();
+                                    ui_state.reset_llm_connection_state();
                                     let _ = server_tx.send(endpoint);
                                     ui_state.close_settings();
                                 }
@@ -543,11 +545,12 @@ fn spawn_llm_worker(
 }
 
 fn stabilize_llm_sample(
-    stats: LlmStats,
+    mut stats: LlmStats,
     last_good: &mut Option<(LlmStats, Instant)>,
     now: Instant,
 ) -> LlmStats {
     if stats.connected {
+        stats.reconnecting = false;
         *last_good = Some((stats.clone(), now));
         return stats;
     }
@@ -563,6 +566,7 @@ fn stabilize_llm_sample(
             if now.saturating_duration_since(*at) <= LLM_OFFLINE_GRACE {
                 let mut held = previous.clone();
                 held.error.clear();
+                held.reconnecting = true;
                 return held;
             }
         }
@@ -614,6 +618,29 @@ mod tests {
         change_refresh(&mut value, false, &shared);
         assert_eq!(value, 900);
         assert_eq!(shared.load(Ordering::Relaxed), 900);
+    }
+
+    #[test]
+    fn transient_llm_failure_keeps_last_sample_and_marks_reconnecting() {
+        let now = Instant::now();
+        let mut last_good = None;
+        let good = LlmStats {
+            connected: true,
+            prompt_tps: 123.0,
+            ..LlmStats::default()
+        };
+        let fresh = stabilize_llm_sample(good, &mut last_good, now);
+        assert!(fresh.connected);
+        assert!(!fresh.reconnecting);
+
+        let failed = LlmStats {
+            error: "cannot reach llama.cpp: timeout".to_string(),
+            ..LlmStats::default()
+        };
+        let held = stabilize_llm_sample(failed, &mut last_good, now + Duration::from_millis(500));
+        assert!(held.connected);
+        assert!(held.reconnecting);
+        assert_eq!(held.prompt_tps, 123.0);
     }
 
     #[test]

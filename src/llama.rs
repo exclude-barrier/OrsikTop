@@ -13,6 +13,7 @@ const SPEC_ACCEPTANCE_HOLD: Duration = Duration::from_secs(3);
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
     pub connected: bool,
+    pub reconnecting: bool,
     pub model: String,
     pub context_size: u64,
     pub context_used: u64,
