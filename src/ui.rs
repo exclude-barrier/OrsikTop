@@ -121,6 +121,7 @@ pub struct UiState {
     expanded_process_groups: HashSet<String>,
     process_scroll: usize,
     process_display_total: usize,
+    process_scroll_visible: usize,
     process_sort_key: ProcessSortKey,
     process_sort_desc: bool,
     process_header_hits: Vec<ProcessHeaderHit>,
@@ -145,6 +146,7 @@ impl Default for UiState {
             expanded_process_groups: HashSet::new(),
             process_scroll: 0,
             process_display_total: 0,
+            process_scroll_visible: 0,
             process_sort_key: ProcessSortKey::Cpu,
             process_sort_desc: true,
             process_header_hits: Vec::new(),
@@ -171,6 +173,7 @@ impl UiState {
     }
 
     pub fn move_process_selection(&mut self, delta: isize, processes: &[ProcessStats]) {
+        self.normalize_process_selection(processes);
         let targets = self.process_navigation_targets(processes);
         if targets.is_empty() {
             self.process_selected_pid = None;
@@ -181,16 +184,17 @@ impl UiState {
 
         let current = self
             .current_process_target()
-            .and_then(|selected| targets.iter().position(|target| *target == selected))
-            .unwrap_or_else(|| self.process_scroll.min(targets.len() - 1));
-        let target = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current
+            .and_then(|selected| targets.iter().position(|target| *target == selected));
+        let target = match current {
+            Some(current) if delta.is_negative() => current.saturating_sub(delta.unsigned_abs()),
+            Some(current) => current
                 .saturating_add(delta as usize)
-                .min(targets.len() - 1)
+                .min(targets.len() - 1),
+            None if delta.is_negative() => self.process_scroll.min(targets.len() - 1),
+            None => self.process_scroll.min(targets.len() - 1),
         };
         self.select_process_target(&targets[target]);
+        self.ensure_selected_process_visible(processes);
     }
 
     pub fn process_home(&mut self, processes: &[ProcessStats]) {
@@ -202,6 +206,7 @@ impl UiState {
             self.process_selected_group = None;
         }
         self.process_scroll = 0;
+        self.ensure_selected_process_visible(processes);
     }
 
     pub fn process_end(&mut self, processes: &[ProcessStats]) {
@@ -213,6 +218,7 @@ impl UiState {
             self.process_selected_group = None;
         }
         self.process_scroll = targets.len().saturating_sub(1);
+        self.ensure_selected_process_visible(processes);
     }
 
     fn current_process_target(&self) -> Option<ProcessRowTarget> {
@@ -260,6 +266,86 @@ impl UiState {
         targets
     }
 
+    fn process_scroll_targets(&self, processes: &[ProcessStats]) -> Vec<ProcessRowTarget> {
+        let (_, mut rows) = grouped_process_rows(
+            processes,
+            self.process_sort_key,
+            self.process_sort_desc,
+            self.process_pinned_pid,
+            &self.expanded_process_groups,
+        );
+        let _ = take_pinned_group_rows(&mut rows, self.process_pinned_group.as_deref());
+        rows.iter().map(process_row_target).collect()
+    }
+
+    fn normalize_process_selection(&mut self, processes: &[ProcessStats]) {
+        let Some(selected) = self.current_process_target() else {
+            return;
+        };
+        let targets = self.process_navigation_targets(processes);
+        if targets.contains(&selected) {
+            return;
+        }
+
+        match selected {
+            ProcessRowTarget::Process(pid) => {
+                if let Some(process) = processes.iter().find(|process| process.pid == pid) {
+                    let group = ProcessRowTarget::Group(process.program.clone());
+                    if targets.contains(&group) {
+                        self.select_process_target(&group);
+                        return;
+                    }
+                }
+            }
+            ProcessRowTarget::Group(program) => {
+                if let Some(process) = processes.iter().find(|process| process.program == program) {
+                    let process_target = ProcessRowTarget::Process(process.pid);
+                    if targets.contains(&process_target) {
+                        self.select_process_target(&process_target);
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.process_selected_pid = None;
+        self.process_selected_group = None;
+    }
+
+    fn ensure_selected_process_visible(&mut self, processes: &[ProcessStats]) {
+        let Some(selected) = self.current_process_target() else {
+            return;
+        };
+        let targets = self.process_scroll_targets(processes);
+        let total = targets.len();
+        self.process_display_total = total;
+        if total == 0 {
+            self.process_scroll = 0;
+            return;
+        }
+
+        let Some(index) = targets.iter().position(|target| *target == selected) else {
+            // Pinned rows are always visible and are intentionally outside the scroll stream.
+            self.process_scroll = self.process_scroll.min(total.saturating_sub(1));
+            return;
+        };
+
+        let visible = self.process_scroll_visible;
+        if visible == 0 {
+            self.process_scroll = index;
+            return;
+        }
+
+        let max_start = total.saturating_sub(visible);
+        let mut start = self.process_scroll.min(max_start);
+        if index < start {
+            start = index;
+        } else if index >= start.saturating_add(visible) {
+            start = index.saturating_add(1).saturating_sub(visible);
+        }
+        self.process_scroll = start.min(max_start);
+    }
+
     pub fn clamp_process_selection(&mut self, processes: &[ProcessStats]) {
         if self
             .process_selected_pid
@@ -293,6 +379,8 @@ impl UiState {
         }
         self.expanded_process_groups
             .retain(|program| programs.contains(program.as_str()));
+        self.normalize_process_selection(processes);
+        self.ensure_selected_process_visible(processes);
         self.process_scroll = self
             .process_scroll
             .min(self.process_display_total.saturating_sub(1));
@@ -1880,6 +1968,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
     let pinned_rows =
         usize::from(pinned.is_some() && visible > 0).saturating_add(pinned_group_rows.len());
     let scroll_visible = visible.saturating_sub(pinned_rows);
+    state.process_scroll_visible = scroll_visible;
     let max_start = rows.len().saturating_sub(scroll_visible);
     let start = state.process_scroll.min(max_start);
     state.process_scroll = start;
@@ -3344,6 +3433,76 @@ mod tests {
         state.move_process_selection(1, &processes);
         assert!(matches!(state.process_selected_pid, Some(10 | 20)));
         assert_eq!(state.process_selected_group, None);
+    }
+
+    #[test]
+    fn keyboard_navigation_scrolls_selected_row_into_view() {
+        let processes = (1..=8)
+            .map(|pid| ProcessStats {
+                pid,
+                program: format!("proc-{pid}"),
+                ..ProcessStats::default()
+            })
+            .collect::<Vec<_>>();
+        let mut state = UiState {
+            process_sort_key: ProcessSortKey::Pid,
+            process_sort_desc: false,
+            process_scroll_visible: 3,
+            ..UiState::default()
+        };
+
+        state.process_home(&processes);
+        for _ in 0..4 {
+            state.move_process_selection(1, &processes);
+        }
+
+        assert_eq!(state.process_selected_pid, Some(5));
+        assert_eq!(state.process_scroll, 2);
+    }
+
+    #[test]
+    fn hidden_selected_child_falls_back_to_collapsed_group() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "chromium".to_string(),
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "chromium".to_string(),
+                ..ProcessStats::default()
+            },
+        ];
+        let mut state = UiState {
+            process_selected_pid: Some(10),
+            process_scroll_visible: 10,
+            ..UiState::default()
+        };
+
+        state.clamp_process_selection(&processes);
+
+        assert_eq!(state.process_selected_pid, None);
+        assert_eq!(state.process_selected_group.as_deref(), Some("chromium"));
+    }
+
+    #[test]
+    fn selected_group_falls_back_to_single_process_when_group_disappears() {
+        let processes = vec![ProcessStats {
+            pid: 10,
+            program: "chromium".to_string(),
+            ..ProcessStats::default()
+        }];
+        let mut state = UiState {
+            process_selected_group: Some("chromium".to_string()),
+            process_scroll_visible: 10,
+            ..UiState::default()
+        };
+
+        state.clamp_process_selection(&processes);
+
+        assert_eq!(state.process_selected_group, None);
+        assert_eq!(state.process_selected_pid, Some(10));
     }
 
     #[test]
