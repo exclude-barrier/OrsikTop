@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -126,6 +126,7 @@ pub struct UiState {
     process_header_hits: Vec<ProcessHeaderHit>,
     process_pane: Option<Rect>,
     process_rows: Option<ProcessRowsHit>,
+    help_open: bool,
 }
 
 impl Default for UiState {
@@ -149,6 +150,7 @@ impl Default for UiState {
             process_header_hits: Vec::new(),
             process_pane: None,
             process_rows: None,
+            help_open: false,
         }
     }
 }
@@ -265,6 +267,18 @@ impl UiState {
     pub fn process_pane_contains(&self, x: u16, y: u16) -> bool {
         self.process_pane
             .is_some_and(|pane| rect_contains(pane, x, y))
+    }
+
+    pub fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+    }
+
+    pub fn close_help(&mut self) {
+        self.help_open = false;
+    }
+
+    pub fn is_help_open(&self) -> bool {
+        self.help_open
     }
 
     pub fn click_process_sort(&mut self, x: u16, y: u16) -> bool {
@@ -436,9 +450,13 @@ pub fn draw(
 
     if show_history {
         draw_bottom(frame, rows[3], state, &system.processes);
-        draw_footer(frame, rows[4], llm, gpu, refresh_ms);
+        draw_footer(frame, rows[4], llm, gpu);
     } else {
-        draw_footer(frame, rows[4], llm, gpu, refresh_ms);
+        draw_footer(frame, rows[4], llm, gpu);
+    }
+
+    if state.help_open {
+        draw_help_popup(frame, area);
     }
 }
 
@@ -2430,7 +2448,7 @@ fn is_llm_process(program: &str, command: &str) -> bool {
         || command.contains("orsiktop")
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, refresh_ms: u64) {
+fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats) {
     let status = if !llm.error.is_empty() {
         friendly_llm_error(&llm.error)
     } else if !gpu.error.is_empty() {
@@ -2451,9 +2469,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let help = format!(
-        " [q] quit  [-]/[+] refresh  [click] select  [2x] pin row/group  [RMB group] expand  [header] sort  {refresh_ms} ms  "
-    );
+    let help = " [q] quit  [h] help ";
     let help_width = help.chars().count() as u16;
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(MUTED)),
@@ -2475,6 +2491,68 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
             ),
         );
     }
+}
+
+fn draw_help_popup(frame: &mut Frame, area: Rect) {
+    let width = area.width.saturating_sub(6).min(72);
+    let height = area.height.saturating_sub(4).min(20);
+    if width < 48 || height < 16 {
+        return;
+    }
+
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" HELP · OrsikTop ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let key = |text: &'static str| {
+        Span::styled(
+            format!(" {text:<15}"),
+            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+        )
+    };
+    let desc = |text: &'static str| Span::styled(text, Style::default().fg(WHITE));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " KEYBOARD",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![key("q"), desc("Quit")]),
+        Line::from(vec![key("h"), desc("Toggle this help")]),
+        Line::from(vec![key("Esc"), desc("Close help")]),
+        Line::from(vec![
+            key("- / +"),
+            desc("Decrease / increase refresh interval"),
+        ]),
+        Line::from(vec![key("↑ / k"), desc("Select previous process")]),
+        Line::from(vec![key("↓ / j"), desc("Select next process")]),
+        Line::from(vec![key("PgUp / PgDn"), desc("Jump 10 processes")]),
+        Line::from(vec![key("Home / End"), desc("First / last process")]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " MOUSE",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![key("Left click"), desc("Select process or group")]),
+        Line::from(vec![key("Double click"), desc("Pin process or group")]),
+        Line::from(vec![key("Right click"), desc("Expand / collapse group")]),
+        Line::from(vec![key("Header click"), desc("Sort process table")]),
+        Line::from(vec![key("Mouse wheel"), desc("Scroll process table")]),
+        Line::from(vec![key("[-] / [+]"), desc("Change refresh interval")]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 pub fn refresh_controls(area: Rect) -> Option<RefreshControls> {
@@ -3184,6 +3262,19 @@ mod tests {
         assert_eq!(core_usage_color(75.0), YELLOW);
         assert_eq!(core_usage_color(90.0), ORANGE);
         assert_eq!(core_usage_color(100.0), ORANGE);
+    }
+
+    #[test]
+    fn help_popup_state_toggles_and_closes() {
+        let mut state = UiState::default();
+        assert!(!state.is_help_open());
+        state.toggle_help();
+        assert!(state.is_help_open());
+        state.toggle_help();
+        assert!(!state.is_help_open());
+        state.toggle_help();
+        state.close_help();
+        assert!(!state.is_help_open());
     }
 
     #[test]
