@@ -3,6 +3,10 @@
 **btop for local LLM Orks**
 
 [![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/exclude-barrier/OrsikTop)](./LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
+[![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-supported-5C6BC0)](https://github.com/ggml-org/llama.cpp)
 
 OrsikTop is a fast Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one dense btop-style view.
 
