@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use crate::{
+    config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     gpu::GpuStats,
     llama::LlmStats,
@@ -93,6 +94,11 @@ enum ProcessSortKey {
 enum SettingsField {
     Host,
     Port,
+    Gpu,
+    Refresh,
+    ProcessRefresh,
+    OfflineGrace,
+    AutoDiscovery,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -147,6 +153,11 @@ pub struct UiState {
     settings_field: SettingsField,
     settings_host: String,
     settings_port: String,
+    settings_gpu: String,
+    settings_refresh_ms: String,
+    settings_process_refresh_ms: String,
+    settings_offline_grace_ms: String,
+    settings_auto_discovery: bool,
     settings_error: Option<String>,
 }
 
@@ -186,6 +197,11 @@ impl Default for UiState {
             settings_field: SettingsField::Host,
             settings_host: "127.0.0.1".to_string(),
             settings_port: "8080".to_string(),
+            settings_gpu: "0".to_string(),
+            settings_refresh_ms: "1000".to_string(),
+            settings_process_refresh_ms: "1000".to_string(),
+            settings_offline_grace_ms: "2500".to_string(),
+            settings_auto_discovery: true,
             settings_error: None,
         }
     }
@@ -536,14 +552,20 @@ impl UiState {
         self.help_open
     }
 
-    pub fn open_settings(&mut self, server: &str) {
-        let (host, port) = endpoint_parts(server);
+    pub fn open_settings(&mut self, active_server: &str, settings: &AppConfig) {
+        let editable_server = settings.server.as_deref().unwrap_or(active_server);
+        let (host, port) = endpoint_parts(editable_server);
         self.help_open = false;
         self.process_search_open = false;
         self.settings_open = true;
         self.settings_field = SettingsField::Host;
         self.settings_host = host;
         self.settings_port = port.to_string();
+        self.settings_gpu = settings.gpu_index.to_string();
+        self.settings_refresh_ms = settings.refresh_ms.to_string();
+        self.settings_process_refresh_ms = settings.process_refresh_ms.to_string();
+        self.settings_offline_grace_ms = settings.offline_grace_ms.to_string();
+        self.settings_auto_discovery = settings.auto_discovery;
         self.settings_error = None;
     }
 
@@ -559,13 +581,27 @@ impl UiState {
     pub fn settings_next_field(&mut self) {
         self.settings_field = match self.settings_field {
             SettingsField::Host => SettingsField::Port,
-            SettingsField::Port => SettingsField::Host,
+            SettingsField::Port => SettingsField::Gpu,
+            SettingsField::Gpu => SettingsField::Refresh,
+            SettingsField::Refresh => SettingsField::ProcessRefresh,
+            SettingsField::ProcessRefresh => SettingsField::OfflineGrace,
+            SettingsField::OfflineGrace => SettingsField::AutoDiscovery,
+            SettingsField::AutoDiscovery => SettingsField::Host,
         };
         self.settings_error = None;
     }
 
     pub fn settings_previous_field(&mut self) {
-        self.settings_next_field();
+        self.settings_field = match self.settings_field {
+            SettingsField::Host => SettingsField::AutoDiscovery,
+            SettingsField::Port => SettingsField::Host,
+            SettingsField::Gpu => SettingsField::Port,
+            SettingsField::Refresh => SettingsField::Gpu,
+            SettingsField::ProcessRefresh => SettingsField::Refresh,
+            SettingsField::OfflineGrace => SettingsField::ProcessRefresh,
+            SettingsField::AutoDiscovery => SettingsField::OfflineGrace,
+        };
+        self.settings_error = None;
     }
 
     pub fn settings_backspace(&mut self) {
@@ -576,25 +612,94 @@ impl UiState {
             SettingsField::Port => {
                 self.settings_port.pop();
             }
+            SettingsField::Gpu => {
+                self.settings_gpu.pop();
+            }
+            SettingsField::Refresh => {
+                self.settings_refresh_ms.pop();
+            }
+            SettingsField::ProcessRefresh => {
+                self.settings_process_refresh_ms.pop();
+            }
+            SettingsField::OfflineGrace => {
+                self.settings_offline_grace_ms.pop();
+            }
+            SettingsField::AutoDiscovery => {}
         }
         self.settings_error = None;
     }
 
     pub fn settings_insert_char(&mut self, ch: char) {
         match self.settings_field {
-            SettingsField::Host if !ch.is_control() && !ch.is_whitespace() => {
+            SettingsField::Host
+                if !ch.is_control()
+                    && !ch.is_whitespace()
+                    && self.settings_host.chars().count() < 64 =>
+            {
                 self.settings_host.push(ch);
             }
             SettingsField::Port if ch.is_ascii_digit() && self.settings_port.len() < 5 => {
                 self.settings_port.push(ch);
             }
+            SettingsField::Gpu if ch.is_ascii_digit() && self.settings_gpu.len() < 3 => {
+                self.settings_gpu.push(ch);
+            }
+            SettingsField::Refresh if ch.is_ascii_digit() && self.settings_refresh_ms.len() < 6 => {
+                self.settings_refresh_ms.push(ch);
+            }
+            SettingsField::ProcessRefresh
+                if ch.is_ascii_digit() && self.settings_process_refresh_ms.len() < 6 =>
+            {
+                self.settings_process_refresh_ms.push(ch);
+            }
+            SettingsField::OfflineGrace
+                if ch.is_ascii_digit() && self.settings_offline_grace_ms.len() < 6 =>
+            {
+                self.settings_offline_grace_ms.push(ch);
+            }
+            SettingsField::AutoDiscovery => {}
             _ => {}
         }
         self.settings_error = None;
     }
 
-    pub fn settings_endpoint(&self) -> Result<String, String> {
-        build_endpoint(&self.settings_host, &self.settings_port)
+    pub fn settings_toggle_selected(&mut self) {
+        if self.settings_field == SettingsField::AutoDiscovery {
+            self.settings_auto_discovery = !self.settings_auto_discovery;
+            self.settings_error = None;
+        }
+    }
+
+    pub fn settings_config(&self) -> Result<AppConfig, String> {
+        let endpoint = build_endpoint(&self.settings_host, &self.settings_port)?;
+        let gpu_index = parse_setting_u64(&self.settings_gpu, "GPU", 0, 255)? as u32;
+        let refresh_ms = parse_setting_u64(
+            &self.settings_refresh_ms,
+            "Refresh",
+            MIN_REFRESH_MS,
+            MAX_REFRESH_MS,
+        )?;
+        let process_refresh_ms = parse_setting_u64(
+            &self.settings_process_refresh_ms,
+            "Process refresh",
+            MIN_PROCESS_REFRESH_MS,
+            MAX_PROCESS_REFRESH_MS,
+        )?;
+        let offline_grace_ms = parse_setting_u64(
+            &self.settings_offline_grace_ms,
+            "Offline grace",
+            0,
+            MAX_OFFLINE_GRACE_MS,
+        )?;
+
+        Ok(AppConfig {
+            server: Some(endpoint),
+            gpu_index,
+            refresh_ms,
+            process_refresh_ms,
+            offline_grace_ms,
+            auto_discovery: self.settings_auto_discovery,
+        })
     }
 
     pub fn set_settings_error(&mut self, error: String) {
@@ -3247,9 +3352,9 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
 }
 
 fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
-    let width = area.width.saturating_sub(6).min(70);
-    let height = 13.min(area.height.saturating_sub(4));
-    if width < 50 || height < 11 {
+    let width = area.width.saturating_sub(6).min(74);
+    let height = 18.min(area.height.saturating_sub(4));
+    if width < 54 || height < 15 {
         return;
     }
 
@@ -3267,54 +3372,77 @@ fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let host_selected = state.settings_field == SettingsField::Host;
-    let port_selected = state.settings_field == SettingsField::Port;
-    let field_style = |selected: bool| {
-        let style = Style::default().fg(if selected { BRIGHT_GREEN } else { WHITE });
-        if selected {
-            style.bg(PROCESS_SELECTED_BG).add_modifier(Modifier::BOLD)
+    let field_line = |field: SettingsField, label: &str, value: String| {
+        let selected = state.settings_field == field;
+        let value_style = if selected {
+            Style::default()
+                .fg(BRIGHT_GREEN)
+                .bg(PROCESS_SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
         } else {
-            style
-        }
+            Style::default().fg(WHITE)
+        };
+        Line::from(vec![
+            Span::styled(
+                format!(" {label:<18}"),
+                Style::default().fg(if selected { CYAN } else { MUTED }),
+            ),
+            Span::styled(format!(" {value:<42}"), value_style),
+        ])
     };
-    let cursor = |selected: bool| if selected { "▏" } else { "" };
-    let preview = state
-        .settings_endpoint()
+
+    let preview = build_endpoint(&state.settings_host, &state.settings_port)
         .unwrap_or_else(|_| "http://…".to_string());
+    let auto = if state.settings_auto_discovery {
+        "ON"
+    } else {
+        "OFF"
+    };
 
     let mut lines = vec![
         Line::from(Span::styled(
-            " LLM ENDPOINT",
+            " RUNTIME / CONNECTION",
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         )),
+        field_line(
+            SettingsField::Host,
+            "LLM Host/IP",
+            fit_cell(&state.settings_host, 40),
+        ),
+        field_line(SettingsField::Port, "LLM Port", state.settings_port.clone()),
+        field_line(SettingsField::Gpu, "GPU", state.settings_gpu.clone()),
+        field_line(
+            SettingsField::Refresh,
+            "Refresh",
+            format!("{} ms", state.settings_refresh_ms),
+        ),
+        field_line(
+            SettingsField::ProcessRefresh,
+            "Process refresh",
+            format!("{} ms", state.settings_process_refresh_ms),
+        ),
+        field_line(
+            SettingsField::OfflineGrace,
+            "Offline grace",
+            format!("{} ms", state.settings_offline_grace_ms),
+        ),
+        field_line(
+            SettingsField::AutoDiscovery,
+            "Auto discovery",
+            auto.to_string(),
+        ),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Host / IP  ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!(
-                    " {:<40}{} ",
-                    fit_cell(&state.settings_host, 40),
-                    cursor(host_selected)
-                ),
-                field_style(host_selected),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" Port       ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!(" {:<8}{} ", state.settings_port, cursor(port_selected)),
-                field_style(port_selected),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" Endpoint   ", Style::default().fg(MUTED)),
+            Span::styled(" Endpoint          ", Style::default().fg(MUTED)),
             Span::styled(preview, Style::default().fg(CYAN)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            " Tab / ↑↓ select   Type to edit   Enter apply + save   Esc cancel",
+            " Tab / ↑↓ select   Type to edit   Space / ←→ toggle   Enter apply + save",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            " Esc cancel   Auto discovery uses a detected local llama server first",
             Style::default().fg(MUTED),
         )),
     ];
@@ -3351,6 +3479,17 @@ fn endpoint_parts(server: &str) -> (String, u16) {
         }
     }
     (compact.to_string(), 8080)
+}
+
+fn parse_setting_u64(value: &str, label: &str, min: u64, max: u64) -> Result<u64, String> {
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{label} must be a number"))?;
+    if !(min..=max).contains(&parsed) {
+        return Err(format!("{label} must be between {min} and {max}"));
+    }
+    Ok(parsed)
 }
 
 fn build_endpoint(host: &str, port: &str) -> Result<String, String> {
@@ -4454,6 +4593,32 @@ mod tests {
             build_endpoint("10.0.0.7", "9090").unwrap(),
             "http://10.0.0.7:9090"
         );
+    }
+
+    #[test]
+    fn expanded_settings_build_runtime_config() {
+        let mut state = UiState::default();
+        let settings = AppConfig {
+            server: Some("http://127.0.0.1:8081".to_string()),
+            gpu_index: 1,
+            refresh_ms: 200,
+            process_refresh_ms: 1500,
+            offline_grace_ms: 3000,
+            auto_discovery: false,
+        };
+        state.open_settings("http://127.0.0.1:8081", &settings);
+        assert_eq!(state.settings_config().unwrap(), settings);
+    }
+
+    #[test]
+    fn settings_auto_discovery_toggle_changes_saved_value() {
+        let mut state = UiState {
+            settings_field: SettingsField::AutoDiscovery,
+            ..UiState::default()
+        };
+        let before = state.settings_auto_discovery;
+        state.settings_toggle_selected();
+        assert_ne!(state.settings_auto_discovery, before);
     }
 
     #[test]
