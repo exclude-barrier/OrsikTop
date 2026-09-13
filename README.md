@@ -11,7 +11,7 @@
 OrsikTop is a fast Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one dense btop-style view.
 
 > Orsik = fantasy ork. Local models need tokens. Orks need more power.
-<img width="926" height="785" alt="image" src="https://github.com/user-attachments/assets/4fd5278f-adf4-44c6-9325-6ee84e971ba2" />
+<img width="1440" height="967" alt="image" src="https://github.com/user-attachments/assets/a678c3c8-1ce0-4833-b246-5378ba3d1b54" />
 
 ## Current scope
 
