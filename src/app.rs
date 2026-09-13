@@ -101,7 +101,8 @@ pub fn run(
                 Event::Key(key)
                     if key.kind == KeyEventKind::Repeat
                         && !ui_state.is_help_open()
-                        && !ui_state.is_settings_open() =>
+                        && !ui_state.is_settings_open()
+                        && !ui_state.is_process_search_open() =>
                 {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -145,8 +146,29 @@ pub fn run(
                         _ => {}
                     }
                 }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press && ui_state.is_process_search_open() =>
+                {
+                    match key.code {
+                        KeyCode::Esc => {
+                            ui_state.clear_process_search();
+                            ui_state.clamp_process_selection(&snapshot.system.processes);
+                        }
+                        KeyCode::Enter => ui_state.accept_process_search(),
+                        KeyCode::Backspace => {
+                            ui_state.process_search_backspace();
+                            ui_state.clamp_process_selection(&snapshot.system.processes);
+                        }
+                        KeyCode::Char(ch) => {
+                            ui_state.process_search_insert_char(ch);
+                            ui_state.clamp_process_selection(&snapshot.system.processes);
+                        }
+                        _ => {}
+                    }
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') => break,
+                    KeyCode::Char('/') => ui_state.open_process_search(),
                     KeyCode::Char('h') => ui_state.toggle_help(),
                     KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
                     KeyCode::Esc => ui_state.open_settings(&server),
@@ -173,7 +195,11 @@ pub fn run(
                     KeyCode::End => ui_state.process_end(&snapshot.system.processes),
                     _ => {}
                 },
-                Event::Mouse(mouse) if !ui_state.is_help_open() && !ui_state.is_settings_open() => {
+                Event::Mouse(mouse)
+                    if !ui_state.is_help_open()
+                        && !ui_state.is_settings_open()
+                        && !ui_state.is_process_search_open() =>
+                {
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             if ui_state.click_process_row(mouse.column, mouse.row) {

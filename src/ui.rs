@@ -140,6 +140,8 @@ pub struct UiState {
     process_header_hits: Vec<ProcessHeaderHit>,
     process_pane: Option<Rect>,
     process_rows: Option<ProcessRowsHit>,
+    process_search_open: bool,
+    process_search_query: String,
     help_open: bool,
     settings_open: bool,
     settings_field: SettingsField,
@@ -177,6 +179,8 @@ impl Default for UiState {
             process_header_hits: Vec::new(),
             process_pane: None,
             process_rows: None,
+            process_search_open: false,
+            process_search_query: String::new(),
             help_open: false,
             settings_open: false,
             settings_field: SettingsField::Host,
@@ -308,12 +312,13 @@ impl UiState {
     }
 
     fn process_navigation_targets(&self, processes: &[ProcessStats]) -> Vec<ProcessRowTarget> {
-        let (pinned, mut rows) = grouped_process_rows(
+        let (pinned, mut rows) = grouped_process_rows_filtered(
             processes,
             self.process_sort_key,
             self.process_sort_desc,
             self.process_pinned_pid,
             &self.expanded_process_groups,
+            self.process_search_query(),
         );
         let pinned_group_rows =
             take_pinned_group_rows(&mut rows, self.process_pinned_group.as_deref());
@@ -330,12 +335,13 @@ impl UiState {
     }
 
     fn process_scroll_targets(&self, processes: &[ProcessStats]) -> Vec<ProcessRowTarget> {
-        let (_, mut rows) = grouped_process_rows(
+        let (_, mut rows) = grouped_process_rows_filtered(
             processes,
             self.process_sort_key,
             self.process_sort_desc,
             self.process_pinned_pid,
             &self.expanded_process_groups,
+            self.process_search_query(),
         );
         let _ = take_pinned_group_rows(&mut rows, self.process_pinned_group.as_deref());
         rows.iter().map(process_row_target).collect()
@@ -478,8 +484,47 @@ impl UiState {
             .is_some_and(|pane| rect_contains(pane, x, y))
     }
 
+    pub fn open_process_search(&mut self) {
+        self.help_open = false;
+        self.settings_open = false;
+        self.process_search_open = true;
+        self.process_scroll = 0;
+    }
+
+    pub fn accept_process_search(&mut self) {
+        self.process_search_open = false;
+    }
+
+    pub fn clear_process_search(&mut self) {
+        self.process_search_open = false;
+        self.process_search_query.clear();
+        self.process_scroll = 0;
+    }
+
+    pub fn is_process_search_open(&self) -> bool {
+        self.process_search_open
+    }
+
+    pub fn process_search_backspace(&mut self) {
+        self.process_search_query.pop();
+        self.process_scroll = 0;
+    }
+
+    pub fn process_search_insert_char(&mut self, ch: char) {
+        if !ch.is_control() && self.process_search_query.chars().count() < 48 {
+            self.process_search_query.push(ch);
+            self.process_scroll = 0;
+        }
+    }
+
+    fn process_search_query(&self) -> Option<&str> {
+        let query = self.process_search_query.trim();
+        (!query.is_empty()).then_some(query)
+    }
+
     pub fn toggle_help(&mut self) {
         self.settings_open = false;
+        self.process_search_open = false;
         self.help_open = !self.help_open;
     }
 
@@ -494,6 +539,7 @@ impl UiState {
     pub fn open_settings(&mut self, server: &str) {
         let (host, port) = endpoint_parts(server);
         self.help_open = false;
+        self.process_search_open = false;
         self.settings_open = true;
         self.settings_field = SettingsField::Host;
         self.settings_host = host;
@@ -724,9 +770,9 @@ pub fn draw(
 
     if show_history {
         draw_bottom(frame, rows[3], state, &system.processes);
-        draw_footer(frame, rows[4], llm, gpu);
+        draw_footer(frame, rows[4], llm, gpu, state);
     } else {
-        draw_footer(frame, rows[4], llm, gpu);
+        draw_footer(frame, rows[4], llm, gpu, state);
     }
 
     if state.settings_open {
@@ -1106,11 +1152,14 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
         label_span(" STATE      "),
         value_span(phase, phase_color),
         llm_sep(),
-        label_span("SLOT "),
+        label_span("SLOTS "),
         value_span(&slots, CYAN),
         llm_sep(),
-        label_span("QUEUE "),
-        value_span(&format!("{:.0}", llm.deferred_requests), WHITE),
+        label_span("REQ "),
+        value_span(
+            &format!("{:.0}/{:.0}", llm.active_requests, llm.deferred_requests),
+            WHITE,
+        ),
         llm_sep(),
         value_span(&mtp, mtp_color),
         llm_sep(),
@@ -1127,7 +1176,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
             label_span(" STATE      "),
             value_span(phase, phase_color),
             Span::raw("  "),
-            label_span("SLOT "),
+            label_span("SLOTS "),
             value_span(&slots, CYAN),
             Span::raw("  "),
             value_span(&mtp, mtp_color),
@@ -1229,37 +1278,26 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
     }
 
     if inner.height >= 11 {
-        let draft = if llm.spec_enabled {
-            format!("{} draft", grouped_f64(llm.spec_draft_tokens))
-        } else {
-            "disabled".to_string()
-        };
-        let accepted = if llm.spec_enabled {
-            match spec_total_acceptance {
+        if llm.spec_enabled {
+            let draft = format!("{} draft", grouped_f64(llm.spec_draft_tokens));
+            let accepted = match spec_total_acceptance {
                 Some(rate) => format!(
                     "{} accepted · {rate:.1}%",
                     grouped_f64(llm.spec_accepted_tokens)
                 ),
                 None => format!("{} accepted", grouped_f64(llm.spec_accepted_tokens)),
-            }
+            };
+            lines.push(Line::from(vec![
+                label_span(" SPEC TOK   "),
+                llm_metric_cell(&draft, metric_width, CYAN, false),
+                llm_metric_cell(&accepted, metric_width, ORK_GREEN, false),
+            ]));
         } else {
-            "—".to_string()
-        };
-        lines.push(Line::from(vec![
-            label_span(" SPEC TOK   "),
-            llm_metric_cell(
-                &draft,
-                metric_width,
-                if llm.spec_enabled { CYAN } else { MUTED },
-                false,
-            ),
-            llm_metric_cell(
-                &accepted,
-                metric_width,
-                if llm.spec_enabled { ORK_GREEN } else { MUTED },
-                false,
-            ),
-        ]));
+            lines.push(Line::from(vec![
+                label_span(" SPEC       "),
+                value_span("OFF", MUTED),
+            ]));
+        }
     }
 
     if inner.height >= 12 {
@@ -1429,6 +1467,16 @@ fn draw_llm_rate_history_column(
     }
 
     let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
+    if !llm_rate_history_has_activity(history) {
+        let header = format!(" {title} idle");
+        frame.render_widget(
+            Paragraph::new(fit_cell(&header, inner.width as usize))
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        return;
+    }
+
     let scale = history_max(history).max(1.0);
     let header = format!(
         " {title} {} tok/s · max {}",
@@ -1457,6 +1505,10 @@ fn draw_llm_rate_history_column(
         )),
         graph,
     );
+}
+
+fn llm_rate_history_has_activity(history: &VecDeque<TimedSample>) -> bool {
+    history.iter().any(|sample| sample.value > 0.05)
 }
 
 fn compact_rate(value: f64) -> String {
@@ -2256,6 +2308,7 @@ fn process_row_target(row: &ProcessDisplayRow<'_>) -> ProcessRowTarget {
     }
 }
 
+#[cfg(test)]
 fn grouped_process_rows<'a>(
     processes: &'a [ProcessStats],
     key: ProcessSortKey,
@@ -2263,7 +2316,32 @@ fn grouped_process_rows<'a>(
     pinned_pid: Option<u32>,
     expanded_groups: &HashSet<String>,
 ) -> (Option<&'a ProcessStats>, Vec<ProcessDisplayRow<'a>>) {
-    let (pinned, unpinned) = sorted_processes_with_pin(processes, key, descending, pinned_pid);
+    grouped_process_rows_filtered(
+        processes,
+        key,
+        descending,
+        pinned_pid,
+        expanded_groups,
+        None,
+    )
+}
+
+fn grouped_process_rows_filtered<'a>(
+    processes: &'a [ProcessStats],
+    key: ProcessSortKey,
+    descending: bool,
+    pinned_pid: Option<u32>,
+    expanded_groups: &HashSet<String>,
+    search_query: Option<&str>,
+) -> (Option<&'a ProcessStats>, Vec<ProcessDisplayRow<'a>>) {
+    let (mut pinned, mut unpinned) =
+        sorted_processes_with_pin(processes, key, descending, pinned_pid);
+    if let Some(query) = search_query {
+        if pinned.is_some_and(|process| !process_matches_search(process, query)) {
+            pinned = None;
+        }
+        unpinned.retain(|process| process_matches_search(process, query));
+    }
     let mut by_program = HashMap::<&str, Vec<&ProcessStats>>::new();
     for process in unpinned {
         by_program
@@ -2372,21 +2450,17 @@ fn take_pinned_group_rows<'a>(
 
 fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], state: &mut UiState) {
     state.process_pane = Some(area);
-    let (pinned, mut rows) = grouped_process_rows(
+    let search_query = state.process_search_query().map(str::to_string);
+    let (pinned, mut rows) = grouped_process_rows_filtered(
         processes,
         state.process_sort_key,
         state.process_sort_desc,
         state.process_pinned_pid,
         &state.expanded_process_groups,
+        search_query.as_deref(),
     );
-    if state.process_pinned_pid.is_some() && pinned.is_none() {
-        state.process_pinned_pid = None;
-    }
     let pinned_group_name = state.process_pinned_group.clone();
     let pinned_group_rows = take_pinned_group_rows(&mut rows, pinned_group_name.as_deref());
-    if pinned_group_name.is_some() && pinned_group_rows.is_empty() {
-        state.process_pinned_group = None;
-    }
     state.process_display_total = rows.len();
 
     let visible = area.height.saturating_sub(3) as usize;
@@ -2406,6 +2480,25 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         "↑"
     };
     let process_total = processes.len();
+    let matched_process_total = search_query
+        .as_deref()
+        .map(|query| {
+            processes
+                .iter()
+                .filter(|process| process_matches_search(process, query))
+                .count()
+        })
+        .unwrap_or(process_total);
+    let process_count = if search_query.is_some() {
+        format!("{matched_process_total}/{process_total} PROC")
+    } else {
+        format!("{process_total} PROC")
+    };
+    let search_title = if state.process_search_open || search_query.is_some() {
+        format!(" · /{}", fit_cell(&state.process_search_query, 18))
+    } else {
+        String::new()
+    };
     let row_total = rows.len();
     let range = if scroll_visible == 0 || rows.is_empty() {
         "0".to_string()
@@ -2413,19 +2506,19 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         format!("{}–{}", start + 1, end)
     };
     let title = if process_total == 0 {
-        format!(" PROCESSES · SORT {sort_name} {sort_arrow} · 0 ")
+        format!(" PROCESSES{search_title} · SORT {sort_name} {sort_arrow} · 0 ")
     } else if let Some(process) = pinned {
         format!(
-            " PROCESSES · PIN {} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC ",
+            " PROCESSES{search_title} · PIN {} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_count} ",
             process.pid
         )
     } else if let Some(program) = state.process_pinned_group.as_deref() {
         format!(
-            " PROCESSES · PIN GROUP {program} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC "
+            " PROCESSES{search_title} · PIN GROUP {program} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_count} "
         )
     } else {
         format!(
-            " PROCESSES · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC "
+            " PROCESSES{search_title} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_count} "
         )
     };
 
@@ -2534,8 +2627,12 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
     }
 
     if lines.is_empty() {
+        let message = search_query
+            .as_deref()
+            .map(|query| format!(" no processes match /{query}"))
+            .unwrap_or_else(|| " waiting for process samples…".to_string());
         lines.push(Line::from(Span::styled(
-            " waiting for process samples…",
+            message,
             Style::default().fg(MUTED),
         )));
     }
@@ -3011,6 +3108,16 @@ fn process_cpu_color(cpu_pct: f64) -> Color {
     }
 }
 
+fn process_matches_search(process: &ProcessStats, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    process.program.to_ascii_lowercase().contains(&query)
+        || process.command.to_ascii_lowercase().contains(&query)
+        || process.pid.to_string().contains(&query)
+}
+
 fn is_llm_process(program: &str, command: &str) -> bool {
     let program = program.to_ascii_lowercase();
     let command = command.to_ascii_lowercase();
@@ -3020,7 +3127,7 @@ fn is_llm_process(program: &str, command: &str) -> bool {
         || command.contains("orsiktop")
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats) {
+fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, state: &UiState) {
     let status = if !llm.error.is_empty() {
         friendly_llm_error(&llm.error)
     } else if !gpu.error.is_empty() {
@@ -3041,10 +3148,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let help = " [q] quit  [h] help  [esc] settings ";
+    let help = if state.process_search_open {
+        format!(
+            " SEARCH /{}▏  [enter] apply  [esc] clear ",
+            fit_cell(&state.process_search_query, 30)
+        )
+    } else {
+        " [q] quit  [h] help  [esc] settings  [/] search ".to_string()
+    };
     let help_width = help.chars().count() as u16;
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(MUTED)),
+        Paragraph::new(help).style(Style::default().fg(if state.process_search_open {
+            CYAN
+        } else {
+            MUTED
+        })),
         Rect::new(inner.x, inner.y, inner.width.min(help_width), 1),
     );
 
@@ -3103,6 +3221,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![key("q"), desc("Quit")]),
         Line::from(vec![key("h"), desc("Toggle this help")]),
         Line::from(vec![key("Esc"), desc("Open settings")]),
+        Line::from(vec![key("/"), desc("Search / filter processes")]),
         Line::from(vec![
             key("- / +"),
             desc("Decrease / increase refresh interval"),
@@ -3818,6 +3937,92 @@ mod tests {
             rows[2],
             ProcessDisplayRow::Process { child: true, .. }
         ));
+    }
+
+    #[test]
+    fn process_search_matches_program_command_and_pid() {
+        let process = ProcessStats {
+            pid: 4242,
+            program: "llama".to_string(),
+            command: "/usr/local/bin/llama-server --model Qwen".to_string(),
+            ..ProcessStats::default()
+        };
+        assert!(process_matches_search(&process, "LLAMA"));
+        assert!(process_matches_search(&process, "qwen"));
+        assert!(process_matches_search(&process, "424"));
+        assert!(!process_matches_search(&process, "chromium"));
+    }
+
+    #[test]
+    fn filtered_grouping_only_keeps_matching_processes() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "chromium".to_string(),
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "chromium".to_string(),
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 30,
+                program: "llama".to_string(),
+                command: "/usr/bin/llama-server".to_string(),
+                ..ProcessStats::default()
+            },
+        ];
+        let (_, rows) = grouped_process_rows_filtered(
+            &processes,
+            ProcessSortKey::Cpu,
+            true,
+            None,
+            &HashSet::new(),
+            Some("llama"),
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0],
+            ProcessDisplayRow::Process { process, .. } if process.pid == 30
+        ));
+    }
+
+    #[test]
+    fn keyboard_navigation_respects_process_search() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "chromium".to_string(),
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "llama".to_string(),
+                ..ProcessStats::default()
+            },
+        ];
+        let mut state = UiState {
+            process_search_query: "llama".to_string(),
+            ..UiState::default()
+        };
+        state.process_home(&processes);
+        assert_eq!(state.process_selected_pid, Some(20));
+    }
+
+    #[test]
+    fn llm_rate_history_idle_requires_real_activity() {
+        let mut history = VecDeque::new();
+        history.push_back(TimedSample {
+            at: Instant::now(),
+            value: 0.0,
+        });
+        assert!(!llm_rate_history_has_activity(&history));
+        history.push_back(TimedSample {
+            at: Instant::now(),
+            value: 12.5,
+        });
+        assert!(llm_rate_history_has_activity(&history));
     }
 
     #[test]
