@@ -3259,7 +3259,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, st
             fit_cell(&state.process_search_query, 30)
         )
     } else {
-        " [q] quit  [h] help  [esc] settings  [/] search ".to_string()
+        " [esc] quit  [h] help  [q] settings  [/] search ".to_string()
     };
     let help_width = help.chars().count() as u16;
     frame.render_widget(
@@ -3323,9 +3323,9 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
             " KEYBOARD",
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         )),
-        Line::from(vec![key("q"), desc("Quit")]),
+        Line::from(vec![key("Esc"), desc("Quit")]),
         Line::from(vec![key("h"), desc("Toggle this help")]),
-        Line::from(vec![key("Esc"), desc("Open settings")]),
+        Line::from(vec![key("q"), desc("Open settings")]),
         Line::from(vec![key("/"), desc("Search / filter processes")]),
         Line::from(vec![
             key("- / +"),
