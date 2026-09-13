@@ -2530,7 +2530,6 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         )),
         Line::from(vec![key("q"), desc("Quit")]),
         Line::from(vec![key("h"), desc("Toggle this help")]),
-        Line::from(vec![key("Esc"), desc("Close help")]),
         Line::from(vec![
             key("- / +"),
             desc("Decrease / increase refresh interval"),
