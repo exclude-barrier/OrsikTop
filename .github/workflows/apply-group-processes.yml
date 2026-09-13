@@ -1,0 +1,39 @@
+name: Apply grouped process view
+
+on:
+  push:
+    branches: [feat/group-processes]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/group-processes
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply patch
+        run: python .github/scripts/apply_group_processes.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Validate
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo run --locked -- --help >/dev/null
+      - name: Remove temporary patch files
+        run: rm -f .github/scripts/apply_group_processes.py .github/workflows/apply-group-processes.yml
+      - name: Commit result
+        run: |
+          git config user.name "exclude-barrier"
+          git config user.email "christopher@cloudfiebig.de"
+          git add -A
+          git commit -m "Group same-name processes with right-click expansion"
+          git push origin HEAD:feat/group-processes
