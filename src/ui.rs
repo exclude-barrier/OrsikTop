@@ -77,7 +77,7 @@ pub struct RefreshControls {
 #[derive(Copy, Clone, Debug)]
 struct TimedSample {
     at: Instant,
-    value: u64,
+    value: f64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -118,6 +118,12 @@ pub struct UiState {
     vram_history: VecDeque<TimedSample>,
     cpu_history: VecDeque<TimedSample>,
     ram_history: VecDeque<TimedSample>,
+    llm_prefill_history: VecDeque<TimedSample>,
+    llm_decode_history: VecDeque<TimedSample>,
+    llm_last_fresh_at: Option<Instant>,
+    llm_connected_since: Option<Instant>,
+    llm_connected_flash_until: Option<Instant>,
+    llm_was_connected: bool,
     process_selected_pid: Option<u32>,
     process_pinned_pid: Option<u32>,
     last_process_click: Option<(u32, Instant)>,
@@ -148,6 +154,12 @@ impl Default for UiState {
             vram_history: VecDeque::with_capacity(600),
             cpu_history: VecDeque::with_capacity(600),
             ram_history: VecDeque::with_capacity(600),
+            llm_prefill_history: VecDeque::with_capacity(600),
+            llm_decode_history: VecDeque::with_capacity(600),
+            llm_last_fresh_at: None,
+            llm_connected_since: None,
+            llm_connected_flash_until: None,
+            llm_was_connected: false,
             process_selected_pid: None,
             process_pinned_pid: None,
             last_process_click: None,
@@ -186,6 +198,33 @@ impl UiState {
         push_history_at(&mut self.vram_history, vram, now);
         push_history_at(&mut self.cpu_history, system.cpu_usage, now);
         push_history_at(&mut self.ram_history, ram, now);
+    }
+
+    pub fn observe_llm_sample(&mut self, llm: &LlmStats) {
+        let now = Instant::now();
+        if llm.connected && !llm.reconnecting {
+            if !self.llm_was_connected {
+                self.llm_connected_since = Some(now);
+                self.llm_connected_flash_until = Some(now + Duration::from_secs(2));
+            }
+            self.llm_was_connected = true;
+            self.llm_last_fresh_at = Some(now);
+            push_metric_history_at(&mut self.llm_prefill_history, llm.prompt_tps, now);
+            push_metric_history_at(&mut self.llm_decode_history, llm.generation_tps, now);
+        } else if !llm.connected {
+            self.llm_was_connected = false;
+            self.llm_connected_since = None;
+            self.llm_connected_flash_until = None;
+        }
+    }
+
+    pub fn reset_llm_connection_state(&mut self) {
+        self.llm_prefill_history.clear();
+        self.llm_decode_history.clear();
+        self.llm_last_fresh_at = None;
+        self.llm_connected_since = None;
+        self.llm_connected_flash_until = None;
+        self.llm_was_connected = false;
     }
 
     pub fn move_process_selection(&mut self, delta: isize, processes: &[ProcessStats]) {
@@ -671,9 +710,9 @@ pub fn draw(
             .split(area)
     };
 
-    draw_header(frame, rows[0], llm, server, refresh_ms);
+    draw_header(frame, rows[0], llm, state, server, refresh_ms);
     draw_gpu(frame, rows[1], gpu);
-    draw_llm_and_system(frame, rows[2], system, llm);
+    draw_llm_and_system(frame, rows[2], system, llm, state);
 
     if show_history {
         draw_bottom(frame, rows[3], state, &system.processes);
@@ -703,7 +742,14 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str, refresh_ms: u64) {
+fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    llm: &LlmStats,
+    state: &UiState,
+    server: &str,
+    refresh_ms: u64,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM_GREEN));
@@ -717,12 +763,10 @@ fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str, refr
     let left_width = controls_start.saturating_sub(inner.x).saturating_sub(1);
 
     if left_width > 0 {
-        let status = if llm.connected { "ONLINE" } else { "OFFLINE" };
-        let status_style = if llm.connected {
-            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(RED).add_modifier(Modifier::BOLD)
-        };
+        let (status, status_color) = llm_link_status(state, llm);
+        let status_style = Style::default()
+            .fg(status_color)
+            .add_modifier(Modifier::BOLD);
         let endpoint = compact_endpoint(server);
 
         let mut spans = vec![
@@ -915,17 +959,23 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_llm_and_system(frame: &mut Frame, area: Rect, system: &SystemStats, llm: &LlmStats) {
+fn draw_llm_and_system(
+    frame: &mut Frame,
+    area: Rect,
+    system: &SystemStats,
+    llm: &LlmStats,
+    state: &UiState,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
-    draw_llm(frame, cols[0], llm);
+    draw_llm(frame, cols[0], llm, state);
     draw_system(frame, cols[1], system);
 }
 
-fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
+fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
     let block = Block::default()
         .title(" LLM INFERENCE ")
         .borders(Borders::ALL)
@@ -941,16 +991,23 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         let metrics_off = llm_metrics_disabled(&llm.error);
         let (status, color, message) = if metrics_off {
             ("METRICS OFF", YELLOW, "restart server with --metrics")
+        } else if llm.reconnecting {
+            ("RECONNECTING", YELLOW, "connection lost · retrying")
         } else {
-            ("SERVER OFFLINE", RED, "connection lost · retrying")
+            ("SERVER OFFLINE", RED, "connection lost")
         };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(vec![label_span(" STATUS   "), value_span(status, color)]),
+                Line::from(vec![label_span(" STATUS      "), value_span(status, color)]),
                 Line::from(vec![
-                    label_span(" LLAMA    "),
+                    label_span(" LLAMA       "),
                     Span::styled(message, Style::default().fg(MUTED)),
                 ]),
+                Line::from(vec![
+                    label_span(" LAST SAMPLE "),
+                    value_span(&llm_last_sample_text(state), MUTED),
+                ]),
+                Line::from(vec![label_span(" UPTIME      "), value_span("—", MUTED)]),
             ]),
             inner,
         );
@@ -1037,7 +1094,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
     let request_color = if llm.busy_slots > 0 { WHITE } else { MUTED };
 
     let metric_width = ((inner.width as usize).saturating_sub(12) / 2).clamp(16, 30);
-    let mut state = vec![
+    let mut state_line = vec![
         label_span(" STATE      "),
         value_span(phase, phase_color),
         llm_sep(),
@@ -1053,12 +1110,12 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         value_span(&acc, acc_color),
     ];
     if inner.width >= 82 {
-        state.push(llm_sep());
-        state.push(label_span("CACHE "));
-        state.push(value_span(&cache, cache_color));
+        state_line.push(llm_sep());
+        state_line.push(label_span("CACHE "));
+        state_line.push(value_span(&cache, cache_color));
     }
     if inner.width < 66 {
-        state = vec![
+        state_line = vec![
             label_span(" STATE      "),
             value_span(phase, phase_color),
             Span::raw("  "),
@@ -1083,7 +1140,17 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
                 Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(state),
+        Line::from(vec![
+            label_span(" LINK       "),
+            value_span(llm_link_status(state, llm).0, llm_link_status(state, llm).1),
+            llm_sep(),
+            label_span("LAST "),
+            value_span(&llm_last_sample_text(state), MUTED),
+            llm_sep(),
+            label_span("UPTIME "),
+            value_span(&llm_uptime_text(state), MUTED),
+        ]),
+        Line::from(state_line),
         Line::from(vec![
             label_span("            "),
             llm_metric_cell("PREFILL / PP", metric_width, pp_header_color, pp_active),
@@ -1206,7 +1273,169 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
     }
 
     lines.truncate(inner.height as usize);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let text_height = lines.len().min(inner.height as usize) as u16;
+    if text_height > 0 {
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(inner.x, inner.y, inner.width, text_height),
+        );
+    }
+
+    let graph_height = inner.height.saturating_sub(text_height);
+    if graph_height >= 3 && inner.width >= 40 {
+        draw_llm_rate_history(
+            frame,
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(text_height),
+                inner.width,
+                graph_height,
+            ),
+            state,
+        );
+    }
+}
+
+fn llm_link_status(state: &UiState, llm: &LlmStats) -> (&'static str, Color) {
+    if llm.reconnecting {
+        ("RECONNECTING", YELLOW)
+    } else if !llm.connected {
+        ("OFFLINE", RED)
+    } else if state
+        .llm_connected_flash_until
+        .is_some_and(|until| Instant::now() <= until)
+    {
+        ("CONNECTED", BRIGHT_GREEN)
+    } else {
+        ("ONLINE", ORK_GREEN)
+    }
+}
+
+fn llm_last_sample_text(state: &UiState) -> String {
+    state
+        .llm_last_fresh_at
+        .map(|at| format_sample_age(Instant::now().saturating_duration_since(at)))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn llm_uptime_text(state: &UiState) -> String {
+    state
+        .llm_connected_since
+        .map(|at| format_uptime(Instant::now().saturating_duration_since(at)))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_sample_age(age: Duration) -> String {
+    let millis = age.as_millis();
+    if millis < 1_000 {
+        return format!("{millis} ms");
+    }
+    let seconds = age.as_secs_f64();
+    if seconds < 60.0 {
+        return format!("{seconds:.1} s");
+    }
+    let total = age.as_secs();
+    format!("{}m {:02}s", total / 60, total % 60)
+}
+
+fn format_uptime(uptime: Duration) -> String {
+    let total = uptime.as_secs();
+    let days = total / 86_400;
+    let hours = (total / 3_600) % 24;
+    let minutes = (total / 60) % 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+fn draw_llm_rate_history(frame: &mut Frame, area: Rect, state: &UiState) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    draw_llm_rate_history_column(
+        frame,
+        cols[0],
+        "PREFILL",
+        &state.llm_prefill_history,
+        CYAN,
+        true,
+    );
+    draw_llm_rate_history_column(
+        frame,
+        cols[1],
+        "DECODE",
+        &state.llm_decode_history,
+        ORK_GREEN,
+        false,
+    );
+}
+
+fn draw_llm_rate_history_column(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    history: &VecDeque<TimedSample>,
+    color: Color,
+    right_border: bool,
+) {
+    let block = Block::default()
+        .borders(if right_border {
+            Borders::RIGHT
+        } else {
+            Borders::NONE
+        })
+        .border_style(Style::default().fg(INNER_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+
+    let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
+    let scale = history_max(history).max(1.0);
+    let header = format!(
+        " {title} {} tok/s · max {}",
+        compact_rate(latest),
+        compact_rate(scale)
+    );
+    frame.render_widget(
+        Paragraph::new(fit_cell(&header, inner.width as usize))
+            .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let graph = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    frame.render_widget(
+        Paragraph::new(trend_lines_scaled(
+            history,
+            graph.width as usize,
+            graph.height as usize,
+            color,
+            scale,
+        )),
+        graph,
+    );
+}
+
+fn compact_rate(value: f64) -> String {
+    if !value.is_finite() || value <= 0.0 {
+        "0".to_string()
+    } else if value >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else if value >= 100.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
 }
 
 fn llm_metric_cell(text: &str, width: usize, color: Color, bold: bool) -> Span<'static> {
@@ -1242,7 +1471,9 @@ fn grouped_f64(value: f64) -> String {
 }
 
 fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
-    if llm.generation_tps > 0.05 {
+    if llm.reconnecting {
+        ("RECONNECTING", YELLOW)
+    } else if llm.generation_tps > 0.05 {
         ("GENERATING", ORK_GREEN)
     } else if llm.prompt_tps > 0.05 {
         ("PREFILL", CYAN)
@@ -1928,7 +2159,7 @@ fn draw_history_column(
         return;
     }
 
-    let latest = history.back().map(|sample| sample.value).unwrap_or(0);
+    let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -1941,7 +2172,7 @@ fn draw_history_column(
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:>3}%", latest),
+                format!("{latest:>3.0}%"),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -3202,8 +3433,19 @@ fn trend_lines(
     height: usize,
     color: Color,
 ) -> Vec<Line<'static>> {
+    trend_lines_scaled(history, width, height, color, 100.0)
+}
+
+fn trend_lines_scaled(
+    history: &VecDeque<TimedSample>,
+    width: usize,
+    height: usize,
+    color: Color,
+    scale_max: f64,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
     let height = height.max(1);
+    let scale_max = scale_max.max(f64::EPSILON);
     let now = Instant::now();
     let columns = resample_history(history, width * 2, now);
     let sub_height = height * 4;
@@ -3221,8 +3463,9 @@ fn trend_lines(
                         continue;
                     };
 
-                    let mut filled = ((sample as f64 / 100.0) * sub_height as f64).round() as usize;
-                    if sample > 0 && filled == 0 {
+                    let normalized = (sample / scale_max).clamp(0.0, 1.0);
+                    let mut filled = (normalized * sub_height as f64).round() as usize;
+                    if sample > 0.0 && filled == 0 {
                         filled = 1;
                     }
                     filled = filled.min(sub_height);
@@ -3248,7 +3491,7 @@ fn resample_history(
     history: &VecDeque<TimedSample>,
     columns: usize,
     now: Instant,
-) -> Vec<Option<u64>> {
+) -> Vec<Option<f64>> {
     let columns = columns.max(1);
     let window_secs = HISTORY_WINDOW.as_secs_f64();
     let mut points = history
@@ -3256,7 +3499,7 @@ fn resample_history(
         .filter_map(|sample| {
             let age = now.saturating_duration_since(sample.at);
             (age <= HISTORY_WINDOW)
-                .then_some((window_secs - age.as_secs_f64(), sample.value.min(100)))
+                .then_some((window_secs - age.as_secs_f64(), sample.value.max(0.0)))
         })
         .peekable();
 
@@ -3309,7 +3552,7 @@ fn braille_char(mask: u8) -> char {
 fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant) {
     history.push_back(TimedSample {
         at: now,
-        value: clamp_percent(value) as u64,
+        value: clamp_percent(value),
     });
 
     while history
@@ -3321,6 +3564,37 @@ fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant
     while history.len() > HISTORY_MAX_SAMPLES {
         history.pop_front();
     }
+}
+
+fn push_metric_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant) {
+    history.push_back(TimedSample {
+        at: now,
+        value: if value.is_finite() {
+            value.max(0.0)
+        } else {
+            0.0
+        },
+    });
+
+    while history
+        .front()
+        .is_some_and(|sample| now.saturating_duration_since(sample.at) > HISTORY_WINDOW)
+    {
+        history.pop_front();
+    }
+    while history.len() > HISTORY_MAX_SAMPLES {
+        history.pop_front();
+    }
+}
+
+fn history_max(history: &VecDeque<TimedSample>) -> f64 {
+    let now = Instant::now();
+    history
+        .iter()
+        .filter(|sample| now.saturating_duration_since(sample.at) <= HISTORY_WINDOW)
+        .map(|sample| sample.value)
+        .filter(|value| value.is_finite())
+        .fold(0.0, f64::max)
 }
 
 fn percent(value: f64, total: f64) -> f64 {
@@ -3899,7 +4173,32 @@ mod tests {
         );
         push_history_at(&mut history, 20.0, now);
         assert_eq!(history.len(), 1);
-        assert_eq!(history.back().unwrap().value, 20);
+        assert_eq!(history.back().unwrap().value, 20.0);
+    }
+
+    #[test]
+    fn llm_history_ignores_held_reconnect_samples() {
+        let mut state = UiState::default();
+        state.observe_llm_sample(&LlmStats {
+            connected: true,
+            prompt_tps: 1200.0,
+            generation_tps: 75.0,
+            ..LlmStats::default()
+        });
+        assert_eq!(state.llm_prefill_history.len(), 1);
+        assert_eq!(state.llm_decode_history.len(), 1);
+        assert!(state.llm_last_fresh_at.is_some());
+        assert!(state.llm_connected_since.is_some());
+
+        state.observe_llm_sample(&LlmStats {
+            connected: true,
+            reconnecting: true,
+            prompt_tps: 9999.0,
+            generation_tps: 9999.0,
+            ..LlmStats::default()
+        });
+        assert_eq!(state.llm_prefill_history.len(), 1);
+        assert_eq!(state.llm_decode_history.len(), 1);
     }
 
     #[test]
@@ -3930,11 +4229,11 @@ mod tests {
         let history = VecDeque::from([
             TimedSample {
                 at: now - Duration::from_secs(30),
-                value: 25,
+                value: 25.0,
             },
             TimedSample {
                 at: now,
-                value: 100,
+                value: 100.0,
             },
         ]);
         let lines = trend_lines(&history, 5, 3, ORK_GREEN);
@@ -3948,18 +4247,26 @@ mod tests {
         let history = VecDeque::from([
             TimedSample {
                 at: now - Duration::from_secs(30),
-                value: 25,
+                value: 25.0,
             },
             TimedSample {
                 at: now - Duration::from_secs(10),
-                value: 50,
+                value: 50.0,
             },
         ]);
 
         let columns = resample_history(&history, 7, now);
         assert_eq!(
             columns,
-            vec![None, None, None, Some(25), Some(25), Some(50), Some(50)]
+            vec![
+                None,
+                None,
+                None,
+                Some(25.0),
+                Some(25.0),
+                Some(50.0),
+                Some(50.0),
+            ]
         );
     }
 
