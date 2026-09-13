@@ -141,15 +141,18 @@ pub fn run(
                             ui_state.click_process_sort(mouse.column, mouse.row);
                         }
                     }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        ui_state.right_click_process_group(mouse.column, mouse.row);
+                    }
                     MouseEventKind::ScrollUp
                         if ui_state.process_pane_contains(mouse.column, mouse.row) =>
                     {
-                        ui_state.scroll_processes(-3, snapshot.system.processes.len());
+                        ui_state.scroll_processes(-3);
                     }
                     MouseEventKind::ScrollDown
                         if ui_state.process_pane_contains(mouse.column, mouse.row) =>
                     {
-                        ui_state.scroll_processes(3, snapshot.system.processes.len());
+                        ui_state.scroll_processes(3);
                     }
                     _ => {}
                 },
