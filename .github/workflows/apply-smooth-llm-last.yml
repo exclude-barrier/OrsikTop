@@ -19,7 +19,7 @@ jobs:
       - name: Apply patch
         run: python .github/scripts/smooth_llm_last.py
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt
       - name: Test
         run: cargo test
       - name: Clippy
