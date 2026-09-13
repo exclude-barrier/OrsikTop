@@ -2777,7 +2777,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let help = " [q] quit  [h] help ";
+    let help = " [q] quit  [h] help  [esc] settings ";
     let help_width = help.chars().count() as u16;
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(MUTED)),
