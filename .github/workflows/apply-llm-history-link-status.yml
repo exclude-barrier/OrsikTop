@@ -17,7 +17,9 @@ jobs:
           ref: feature/llm-history-link-status
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply patch
-        run: python .github/scripts/add_llm_history_link_status.py
+        run: |
+          python .github/scripts/add_llm_history_link_status.py
+          python .github/scripts/fix_llm_history_link_status.py
       - name: Format
         run: cargo fmt
       - name: Test
