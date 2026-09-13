@@ -171,35 +171,93 @@ impl UiState {
     }
 
     pub fn move_process_selection(&mut self, delta: isize, processes: &[ProcessStats]) {
-        let sorted = sorted_processes(processes, self.process_sort_key, self.process_sort_desc);
-        if sorted.is_empty() {
+        let targets = self.process_navigation_targets(processes);
+        if targets.is_empty() {
             self.process_selected_pid = None;
+            self.process_selected_group = None;
             self.process_scroll = 0;
             return;
         }
 
         let current = self
-            .process_selected_pid
-            .and_then(|pid| sorted.iter().position(|process| process.pid == pid))
-            .unwrap_or_else(|| self.process_scroll.min(sorted.len() - 1));
+            .current_process_target()
+            .and_then(|selected| targets.iter().position(|target| *target == selected))
+            .unwrap_or_else(|| self.process_scroll.min(targets.len() - 1));
         let target = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs())
         } else {
-            current.saturating_add(delta as usize).min(sorted.len() - 1)
+            current
+                .saturating_add(delta as usize)
+                .min(targets.len() - 1)
         };
-        self.process_selected_pid = Some(sorted[target].pid);
+        self.select_process_target(&targets[target]);
     }
 
     pub fn process_home(&mut self, processes: &[ProcessStats]) {
-        let sorted = sorted_processes(processes, self.process_sort_key, self.process_sort_desc);
-        self.process_selected_pid = sorted.first().map(|process| process.pid);
+        let targets = self.process_navigation_targets(processes);
+        if let Some(target) = targets.first() {
+            self.select_process_target(target);
+        } else {
+            self.process_selected_pid = None;
+            self.process_selected_group = None;
+        }
         self.process_scroll = 0;
     }
 
     pub fn process_end(&mut self, processes: &[ProcessStats]) {
-        let sorted = sorted_processes(processes, self.process_sort_key, self.process_sort_desc);
-        self.process_selected_pid = sorted.last().map(|process| process.pid);
-        self.process_scroll = sorted.len().saturating_sub(1);
+        let targets = self.process_navigation_targets(processes);
+        if let Some(target) = targets.last() {
+            self.select_process_target(target);
+        } else {
+            self.process_selected_pid = None;
+            self.process_selected_group = None;
+        }
+        self.process_scroll = targets.len().saturating_sub(1);
+    }
+
+    fn current_process_target(&self) -> Option<ProcessRowTarget> {
+        if let Some(pid) = self.process_selected_pid {
+            Some(ProcessRowTarget::Process(pid))
+        } else {
+            self.process_selected_group
+                .as_ref()
+                .map(|program| ProcessRowTarget::Group(program.clone()))
+        }
+    }
+
+    fn select_process_target(&mut self, target: &ProcessRowTarget) {
+        match target {
+            ProcessRowTarget::Process(pid) => {
+                self.process_selected_pid = Some(*pid);
+                self.process_selected_group = None;
+            }
+            ProcessRowTarget::Group(program) => {
+                self.process_selected_pid = None;
+                self.process_selected_group = Some(program.clone());
+            }
+        }
+    }
+
+    fn process_navigation_targets(&self, processes: &[ProcessStats]) -> Vec<ProcessRowTarget> {
+        let (pinned, mut rows) = grouped_process_rows(
+            processes,
+            self.process_sort_key,
+            self.process_sort_desc,
+            self.process_pinned_pid,
+            &self.expanded_process_groups,
+        );
+        let pinned_group_rows =
+            take_pinned_group_rows(&mut rows, self.process_pinned_group.as_deref());
+
+        let mut targets = Vec::with_capacity(
+            rows.len() + pinned_group_rows.len() + usize::from(pinned.is_some()),
+        );
+        if let Some(process) = pinned {
+            targets.push(ProcessRowTarget::Process(process.pid));
+        }
+        targets.extend(pinned_group_rows.iter().map(process_row_target));
+        targets.extend(rows.iter().map(process_row_target));
+        targets
     }
 
     pub fn clamp_process_selection(&mut self, processes: &[ProcessStats]) {
@@ -2534,8 +2592,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
             key("- / +"),
             desc("Decrease / increase refresh interval"),
         ]),
-        Line::from(vec![key("↑ / k"), desc("Select previous process")]),
-        Line::from(vec![key("↓ / j"), desc("Select next process")]),
+        Line::from(vec![key("↑ / k"), desc("Select previous visible row")]),
+        Line::from(vec![key("↓ / j"), desc("Select next visible row")]),
         Line::from(vec![key("PgUp / PgDn"), desc("Jump 10 processes")]),
         Line::from(vec![key("Home / End"), desc("First / last process")]),
         Line::from(""),
@@ -3218,6 +3276,74 @@ mod tests {
         assert!(state.click_process_row(12, 11));
         assert_eq!(state.process_selected_pid, Some(20));
         assert_eq!(state.process_pinned_pid, None);
+    }
+
+    #[test]
+    fn keyboard_navigation_treats_collapsed_group_as_one_row() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "chromium".to_string(),
+                cpu_pct: 30.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "chromium".to_string(),
+                cpu_pct: 20.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 30,
+                program: "llama".to_string(),
+                cpu_pct: 10.0,
+                ..ProcessStats::default()
+            },
+        ];
+        let mut state = UiState::default();
+
+        state.process_home(&processes);
+        assert_eq!(state.process_selected_group.as_deref(), Some("chromium"));
+        assert_eq!(state.process_selected_pid, None);
+
+        state.move_process_selection(1, &processes);
+        assert_eq!(state.process_selected_pid, Some(30));
+        assert_eq!(state.process_selected_group, None);
+    }
+
+    #[test]
+    fn keyboard_navigation_enters_children_only_when_group_is_expanded() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "chromium".to_string(),
+                cpu_pct: 30.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "chromium".to_string(),
+                cpu_pct: 20.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 30,
+                program: "llama".to_string(),
+                cpu_pct: 10.0,
+                ..ProcessStats::default()
+            },
+        ];
+        let mut state = UiState {
+            expanded_process_groups: HashSet::from(["chromium".to_string()]),
+            ..UiState::default()
+        };
+
+        state.process_home(&processes);
+        assert_eq!(state.process_selected_group.as_deref(), Some("chromium"));
+
+        state.move_process_selection(1, &processes);
+        assert!(matches!(state.process_selected_pid, Some(10 | 20)));
+        assert_eq!(state.process_selected_group, None);
     }
 
     #[test]
