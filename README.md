@@ -4,63 +4,81 @@
 
 [![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
 
-OrsikTop is a fast Rust terminal UI for monitoring local LLM inference. It combines current llama.cpp inference data, NVIDIA GPU telemetry and Linux system telemetry in one dense btop-style view.
+OrsikTop is a fast Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one dense btop-style view.
 
 > Orsik = fantasy ork. Local models need tokens. Orks need more power.
 
-## Status
+## Current scope
 
-Early alpha. The first target stays intentionally narrow:
+OrsikTop intentionally targets a narrow stack first:
 
 - Linux
-- NVIDIA GPUs
-- llama.cpp / `llama-server` / `llama serve`
-- one local server
+- NVIDIA GPUs via NVML
+- llama.cpp (`llama-server` or `llama serve`)
+- local or manually configured llama.cpp endpoint
 - low-overhead terminal monitoring
 
-This is deliberate: YAGNI first, adapters later.
+No daemon, browser, database or account is required.
 
-## What it monitors
+## Highlights
 
-### llama.cpp
+### LLM inference
 
-- model and configured context
-- live prompt-processing and generation throughput from counter deltas
-- average prompt-processing and generation throughput from monotonic token/time counters
-- processed, prompt-cache and generated token counters
-- active and deferred requests
-- active / total server slots
-- live context usage from `/slots`
-- context high-watermark fallback when `/slots` is unavailable
-- speculative decoding / MTP acceptance over the current sampling window
+OrsikTop reads llama.cpp telemetry directly and shows:
 
-OrsikTop uses current llama.cpp Prometheus metric names. `/props` is cached instead of being requested every refresh. `/slots` is treated as optional telemetry: when it is unavailable, OrsikTop does not report a misleading `0/0`; it falls back to the configured slot count from `/props` when available.
+- model and configured context size
+- current context usage
+- live prompt-processing / prefill throughput
+- live decode / generation throughput
+- server-wide average throughput
+- prompt, cache and generated token counters
+- active and queued/deferred requests
+- active / total slots
+- speculative decoding / MTP state and acceptance data when available
+- cumulative prompt and generation time
+- 60-second prefill and decode history
+- connection state, uptime and smoothed polling latency
+- transient reconnect handling so a short polling hiccup does not immediately flash the server as offline
 
-The average throughput display prefers `prompt_tokens_total / prompt_seconds_total` and `tokens_predicted_total / tokens_predicted_seconds_total`. The older throughput gauges are retained only as compatibility fallbacks because some current llama.cpp builds can report zero from those gauges while inference is active.
+`/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry; when `/slots` is unavailable, OrsikTop falls back gracefully instead of displaying misleading values.
 
 ### NVIDIA GPU
 
 GPU telemetry comes directly from NVML. OrsikTop does **not** spawn `nvidia-smi` on every refresh.
 
-- GPU utilization and 60-second pixel history
-- VRAM used / total and memory utilization
+- GPU utilization
+- VRAM used / total and memory-controller utilization
 - graphics and memory clocks
 - temperature
 - power draw and enforced power limit
 - P-state
 - fan speed
 - encoder / decoder utilization
-- PCIe RX / TX throughput in MB/s
+- PCIe RX / TX throughput
+- 60-second GPU and VRAM history
 
-Unsupported NVML fields are shown as unavailable (`—`) instead of being reported as false zeroes.
+Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes.
 
-### System
+### Linux system
 
-- CPU utilization, frequency, package temperature, load and I/O wait
-- automatic Intel P-core / E-core topology grouping when Linux exposes it
+- CPU utilization and frequency
+- package temperature
+- load averages and I/O wait
+- Intel P-core / E-core grouping when exposed by Linux
+- per-core activity
 - RAM and swap usage
-- process list with sorting, scrolling and pinned processes
-- 60-second GPU/VRAM/CPU/RAM history
+- 60-second CPU and RAM history
+
+### Processes
+
+- process list with CPU, memory and thread counts
+- sorting by PID, program, CPU, memory or threads
+- processes with the same program name grouped together
+- right-click groups to expand / collapse them
+- keyboard navigation with selection auto-scroll
+- double-click to pin a process
+- mouse-wheel scrolling
+- `/` process search by program, command or PID
 
 ## Install
 
@@ -78,7 +96,7 @@ Or directly from GitHub:
 cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
 ```
 
-Cargo installs the binary as `orsiktop` (normally into `~/.cargo/bin`). With that directory in your `PATH`, start it exactly like btop:
+Cargo normally installs the binary into `~/.cargo/bin`:
 
 ```bash
 orsiktop
@@ -92,61 +110,103 @@ Start llama.cpp with metrics enabled:
 llama-server -m /path/to/model.gguf --metrics
 ```
 
-If you use the newer CLI form:
+or with the newer CLI form:
 
 ```bash
 llama serve -hf user/model:Q4_K_M --metrics
 ```
 
-Then simply run:
+Then run:
 
 ```bash
 orsiktop
 ```
 
-When `--server` / `ORSIKTOP_SERVER` is not set, OrsikTop scans local `/proc` entries for a running `llama-server` or `llama serve` process and derives its `--host` and `--port` automatically. A wildcard bind such as `0.0.0.0` is reached through loopback. If no local llama.cpp process is found, OrsikTop still starts and falls back to the standard `http://127.0.0.1:8080` endpoint, so GPU/system/process telemetry remains available while the LLM panel reports the server as offline.
+### Auto discovery
 
-Manual server override remains available:
+With **Auto discovery = ON**, OrsikTop scans local `/proc` entries for a running `llama-server` or `llama serve` process and derives its `--host` and `--port` automatically.
 
-```bash
-orsiktop --server http://127.0.0.1:8081
+A wildcard bind such as `0.0.0.0` or `::` is reached through loopback. If no local llama.cpp process is found, OrsikTop falls back to the saved endpoint and then to:
+
+```text
+http://127.0.0.1:8080
 ```
 
-For a 500 ms telemetry interval:
+This is only local process discovery; OrsikTop does **not** scan the LAN for llama.cpp servers.
 
-```bash
-orsiktop --interval-ms 500
-```
-
-To monitor another NVIDIA GPU:
-
-```bash
-orsiktop --gpu-index 1
-```
+For a remote or fixed endpoint, disable Auto discovery in Settings and enter the desired host and port.
 
 ## Controls
 
 | Action | Control |
 | --- | --- |
-| Quit | `q` or `Esc` |
+| Quit | `q` |
+| Help | `h` |
+| Settings | `Esc` |
+| Process search | `/` |
 | Faster refresh | click `[ - ]`, `-` or `[` |
 | Slower refresh | click `[ + ]`, `+` or `]` |
-| Process navigation | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn`, `Home` / `End`, mouse wheel |
-| Pin process | click process row |
-| Unpin process | click away from process row |
-| Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` header |
+| Process navigation | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn`, `Home` / `End` |
+| Scroll processes | mouse wheel |
+| Pin process | double-click process row |
+| Expand / collapse process group | right-click group |
+| Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` |
 
-Refresh can be changed live from **100 ms to 10,000 ms** in 100 ms steps. GPU telemetry follows that interval; CPU/RAM are refreshed on a lower-overhead cadence and llama.cpp HTTP polling runs independently so a slow `/metrics` or `/slots` response does not stall GPU updates.
+The main telemetry refresh can be changed live from **100 ms to 10,000 ms**.
 
-## Configuration
+## Settings
 
-| Option | Environment variable | Default |
+Press `Esc` to open the in-app settings menu:
+
+```text
+LLM Host/IP      127.0.0.1
+LLM Port         8081
+GPU              0
+Refresh          100 ms
+Process refresh  1000 ms
+Offline grace    2500 ms
+Auto discovery   ON
+```
+
+Settings can be changed without restarting OrsikTop.
+
+- `Tab`, `↑`, `↓` — move between fields
+- type / `Backspace` — edit values
+- `Space`, `←`, `→` — toggle Auto discovery
+- `Enter` — validate, save and apply
+- `Esc` — discard changes and close
+
+Configuration is stored in:
+
+```text
+$XDG_CONFIG_HOME/orsiktop/config
+```
+
+or, when `XDG_CONFIG_HOME` is not set:
+
+```text
+~/.config/orsiktop/config
+```
+
+Saved settings include the LLM endpoint, GPU index, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
+
+## CLI overrides
+
+CLI arguments and environment variables remain available for one-off overrides:
+
+| Option | Environment variable | Purpose |
 | --- | --- | --- |
-| `--server` | `ORSIKTOP_SERVER` | auto-discover local llama.cpp; fallback `http://127.0.0.1:8080` |
-| `--interval-ms`, `-i` | `ORSIKTOP_INTERVAL_MS` | `1000` |
-| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | `0` |
+| `--server` | `ORSIKTOP_SERVER` | llama.cpp endpoint; disables auto discovery for that run |
+| `--interval-ms`, `-i` | `ORSIKTOP_INTERVAL_MS` | main telemetry refresh interval |
+| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | NVIDIA GPU index |
 
-Explicit `--server` and `ORSIKTOP_SERVER` values take precedence over auto-discovery.
+Examples:
+
+```bash
+orsiktop --server http://192.168.1.20:8081
+orsiktop --interval-ms 500
+orsiktop --gpu-index 1
+```
 
 ## Build
 
@@ -157,26 +217,38 @@ cargo build --release --locked
 ./target/release/orsiktop
 ```
 
-OrsikTop loads NVIDIA NVML dynamically through `nvml-wrapper`. A normal NVIDIA Linux driver installation provides NVML; the application itself does not need to link against a bundled NVIDIA library.
+OrsikTop loads NVIDIA NVML dynamically through `nvml-wrapper`. A normal NVIDIA Linux driver installation provides NVML; OrsikTop does not bundle NVIDIA libraries.
 
 ## Architecture
 
-The code deliberately stays small:
-
 ```text
 src/
-├── main.rs   terminal setup + CLI + local llama.cpp discovery
-├── app.rs    event loop + fast/LLM telemetry workers
-├── llama.rs  llama.cpp /metrics, /slots and /props
-├── gpu.rs    NVIDIA NVML telemetry
-└── ui.rs     ratatui rendering + mouse hitboxes + 60 s history
+├── main.rs    terminal setup, CLI and llama.cpp discovery
+├── config.rs  persistent runtime settings
+├── app.rs     event loop and telemetry workers
+├── llama.rs   llama.cpp /metrics, /slots and /props
+├── gpu.rs     NVIDIA NVML telemetry
+├── cpu.rs     CPU topology / Linux CPU helpers
+└── ui.rs      ratatui rendering, controls and histories
 ```
 
-GPU/system telemetry and llama.cpp HTTP polling run in separate background workers. A slow HTTP response therefore cannot freeze mouse/keyboard input or delay fast GPU sampling.
+GPU/system sampling and llama.cpp HTTP polling run independently. A slow `/metrics` or `/slots` response therefore does not block keyboard/mouse input or fast GPU updates.
 
 ## Design goals
 
-OrsikTop should stay fast, readable and boring to operate: one binary, no daemon, no database, no browser and no account.
+OrsikTop should stay:
+
+- fast
+- readable
+- useful for local LLM inference
+- easy to run
+- deliberately small
+
+Features are added when they improve monitoring rather than simply making the TUI busier.
+
+## Status
+
+OrsikTop is still early software. The current implementation is focused on llama.cpp + NVIDIA + Linux before adding broader backend or platform support.
 
 ## License
 
