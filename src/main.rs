@@ -25,19 +25,18 @@ struct Args {
     #[arg(long, env = "ORSIKTOP_SERVER")]
     server: Option<String>,
 
-    /// Refresh interval in milliseconds
+    /// Refresh interval in milliseconds. Overrides the saved setting for this run.
     #[arg(
         short = 'i',
         long = "interval-ms",
         alias = "interval",
-        env = "ORSIKTOP_INTERVAL_MS",
-        default_value_t = 1000
+        env = "ORSIKTOP_INTERVAL_MS"
     )]
-    interval_ms: u64,
+    interval_ms: Option<u64>,
 
-    /// NVIDIA GPU index to monitor
-    #[arg(long, env = "ORSIKTOP_GPU_INDEX", default_value_t = 0)]
-    gpu_index: u32,
+    /// NVIDIA GPU index to monitor. Overrides the saved setting for this run.
+    #[arg(long, env = "ORSIKTOP_GPU_INDEX")]
+    gpu_index: Option<u32>,
 }
 
 struct TerminalGuard;
@@ -56,7 +55,19 @@ impl Drop for TerminalGuard {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let server = resolve_server(args.server);
+    let mut settings = config::load();
+    if let Some(server) = args.server.filter(|value| !value.trim().is_empty()) {
+        settings.server = Some(server);
+        settings.auto_discovery = false;
+    }
+    if let Some(interval_ms) = args.interval_ms {
+        settings.refresh_ms = interval_ms;
+    }
+    if let Some(gpu_index) = args.gpu_index {
+        settings.gpu_index = gpu_index;
+    }
+    settings = settings.sanitized();
+    let server = resolve_server(&settings);
 
     enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
@@ -68,14 +79,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    app::run(&mut terminal, &server, args.interval_ms, args.gpu_index)
+    app::run(&mut terminal, &server, settings)
 }
 
-fn resolve_server(explicit: Option<String>) -> String {
-    explicit
+fn resolve_server(settings: &config::AppConfig) -> String {
+    let discovered = settings
+        .auto_discovery
+        .then(discover_local_llama_server)
+        .flatten();
+    discovered
+        .or_else(|| settings.server.clone())
         .filter(|value| !value.trim().is_empty())
-        .or_else(config::load_server)
-        .or_else(discover_local_llama_server)
         .unwrap_or_else(|| DEFAULT_SERVER.to_string())
 }
 
@@ -200,10 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_server_wins_over_discovery() {
-        assert_eq!(
-            resolve_server(Some("http://10.0.0.5:8080".to_string())),
-            "http://10.0.0.5:8080"
-        );
+    fn manual_server_is_used_when_auto_discovery_is_disabled() {
+        let settings = config::AppConfig {
+            server: Some("http://10.0.0.5:8080".to_string()),
+            auto_discovery: false,
+            ..config::AppConfig::default()
+        };
+        assert_eq!(resolve_server(&settings), "http://10.0.0.5:8080");
     }
 }

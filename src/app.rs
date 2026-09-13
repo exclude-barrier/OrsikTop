@@ -25,8 +25,6 @@ use crate::{
 };
 
 const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
-const LLM_OFFLINE_GRACE: Duration = Duration::from_millis(2500);
 
 #[derive(Clone, Debug, Default)]
 struct DashboardSnapshot {
@@ -44,19 +42,24 @@ struct FastSnapshot {
 pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     server: &str,
-    initial_refresh_ms: u64,
-    gpu_index: u32,
+    initial_settings: config::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut server = server.to_string();
-    let mut refresh_ms = initial_refresh_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
+    let mut settings = initial_settings.sanitized();
+    let mut refresh_ms = settings.refresh_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
+    settings.refresh_ms = refresh_ms;
     let refresh_shared = Arc::new(AtomicU64::new(refresh_ms));
+    let process_refresh_shared = Arc::new(AtomicU64::new(settings.process_refresh_ms));
+    let offline_grace_shared = Arc::new(AtomicU64::new(settings.offline_grace_ms));
+    let gpu_index_shared = Arc::new(AtomicU64::new(settings.gpu_index as u64));
     let stop = Arc::new(AtomicBool::new(false));
     let (fast_tx, fast_rx) = mpsc::sync_channel::<FastSnapshot>(2);
     let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmStats>(2);
     let (server_tx, server_rx) = mpsc::channel::<String>();
 
     spawn_fast_worker(
-        gpu_index,
+        Arc::clone(&gpu_index_shared),
+        Arc::clone(&process_refresh_shared),
         Arc::clone(&refresh_shared),
         Arc::clone(&stop),
         fast_tx,
@@ -64,6 +67,7 @@ pub fn run(
     spawn_llm_worker(
         server.clone(),
         Arc::clone(&refresh_shared),
+        Arc::clone(&offline_grace_shared),
         Arc::clone(&stop),
         llm_tx,
         server_rx,
@@ -127,14 +131,30 @@ pub fn run(
                         KeyCode::Esc => ui_state.close_settings(),
                         KeyCode::Tab | KeyCode::Down => ui_state.settings_next_field(),
                         KeyCode::BackTab | KeyCode::Up => ui_state.settings_previous_field(),
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                            ui_state.settings_toggle_selected();
+                        }
                         KeyCode::Backspace => ui_state.settings_backspace(),
-                        KeyCode::Enter => match ui_state.settings_endpoint() {
-                            Ok(endpoint) => match config::save_server(&endpoint) {
+                        KeyCode::Enter => match ui_state.settings_config() {
+                            Ok(next_settings) => match config::save(&next_settings) {
                                 Ok(()) => {
-                                    server = endpoint.clone();
-                                    snapshot.llm = LlmStats::default();
-                                    ui_state.reset_llm_connection_state();
-                                    let _ = server_tx.send(endpoint);
+                                    let next_server = crate::resolve_server(&next_settings);
+                                    let server_changed = next_server != server;
+                                    settings = next_settings;
+                                    refresh_ms = settings.refresh_ms;
+                                    refresh_shared.store(refresh_ms, Ordering::Relaxed);
+                                    process_refresh_shared
+                                        .store(settings.process_refresh_ms, Ordering::Relaxed);
+                                    offline_grace_shared
+                                        .store(settings.offline_grace_ms, Ordering::Relaxed);
+                                    gpu_index_shared
+                                        .store(settings.gpu_index as u64, Ordering::Relaxed);
+                                    if server_changed {
+                                        server = next_server.clone();
+                                        snapshot.llm = LlmStats::default();
+                                        ui_state.reset_llm_connection_state();
+                                        let _ = server_tx.send(next_server);
+                                    }
                                     ui_state.close_settings();
                                 }
                                 Err(err) => ui_state
@@ -171,13 +191,15 @@ pub fn run(
                     KeyCode::Char('/') => ui_state.open_process_search(),
                     KeyCode::Char('h') => ui_state.toggle_help(),
                     KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
-                    KeyCode::Esc => ui_state.open_settings(&server),
+                    KeyCode::Esc => ui_state.open_settings(&server, &settings),
                     _ if ui_state.is_help_open() => {}
                     KeyCode::Char('-') | KeyCode::Char('[') => {
                         change_refresh(&mut refresh_ms, false, &refresh_shared);
+                        settings.refresh_ms = refresh_ms;
                     }
                     KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => {
                         change_refresh(&mut refresh_ms, true, &refresh_shared);
+                        settings.refresh_ms = refresh_ms;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         ui_state.move_process_selection(-1, &snapshot.system.processes);
@@ -215,10 +237,12 @@ pub fn run(
                             if let Some(controls) = ui::refresh_controls(header) {
                                 if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
                                     change_refresh(&mut refresh_ms, false, &refresh_shared);
+                                    settings.refresh_ms = refresh_ms;
                                     handled = true;
                                 } else if ui::rect_contains(controls.plus, mouse.column, mouse.row)
                                 {
                                     change_refresh(&mut refresh_ms, true, &refresh_shared);
+                                    settings.refresh_ms = refresh_ms;
                                     handled = true;
                                 }
                             }
@@ -265,13 +289,15 @@ fn change_refresh(refresh_ms: &mut u64, increase: bool, shared: &AtomicU64) {
 }
 
 fn spawn_fast_worker(
-    gpu_index: u32,
+    gpu_index: Arc<AtomicU64>,
+    process_refresh_ms: Arc<AtomicU64>,
     refresh_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<FastSnapshot>,
 ) {
     thread::spawn(move || {
-        let gpu = GpuMonitor::new(gpu_index);
+        let mut current_gpu_index = gpu_index.load(Ordering::Relaxed) as u32;
+        let mut gpu = GpuMonitor::new(current_gpu_index);
         let mut system = System::new();
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
@@ -282,9 +308,19 @@ fn spawn_fast_worker(
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
+            let requested_gpu_index = gpu_index.load(Ordering::Relaxed) as u32;
+            if requested_gpu_index != current_gpu_index {
+                current_gpu_index = requested_gpu_index;
+                gpu = GpuMonitor::new(current_gpu_index);
+            }
+            let process_interval =
+                Duration::from_millis(process_refresh_ms.load(Ordering::Relaxed).clamp(
+                    config::MIN_PROCESS_REFRESH_MS,
+                    config::MAX_PROCESS_REFRESH_MS,
+                ));
 
             if last_process_refresh
-                .map(|at| at.elapsed() >= PROCESS_REFRESH_INTERVAL)
+                .map(|at| at.elapsed() >= process_interval)
                 .unwrap_or(true)
             {
                 system.refresh_processes_specifics(
@@ -525,6 +561,7 @@ fn read_cpu_temperature_c() -> Option<f64> {
 fn spawn_llm_worker(
     server: String,
     refresh_ms: Arc<AtomicU64>,
+    offline_grace_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<LlmStats>,
     server_rx: Receiver<String>,
@@ -558,7 +595,13 @@ fn spawn_llm_worker(
                     ..Default::default()
                 },
             };
-            let stats = stabilize_llm_sample(raw_stats, &mut last_good_llm, Instant::now());
+            let offline_grace = Duration::from_millis(
+                offline_grace_ms
+                    .load(Ordering::Relaxed)
+                    .min(config::MAX_OFFLINE_GRACE_MS),
+            );
+            let stats =
+                stabilize_llm_sample(raw_stats, &mut last_good_llm, Instant::now(), offline_grace);
 
             match tx.try_send(stats) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -574,6 +617,7 @@ fn stabilize_llm_sample(
     mut stats: LlmStats,
     last_good: &mut Option<(LlmStats, Instant)>,
     now: Instant,
+    offline_grace: Duration,
 ) -> LlmStats {
     if stats.connected {
         stats.reconnecting = false;
@@ -589,7 +633,7 @@ fn stabilize_llm_sample(
 
     if !hard_failure {
         if let Some((previous, at)) = last_good.as_ref() {
-            if now.saturating_duration_since(*at) <= LLM_OFFLINE_GRACE {
+            if now.saturating_duration_since(*at) <= offline_grace {
                 let mut held = previous.clone();
                 held.error.clear();
                 held.reconnecting = true;
@@ -655,7 +699,7 @@ mod tests {
             prompt_tps: 123.0,
             ..LlmStats::default()
         };
-        let fresh = stabilize_llm_sample(good, &mut last_good, now);
+        let fresh = stabilize_llm_sample(good, &mut last_good, now, Duration::from_millis(2500));
         assert!(fresh.connected);
         assert!(!fresh.reconnecting);
 
@@ -663,7 +707,12 @@ mod tests {
             error: "cannot reach llama.cpp: timeout".to_string(),
             ..LlmStats::default()
         };
-        let held = stabilize_llm_sample(failed, &mut last_good, now + Duration::from_millis(500));
+        let held = stabilize_llm_sample(
+            failed,
+            &mut last_good,
+            now + Duration::from_millis(500),
+            Duration::from_millis(2500),
+        );
         assert!(held.connected);
         assert!(held.reconnecting);
         assert_eq!(held.prompt_tps, 123.0);
