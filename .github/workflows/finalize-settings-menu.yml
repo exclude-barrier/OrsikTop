@@ -1,0 +1,33 @@
+name: Finalize settings menu
+
+on:
+  push:
+    branches: [fix/settings-menu-final]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/settings-menu-final
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply patch
+        run: python .github/scripts/finalize_settings_menu.py
+      - name: Format
+        run: cargo fmt
+      - name: Test
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Commit validated change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs
+          git commit -m "Finalize settings input handling"
+          git push
