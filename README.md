@@ -145,9 +145,9 @@ For a remote or fixed endpoint, disable Auto discovery in Settings and enter the
 
 | Action | Control |
 | --- | --- |
-| Quit | `q` |
+| Quit | `Esc` |
 | Help | `h` |
-| Settings | `Esc` |
+| Settings | `q` |
 | Process search | `/` |
 | Faster refresh | click `[ - ]`, `-` or `[` |
 | Slower refresh | click `[ + ]`, `+` or `]` |
@@ -161,7 +161,7 @@ The main telemetry refresh can be changed live from **100 ms to 10,000 ms**.
 
 ## Settings
 
-Press `Esc` to open the in-app settings menu:
+Press `q` to open the in-app settings menu:
 
 ```text
 LLM Host/IP      127.0.0.1

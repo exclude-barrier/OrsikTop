@@ -187,12 +187,12 @@ pub fn run(
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') => break,
                     KeyCode::Char('/') => ui_state.open_process_search(),
                     KeyCode::Char('h') => ui_state.toggle_help(),
                     KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
-                    KeyCode::Esc => ui_state.open_settings(&server, &settings),
                     _ if ui_state.is_help_open() => {}
+                    KeyCode::Char('q') => ui_state.open_settings(&server, &settings),
+                    KeyCode::Esc => break,
                     KeyCode::Char('-') | KeyCode::Char('[') => {
                         change_refresh(&mut refresh_ms, false, &refresh_shared);
                         settings.refresh_ms = refresh_ms;
