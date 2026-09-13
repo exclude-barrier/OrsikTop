@@ -660,6 +660,7 @@ fn draw_header(frame: &mut Frame, area: Rect, llm: &LlmStats, server: &str, refr
         spans.extend([
             Span::styled(status, status_style),
             Span::styled("   ", Style::default()),
+            Span::styled("LLM ENDPOINT ", Style::default().fg(WHITE)),
             Span::styled(endpoint, Style::default().fg(MUTED)),
         ]);
 
