@@ -17,7 +17,7 @@ jobs:
           ref: fix/llm-panel-stability
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply patch
-        run: python .github/scripts/fix_llm_panel_stability.py
+        run: python .github/scripts/run_fix_llm_panel_stability.py
       - name: Format
         run: cargo fmt
       - name: Test
