@@ -854,15 +854,18 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
     }
 
     if !llm.connected {
+        let metrics_off = llm_metrics_disabled(&llm.error);
+        let (status, color, message) = if metrics_off {
+            ("METRICS OFF", YELLOW, "restart server with --metrics")
+        } else {
+            ("SERVER OFFLINE", RED, "connection lost · retrying")
+        };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(vec![
-                    label_span(" STATUS   "),
-                    value_span("METRICS OFF", YELLOW),
-                ]),
+                Line::from(vec![label_span(" STATUS   "), value_span(status, color)]),
                 Line::from(vec![
                     label_span(" LLAMA    "),
-                    Span::styled("restart server with --metrics", Style::default().fg(MUTED)),
+                    Span::styled(message, Style::default().fg(MUTED)),
                 ]),
             ]),
             inner,
@@ -935,6 +938,11 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
         .map(grouped_f64)
         .unwrap_or_else(|| "—".to_string());
     let cache_color = if cache_available { CYAN } else { MUTED };
+    let cache_share = llm.prompt_cached_total.and_then(|cached| {
+        (llm.prompt_total > 0.0).then_some((cached / llm.prompt_total * 100.0).clamp(0.0, 100.0))
+    });
+    let spec_total_acceptance = (llm.spec_draft_tokens > 0.0)
+        .then_some((llm.spec_accepted_tokens / llm.spec_draft_tokens * 100.0).clamp(0.0, 100.0));
 
     let pp_active = llm.prompt_tps > 0.05;
     let tg_active = llm.generation_tps > 0.05;
@@ -1043,6 +1051,75 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats) {
             )],
         ),
     ];
+
+    // The LLM pane is usually taller than its core metric set because it shares a row
+    // with the system pane. Use that spare vertical space for useful cumulative detail.
+    if inner.height >= 10 {
+        let cache_tokens = llm
+            .prompt_cached_total
+            .map(|value| format!("{} tok", grouped_f64(value)))
+            .unwrap_or_else(|| "—".to_string());
+        let cache_ratio = cache_share
+            .map(|value| format!("{value:.1}% of PP"))
+            .unwrap_or_else(|| "—".to_string());
+        lines.push(Line::from(vec![
+            label_span(" CACHE      "),
+            llm_metric_cell(&cache_tokens, metric_width, cache_color, false),
+            llm_metric_cell(&cache_ratio, metric_width, MUTED, false),
+        ]));
+    }
+
+    if inner.height >= 11 {
+        let draft = if llm.spec_enabled {
+            format!("{} draft", grouped_f64(llm.spec_draft_tokens))
+        } else {
+            "disabled".to_string()
+        };
+        let accepted = if llm.spec_enabled {
+            match spec_total_acceptance {
+                Some(rate) => format!(
+                    "{} accepted · {rate:.1}%",
+                    grouped_f64(llm.spec_accepted_tokens)
+                ),
+                None => format!("{} accepted", grouped_f64(llm.spec_accepted_tokens)),
+            }
+        } else {
+            "—".to_string()
+        };
+        lines.push(Line::from(vec![
+            label_span(" SPEC TOK   "),
+            llm_metric_cell(
+                &draft,
+                metric_width,
+                if llm.spec_enabled { CYAN } else { MUTED },
+                false,
+            ),
+            llm_metric_cell(
+                &accepted,
+                metric_width,
+                if llm.spec_enabled { ORK_GREEN } else { MUTED },
+                false,
+            ),
+        ]));
+    }
+
+    if inner.height >= 12 {
+        lines.push(Line::from(vec![
+            label_span(" TIME       "),
+            llm_metric_cell(
+                &format!("{:.1} s", llm.prompt_seconds_total),
+                metric_width,
+                MUTED,
+                false,
+            ),
+            llm_metric_cell(
+                &format!("{:.1} s", llm.generation_seconds_total),
+                metric_width,
+                MUTED,
+                false,
+            ),
+        ]));
+    }
 
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -3108,9 +3185,14 @@ fn optional_number(value: Option<f64>, decimals: usize, suffix: &str) -> String 
     }
 }
 
+fn llm_metrics_disabled(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("501") || lower.contains("--metrics") || lower.contains("metrics endpoint")
+}
+
 fn friendly_llm_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("501") || lower.contains("--metrics") || lower.contains("metrics endpoint") {
+    if llm_metrics_disabled(error) {
         "LLAMA METRICS OFF · restart server with --metrics".to_string()
     } else if lower.contains("cannot reach") || lower.contains("connection") {
         "LLAMA SERVER OFFLINE".to_string()

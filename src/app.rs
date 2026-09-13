@@ -25,6 +25,7 @@ use crate::{
 
 const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+const LLM_OFFLINE_GRACE: Duration = Duration::from_millis(2500);
 
 #[derive(Clone, Debug, Default)]
 struct DashboardSnapshot {
@@ -469,16 +470,18 @@ fn spawn_llm_worker(
         } else {
             String::new()
         };
+        let mut last_good_llm: Option<(LlmStats, Instant)> = None;
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
-            let stats = match llama.as_mut() {
+            let raw_stats = match llama.as_mut() {
                 Some(monitor) => monitor.sample(),
                 None => LlmStats {
                     error: llama_init_error.clone(),
                     ..Default::default()
                 },
             };
+            let stats = stabilize_llm_sample(raw_stats, &mut last_good_llm, Instant::now());
 
             match tx.try_send(stats) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -488,6 +491,35 @@ fn spawn_llm_worker(
             sleep_until_next_cycle(cycle_started, &refresh_ms, &stop);
         }
     });
+}
+
+fn stabilize_llm_sample(
+    stats: LlmStats,
+    last_good: &mut Option<(LlmStats, Instant)>,
+    now: Instant,
+) -> LlmStats {
+    if stats.connected {
+        *last_good = Some((stats.clone(), now));
+        return stats;
+    }
+
+    let error = stats.error.to_ascii_lowercase();
+    let hard_failure = error.contains("metrics disabled")
+        || error.contains("--metrics")
+        || error.contains("http 501")
+        || error.contains("failed to initialize http client");
+
+    if !hard_failure {
+        if let Some((previous, at)) = last_good.as_ref() {
+            if now.saturating_duration_since(*at) <= LLM_OFFLINE_GRACE {
+                let mut held = previous.clone();
+                held.error.clear();
+                return held;
+            }
+        }
+    }
+
+    stats
 }
 
 fn sleep_until_next_cycle(started: Instant, refresh_ms: &AtomicU64, stop: &AtomicBool) {
