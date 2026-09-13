@@ -99,7 +99,7 @@ pub struct LlamaMonitor {
 impl LlamaMonitor {
     pub fn new(server: &str) -> Result<Self, reqwest::Error> {
         let client = Client::builder()
-            .timeout(Duration::from_millis(700))
+            .timeout(Duration::from_millis(1200))
             .build()?;
 
         Ok(Self {
