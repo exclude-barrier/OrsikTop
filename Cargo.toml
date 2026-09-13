@@ -2,7 +2,7 @@
 name = "orsiktop"
 version = "0.1.0"
 edition = "2021"
-description = "btop for local LLM Orks"
+description = "Fast terminal monitoring for local LLM Orks"
 license = "Apache-2.0"
 repository = "https://github.com/exclude-barrier/OrsikTop"
 keywords = ["llm", "llama-cpp", "tui", "monitoring", "nvidia"]
