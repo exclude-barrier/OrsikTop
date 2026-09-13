@@ -89,6 +89,12 @@ enum ProcessSortKey {
     Threads,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SettingsField {
+    Host,
+    Port,
+}
+
 #[derive(Copy, Clone, Debug)]
 struct ProcessHeaderHit {
     rect: Rect,
@@ -128,6 +134,11 @@ pub struct UiState {
     process_pane: Option<Rect>,
     process_rows: Option<ProcessRowsHit>,
     help_open: bool,
+    settings_open: bool,
+    settings_field: SettingsField,
+    settings_host: String,
+    settings_port: String,
+    settings_error: Option<String>,
 }
 
 impl Default for UiState {
@@ -153,6 +164,11 @@ impl Default for UiState {
             process_pane: None,
             process_rows: None,
             help_open: false,
+            settings_open: false,
+            settings_field: SettingsField::Host,
+            settings_host: "127.0.0.1".to_string(),
+            settings_port: "8080".to_string(),
+            settings_error: None,
         }
     }
 }
@@ -416,6 +432,7 @@ impl UiState {
     }
 
     pub fn toggle_help(&mut self) {
+        self.settings_open = false;
         self.help_open = !self.help_open;
     }
 
@@ -425,6 +442,70 @@ impl UiState {
 
     pub fn is_help_open(&self) -> bool {
         self.help_open
+    }
+
+    pub fn open_settings(&mut self, server: &str) {
+        let (host, port) = endpoint_parts(server);
+        self.help_open = false;
+        self.settings_open = true;
+        self.settings_field = SettingsField::Host;
+        self.settings_host = host;
+        self.settings_port = port.to_string();
+        self.settings_error = None;
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.settings_error = None;
+    }
+
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    pub fn settings_next_field(&mut self) {
+        self.settings_field = match self.settings_field {
+            SettingsField::Host => SettingsField::Port,
+            SettingsField::Port => SettingsField::Host,
+        };
+        self.settings_error = None;
+    }
+
+    pub fn settings_previous_field(&mut self) {
+        self.settings_next_field();
+    }
+
+    pub fn settings_backspace(&mut self) {
+        match self.settings_field {
+            SettingsField::Host => {
+                self.settings_host.pop();
+            }
+            SettingsField::Port => {
+                self.settings_port.pop();
+            }
+        }
+        self.settings_error = None;
+    }
+
+    pub fn settings_insert_char(&mut self, ch: char) {
+        match self.settings_field {
+            SettingsField::Host if !ch.is_control() && !ch.is_whitespace() => {
+                self.settings_host.push(ch);
+            }
+            SettingsField::Port if ch.is_ascii_digit() && self.settings_port.len() < 5 => {
+                self.settings_port.push(ch);
+            }
+            _ => {}
+        }
+        self.settings_error = None;
+    }
+
+    pub fn settings_endpoint(&self) -> Result<String, String> {
+        build_endpoint(&self.settings_host, &self.settings_port)
+    }
+
+    pub fn set_settings_error(&mut self, error: String) {
+        self.settings_error = Some(error);
     }
 
     pub fn click_process_sort(&mut self, x: u16, y: u16) -> bool {
@@ -601,7 +682,9 @@ pub fn draw(
         draw_footer(frame, rows[4], llm, gpu);
     }
 
-    if state.help_open {
+    if state.settings_open {
+        draw_settings_popup(frame, area, state);
+    } else if state.help_open {
         draw_help_popup(frame, area);
     }
 }
@@ -2755,6 +2838,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         )),
         Line::from(vec![key("q"), desc("Quit")]),
         Line::from(vec![key("h"), desc("Toggle this help")]),
+        Line::from(vec![key("Esc"), desc("Open settings")]),
         Line::from(vec![
             key("- / +"),
             desc("Decrease / increase refresh interval"),
@@ -2777,6 +2861,139 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
     ];
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let width = area.width.saturating_sub(6).min(70);
+    let height = 13.min(area.height.saturating_sub(4));
+    if width < 50 || height < 11 {
+        return;
+    }
+
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" SETTINGS · OrsikTop ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let host_selected = state.settings_field == SettingsField::Host;
+    let port_selected = state.settings_field == SettingsField::Port;
+    let field_style = |selected: bool| {
+        let style = Style::default().fg(if selected { BRIGHT_GREEN } else { WHITE });
+        if selected {
+            style.bg(PROCESS_SELECTED_BG).add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    };
+    let cursor = |selected: bool| if selected { "▏" } else { "" };
+    let preview = state
+        .settings_endpoint()
+        .unwrap_or_else(|_| "http://…".to_string());
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " LLM ENDPOINT",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Host / IP  ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!(
+                    " {:<40}{} ",
+                    fit_cell(&state.settings_host, 40),
+                    cursor(host_selected)
+                ),
+                field_style(host_selected),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Port       ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!(" {:<8}{} ", state.settings_port, cursor(port_selected)),
+                field_style(port_selected),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Endpoint   ", Style::default().fg(MUTED)),
+            Span::styled(preview, Style::default().fg(CYAN)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Tab / ↑↓ select   Type to edit   Enter apply + save   Esc cancel",
+            Style::default().fg(MUTED),
+        )),
+    ];
+
+    if let Some(error) = state.settings_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" {error}"),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn endpoint_parts(server: &str) -> (String, u16) {
+    let compact = server
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+
+    if let Some(rest) = compact.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after
+                .strip_prefix(':')
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(8080);
+            return (host.to_string(), port);
+        }
+    }
+
+    if let Some((host, port)) = compact.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return (host.to_string(), port);
+        }
+    }
+    (compact.to_string(), 8080)
+}
+
+fn build_endpoint(host: &str, port: &str) -> Result<String, String> {
+    let host = host
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    if host.is_empty() {
+        return Err("Host / IP must not be empty".to_string());
+    }
+    if host.contains('/') || host.chars().any(char::is_whitespace) {
+        return Err("Host / IP contains invalid characters".to_string());
+    }
+    let port = port
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Port must be between 1 and 65535".to_string())?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!("http://{host}:{port}"))
 }
 
 pub fn refresh_controls(area: Rect) -> Option<RefreshControls> {
@@ -3688,6 +3905,23 @@ mod tests {
     #[test]
     fn endpoint_is_compact() {
         assert_eq!(compact_endpoint("http://127.0.0.1:8081/"), "127.0.0.1:8081");
+    }
+
+    #[test]
+    fn settings_endpoint_parses_and_rebuilds_ipv4() {
+        assert_eq!(
+            endpoint_parts("http://10.0.0.7:9090"),
+            ("10.0.0.7".to_string(), 9090)
+        );
+        assert_eq!(
+            build_endpoint("10.0.0.7", "9090").unwrap(),
+            "http://10.0.0.7:9090"
+        );
+    }
+
+    #[test]
+    fn settings_endpoint_supports_ipv6() {
+        assert_eq!(build_endpoint("::1", "8081").unwrap(), "http://[::1]:8081");
     }
 
     #[test]
