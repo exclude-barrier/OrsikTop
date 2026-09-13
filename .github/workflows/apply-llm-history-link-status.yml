@@ -1,0 +1,33 @@
+name: Apply LLM history and link status
+
+on:
+  push:
+    branches: [feature/llm-history-link-status]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/llm-history-link-status
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply patch
+        run: python .github/scripts/add_llm_history_link_status.py
+      - name: Format
+        run: cargo fmt
+      - name: Test
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Commit validated change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs src/llama.rs src/ui.rs
+          git commit -m "Add LLM throughput history and link status"
+          git push
