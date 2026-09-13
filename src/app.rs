@@ -3,7 +3,7 @@ use std::{
     io::Stdout,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc,
     },
     thread,
@@ -15,6 +15,7 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::{
+    config,
     cpu::{detect_cpu_topology, CpuTopology},
     gpu::{GpuMonitor, GpuStats},
     llama::{LlamaMonitor, LlmStats},
@@ -46,11 +47,13 @@ pub fn run(
     initial_refresh_ms: u64,
     gpu_index: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = server.to_string();
     let mut refresh_ms = initial_refresh_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
     let refresh_shared = Arc::new(AtomicU64::new(refresh_ms));
     let stop = Arc::new(AtomicBool::new(false));
     let (fast_tx, fast_rx) = mpsc::sync_channel::<FastSnapshot>(2);
     let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmStats>(2);
+    let (server_tx, server_rx) = mpsc::channel::<String>();
 
     spawn_fast_worker(
         gpu_index,
@@ -59,10 +62,11 @@ pub fn run(
         fast_tx,
     );
     spawn_llm_worker(
-        server.to_string(),
+        server.clone(),
         Arc::clone(&refresh_shared),
         Arc::clone(&stop),
         llm_tx,
+        server_rx,
     );
 
     let mut snapshot = DashboardSnapshot::default();
@@ -86,7 +90,7 @@ pub fn run(
                 &snapshot.llm,
                 &snapshot.gpu,
                 &mut ui_state,
-                server,
+                &server,
                 refresh_ms,
             )
         })?;
@@ -110,10 +114,36 @@ pub fn run(
                         _ => {}
                     }
                 }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press && ui_state.is_settings_open() =>
+                {
+                    match key.code {
+                        KeyCode::Esc => ui_state.close_settings(),
+                        KeyCode::Tab | KeyCode::Down => ui_state.settings_next_field(),
+                        KeyCode::BackTab | KeyCode::Up => ui_state.settings_previous_field(),
+                        KeyCode::Backspace => ui_state.settings_backspace(),
+                        KeyCode::Enter => match ui_state.settings_endpoint() {
+                            Ok(endpoint) => match config::save_server(&endpoint) {
+                                Ok(()) => {
+                                    server = endpoint.clone();
+                                    snapshot.llm = LlmStats::default();
+                                    let _ = server_tx.send(endpoint);
+                                    ui_state.close_settings();
+                                }
+                                Err(err) => ui_state
+                                    .set_settings_error(format!("Could not save settings: {err}")),
+                            },
+                            Err(err) => ui_state.set_settings_error(err),
+                        },
+                        KeyCode::Char(ch) => ui_state.settings_insert_char(ch),
+                        _ => {}
+                    }
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') => ui_state.toggle_help(),
                     KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
+                    KeyCode::Esc => ui_state.open_settings(&server),
                     _ if ui_state.is_help_open() => {}
                     KeyCode::Char('-') | KeyCode::Char('[') => {
                         change_refresh(&mut refresh_ms, false, &refresh_shared);
@@ -137,46 +167,49 @@ pub fn run(
                     KeyCode::End => ui_state.process_end(&snapshot.system.processes),
                     _ => {}
                 },
-                Event::Mouse(mouse) if !ui_state.is_help_open() => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if ui_state.click_process_row(mouse.column, mouse.row) {
-                            continue;
-                        }
+                Event::Mouse(mouse) if !ui_state.is_help_open() && !ui_state.is_settings_open() => {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if ui_state.click_process_row(mouse.column, mouse.row) {
+                                continue;
+                            }
 
-                        // Any left-click away from a process row releases the pinned process.
-                        ui_state.clear_process_selection();
+                            // Any left-click away from a process row releases the pinned process.
+                            ui_state.clear_process_selection();
 
-                        let (width, _) = crossterm::terminal::size()?;
-                        let header = Rect::new(0, 0, width, 3);
-                        let mut handled = false;
-                        if let Some(controls) = ui::refresh_controls(header) {
-                            if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
-                                change_refresh(&mut refresh_ms, false, &refresh_shared);
-                                handled = true;
-                            } else if ui::rect_contains(controls.plus, mouse.column, mouse.row) {
-                                change_refresh(&mut refresh_ms, true, &refresh_shared);
-                                handled = true;
+                            let (width, _) = crossterm::terminal::size()?;
+                            let header = Rect::new(0, 0, width, 3);
+                            let mut handled = false;
+                            if let Some(controls) = ui::refresh_controls(header) {
+                                if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
+                                    change_refresh(&mut refresh_ms, false, &refresh_shared);
+                                    handled = true;
+                                } else if ui::rect_contains(controls.plus, mouse.column, mouse.row)
+                                {
+                                    change_refresh(&mut refresh_ms, true, &refresh_shared);
+                                    handled = true;
+                                }
+                            }
+                            if !handled {
+                                ui_state.click_process_sort(mouse.column, mouse.row);
                             }
                         }
-                        if !handled {
-                            ui_state.click_process_sort(mouse.column, mouse.row);
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            ui_state.right_click_process_group(mouse.column, mouse.row);
                         }
+                        MouseEventKind::ScrollUp
+                            if ui_state.process_pane_contains(mouse.column, mouse.row) =>
+                        {
+                            ui_state.scroll_processes(-3);
+                        }
+                        MouseEventKind::ScrollDown
+                            if ui_state.process_pane_contains(mouse.column, mouse.row) =>
+                        {
+                            ui_state.scroll_processes(3);
+                        }
+                        _ => {}
                     }
-                    MouseEventKind::Down(MouseButton::Right) => {
-                        ui_state.right_click_process_group(mouse.column, mouse.row);
-                    }
-                    MouseEventKind::ScrollUp
-                        if ui_state.process_pane_contains(mouse.column, mouse.row) =>
-                    {
-                        ui_state.scroll_processes(-3);
-                    }
-                    MouseEventKind::ScrollDown
-                        if ui_state.process_pane_contains(mouse.column, mouse.row) =>
-                    {
-                        ui_state.scroll_processes(3);
-                    }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -462,10 +495,12 @@ fn spawn_llm_worker(
     refresh_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<LlmStats>,
+    server_rx: Receiver<String>,
 ) {
     thread::spawn(move || {
-        let mut llama = LlamaMonitor::new(&server).ok();
-        let llama_init_error = if llama.is_none() {
+        let mut current_server = server;
+        let mut llama = LlamaMonitor::new(&current_server).ok();
+        let mut llama_init_error = if llama.is_none() {
             "failed to initialize HTTP client".to_string()
         } else {
             String::new()
@@ -474,6 +509,16 @@ fn spawn_llm_worker(
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
+            while let Ok(next_server) = server_rx.try_recv() {
+                current_server = next_server;
+                llama = LlamaMonitor::new(&current_server).ok();
+                llama_init_error = if llama.is_none() {
+                    "failed to initialize HTTP client".to_string()
+                } else {
+                    String::new()
+                };
+                last_good_llm = None;
+            }
             let raw_stats = match llama.as_mut() {
                 Some(monitor) => monitor.sample(),
                 None => LlmStats {

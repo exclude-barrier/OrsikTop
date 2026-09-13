@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod cpu;
 mod gpu;
 mod llama;
@@ -73,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn resolve_server(explicit: Option<String>) -> String {
     explicit
         .filter(|value| !value.trim().is_empty())
+        .or_else(config::load_server)
         .or_else(discover_local_llama_server)
         .unwrap_or_else(|| DEFAULT_SERVER.to_string())
 }
