@@ -93,7 +93,10 @@ pub fn run(
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('h') => ui_state.toggle_help(),
+                    KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
+                    _ if ui_state.is_help_open() => {}
                     KeyCode::Char('-') | KeyCode::Char('[') => {
                         change_refresh(&mut refresh_ms, false, &refresh_shared);
                     }
@@ -116,7 +119,7 @@ pub fn run(
                     KeyCode::End => ui_state.process_end(&snapshot.system.processes),
                     _ => {}
                 },
-                Event::Mouse(mouse) => match mouse.kind {
+                Event::Mouse(mouse) if !ui_state.is_help_open() => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         if ui_state.click_process_row(mouse.column, mouse.row) {
                             continue;
