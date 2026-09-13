@@ -97,7 +97,11 @@ pub fn run(
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Repeat && !ui_state.is_help_open() => {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Repeat
+                        && !ui_state.is_help_open()
+                        && !ui_state.is_settings_open() =>
+                {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') => {
                             ui_state.move_process_selection(-1, &snapshot.system.processes);
