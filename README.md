@@ -1,6 +1,6 @@
 # OrsikTop
 
-**btop for local LLM Orks**
+**Fast terminal monitoring for local LLM Orks**
 
 [![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/exclude-barrier/OrsikTop)](./LICENSE)
@@ -8,7 +8,7 @@
 [![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-supported-5C6BC0)](https://github.com/ggml-org/llama.cpp)
 
-OrsikTop is a fast Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one dense btop-style view.
+OrsikTop is a fast Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one dense terminal dashboard.
 
 > Orsik = fantasy ork. Local models need tokens. Orks need more power.
 <img width="1440" alt="OrsikTop dashboard" src="assets/orsiktop.png" />
