@@ -1260,7 +1260,7 @@ fn physical_core_minibar_rows(
             let color = physical_core_color(usage, ORK_GREEN);
             spans.push(Span::styled(
                 format!(" P{row}  "),
-                Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
             spans.extend(mini_core_bar_spans(usage, 4, color));
             spans.push(Span::styled(
@@ -1284,7 +1284,7 @@ fn physical_core_minibar_rows(
             let color = physical_core_color(usage, CYAN);
             spans.push(Span::styled(
                 format!("E{row}  "),
-                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
             spans.extend(mini_core_bar_spans(usage, 3, color));
             spans.push(Span::styled(
@@ -1316,11 +1316,18 @@ fn physical_core_average(core: &CpuPhysicalCore, usages: &[f64]) -> f64 {
 }
 
 fn physical_core_color(usage: f64, base: Color) -> Color {
-    if clamp_percent(usage) >= 90.0 {
-        ORANGE
-    } else {
-        base
-    }
+    // Keep the P/E identity color at normal load, then smoothly heat up as a
+    // physical core approaches saturation: base -> yellow -> orange -> red.
+    interpolate_stops(
+        usage,
+        &[
+            (0.0, base),
+            (55.0, base),
+            (80.0, YELLOW),
+            (92.0, ORANGE),
+            (100.0, RED),
+        ],
+    )
 }
 
 fn mini_core_bar_spans(percent: f64, width: usize, color: Color) -> Vec<Span<'static>> {
@@ -1824,7 +1831,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         )
     } else if let Some(program) = state.process_pinned_group.as_deref() {
         format!(
-            " PROCESSES · PIN {program} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC "
+            " PROCESSES · PIN GROUP {program} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC "
         )
     } else {
         format!(
@@ -2445,7 +2452,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, re
     frame.render_widget(block, area);
 
     let help = format!(
-        " [q] quit  [-]/[+] refresh  [click] select  [2x] pin  [RMB group] expand  [header] sort  {refresh_ms} ms  "
+        " [q] quit  [-]/[+] refresh  [click] select  [2x] pin row/group  [RMB group] expand  [header] sort  {refresh_ms} ms  "
     );
     let help_width = help.chars().count() as u16;
     frame.render_widget(
@@ -3146,10 +3153,16 @@ mod tests {
     }
 
     #[test]
-    fn physical_core_color_only_warns_near_saturation() {
-        assert_eq!(physical_core_color(89.9, ORK_GREEN), ORK_GREEN);
-        assert_eq!(physical_core_color(90.0, ORK_GREEN), ORANGE);
-        assert_eq!(physical_core_color(95.0, CYAN), ORANGE);
+    fn physical_core_color_heats_up_toward_saturation() {
+        assert_eq!(physical_core_color(0.0, ORK_GREEN), ORK_GREEN);
+        assert_eq!(physical_core_color(55.0, CYAN), CYAN);
+        assert_eq!(physical_core_color(80.0, ORK_GREEN), YELLOW);
+        assert_eq!(physical_core_color(92.0, CYAN), ORANGE);
+        assert_eq!(physical_core_color(100.0, ORK_GREEN), RED);
+
+        let mid = physical_core_color(86.0, ORK_GREEN);
+        assert_ne!(mid, YELLOW);
+        assert_ne!(mid, ORANGE);
     }
 
     #[test]
