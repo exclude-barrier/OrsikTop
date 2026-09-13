@@ -115,6 +115,9 @@ pub struct UiState {
     process_selected_pid: Option<u32>,
     process_pinned_pid: Option<u32>,
     last_process_click: Option<(u32, Instant)>,
+    process_selected_group: Option<String>,
+    process_pinned_group: Option<String>,
+    last_process_group_click: Option<(String, Instant)>,
     expanded_process_groups: HashSet<String>,
     process_scroll: usize,
     process_display_total: usize,
@@ -135,6 +138,9 @@ impl Default for UiState {
             process_selected_pid: None,
             process_pinned_pid: None,
             last_process_click: None,
+            process_selected_group: None,
+            process_pinned_group: None,
+            last_process_group_click: None,
             expanded_process_groups: HashSet::new(),
             process_scroll: 0,
             process_display_total: 0,
@@ -211,6 +217,20 @@ impl UiState {
             .iter()
             .map(|process| process.program.as_str())
             .collect::<HashSet<_>>();
+        if self
+            .process_selected_group
+            .as_ref()
+            .is_some_and(|program| !programs.contains(program.as_str()))
+        {
+            self.process_selected_group = None;
+        }
+        if self
+            .process_pinned_group
+            .as_ref()
+            .is_some_and(|program| !programs.contains(program.as_str()))
+        {
+            self.process_pinned_group = None;
+        }
         self.expanded_process_groups
             .retain(|program| programs.contains(program.as_str()));
         self.process_scroll = self
@@ -237,6 +257,9 @@ impl UiState {
         self.process_selected_pid = None;
         self.process_pinned_pid = None;
         self.last_process_click = None;
+        self.process_selected_group = None;
+        self.process_pinned_group = None;
+        self.last_process_group_click = None;
     }
 
     pub fn process_pane_contains(&self, x: u16, y: u16) -> bool {
@@ -280,24 +303,52 @@ impl UiState {
         let Some(target) = rows.targets.get(row).cloned() else {
             return false;
         };
-        let ProcessRowTarget::Process(pid) = target else {
-            return false;
-        };
 
         let now = Instant::now();
-        let is_double_click = self.last_process_click.is_some_and(|(last_pid, at)| {
-            last_pid == pid && now.saturating_duration_since(at) <= PROCESS_DOUBLE_CLICK_WINDOW
-        });
+        match target {
+            ProcessRowTarget::Process(pid) => {
+                let is_double_click = self.last_process_click.is_some_and(|(last_pid, at)| {
+                    last_pid == pid
+                        && now.saturating_duration_since(at) <= PROCESS_DOUBLE_CLICK_WINDOW
+                });
 
-        self.process_selected_pid = Some(pid);
-        if is_double_click {
-            self.process_pinned_pid = Some(pid);
-            self.last_process_click = None;
-        } else {
-            if self.process_pinned_pid.is_some() && self.process_pinned_pid != Some(pid) {
-                self.process_pinned_pid = None;
+                self.process_selected_group = None;
+                self.process_pinned_group = None;
+                self.last_process_group_click = None;
+                self.process_selected_pid = Some(pid);
+                if is_double_click {
+                    self.process_pinned_pid = Some(pid);
+                    self.last_process_click = None;
+                } else {
+                    if self.process_pinned_pid.is_some() && self.process_pinned_pid != Some(pid) {
+                        self.process_pinned_pid = None;
+                    }
+                    self.last_process_click = Some((pid, now));
+                }
             }
-            self.last_process_click = Some((pid, now));
+            ProcessRowTarget::Group(program) => {
+                let is_double_click =
+                    self.last_process_group_click
+                        .as_ref()
+                        .is_some_and(|(last_program, at)| {
+                            last_program == &program
+                                && now.saturating_duration_since(*at) <= PROCESS_DOUBLE_CLICK_WINDOW
+                        });
+
+                self.process_selected_pid = None;
+                self.process_pinned_pid = None;
+                self.last_process_click = None;
+                self.process_selected_group = Some(program.clone());
+                if is_double_click {
+                    self.process_pinned_group = Some(program);
+                    self.last_process_group_click = None;
+                } else {
+                    if self.process_pinned_group.as_deref() != Some(program.as_str()) {
+                        self.process_pinned_group = None;
+                    }
+                    self.last_process_group_click = Some((program, now));
+                }
+            }
         }
         true
     }
@@ -1690,9 +1741,42 @@ fn grouped_process_rows<'a>(
     (pinned, rows)
 }
 
+fn take_pinned_group_rows<'a>(
+    rows: &mut Vec<ProcessDisplayRow<'a>>,
+    pinned_group: Option<&str>,
+) -> Vec<ProcessDisplayRow<'a>> {
+    let Some(group_name) = pinned_group else {
+        return Vec::new();
+    };
+    let Some(index) = rows.iter().position(|row| {
+        matches!(
+            row,
+            ProcessDisplayRow::Group { program, .. } if *program == group_name
+        )
+    }) else {
+        return Vec::new();
+    };
+
+    let mut pinned = vec![rows.remove(index)];
+    while index < rows.len() {
+        let is_child = matches!(
+            rows.get(index),
+            Some(ProcessDisplayRow::Process {
+                process,
+                child: true,
+            }) if process.program == group_name
+        );
+        if !is_child {
+            break;
+        }
+        pinned.push(rows.remove(index));
+    }
+    pinned
+}
+
 fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], state: &mut UiState) {
     state.process_pane = Some(area);
-    let (pinned, rows) = grouped_process_rows(
+    let (pinned, mut rows) = grouped_process_rows(
         processes,
         state.process_sort_key,
         state.process_sort_desc,
@@ -1702,10 +1786,16 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
     if state.process_pinned_pid.is_some() && pinned.is_none() {
         state.process_pinned_pid = None;
     }
+    let pinned_group_name = state.process_pinned_group.clone();
+    let pinned_group_rows = take_pinned_group_rows(&mut rows, pinned_group_name.as_deref());
+    if pinned_group_name.is_some() && pinned_group_rows.is_empty() {
+        state.process_pinned_group = None;
+    }
     state.process_display_total = rows.len();
 
     let visible = area.height.saturating_sub(3) as usize;
-    let pinned_rows = usize::from(pinned.is_some() && visible > 0);
+    let pinned_rows =
+        usize::from(pinned.is_some() && visible > 0).saturating_add(pinned_group_rows.len());
     let scroll_visible = visible.saturating_sub(pinned_rows);
     let max_start = rows.len().saturating_sub(scroll_visible);
     let start = state.process_scroll.min(max_start);
@@ -1731,6 +1821,10 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
         format!(
             " PROCESSES · PIN {} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC ",
             process.pid
+        )
+    } else if let Some(program) = state.process_pinned_group.as_deref() {
+        format!(
+            " PROCESSES · PIN {program} · SORT {sort_name} {sort_arrow} · {range}/{row_total} · {process_total} PROC "
         )
     } else {
         format!(
@@ -1785,6 +1879,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
             child: false,
         });
     }
+    visible_rows.extend(pinned_group_rows.iter().cloned());
     visible_rows.extend(rows.iter().skip(start).take(scroll_visible).cloned());
 
     state.process_rows = Some(ProcessRowsHit {
@@ -1811,27 +1906,33 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
                 memory_bytes,
                 threads,
                 expanded,
-            } => lines.push(if wide {
-                process_group_line_wide(
-                    program,
-                    count,
-                    cpu_pct,
-                    memory_bytes,
-                    threads,
-                    expanded,
-                    table_width as usize,
-                )
-            } else {
-                process_group_line_compact(
-                    program,
-                    count,
-                    cpu_pct,
-                    memory_bytes,
-                    threads,
-                    expanded,
-                    table_width as usize,
-                )
-            }),
+            } => {
+                let is_selected = state.process_selected_group.as_deref() == Some(program)
+                    || state.process_pinned_group.as_deref() == Some(program);
+                lines.push(if wide {
+                    process_group_line_wide(
+                        program,
+                        count,
+                        cpu_pct,
+                        memory_bytes,
+                        threads,
+                        expanded,
+                        is_selected,
+                        table_width as usize,
+                    )
+                } else {
+                    process_group_line_compact(
+                        program,
+                        count,
+                        cpu_pct,
+                        memory_bytes,
+                        threads,
+                        expanded,
+                        is_selected,
+                        table_width as usize,
+                    )
+                });
+            }
         }
     }
 
@@ -2069,6 +2170,7 @@ fn process_header_wide(width: usize, active: ProcessSortKey, descending: bool) -
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_group_line_compact(
     program: &str,
     count: usize,
@@ -2076,6 +2178,7 @@ fn process_group_line_compact(
     memory_bytes: u64,
     threads: usize,
     expanded: bool,
+    selected: bool,
     width: usize,
 ) -> Line<'static> {
     let fixed = 7 + 7 + 9 + 6;
@@ -2084,19 +2187,29 @@ fn process_group_line_compact(
     let arrow = if expanded { "▾" } else { "▸" };
     let program = fit_cell(&format!("{arrow} {program}"), program_width);
     let cpu = process_cpu_color(cpu_pct);
+    let marker = if selected { "›" } else { " " };
 
     Line::from(vec![
-        Span::styled(format!(" {:<6}", count_label), Style::default().fg(CYAN)),
+        Span::styled(
+            format!("{marker}{:<6}", count_label),
+            process_cell_style(CYAN, selected, false),
+        ),
         Span::styled(
             format!("{program:<program_width$}"),
-            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+            process_cell_style(ORK_GREEN, selected, true),
         ),
-        Span::styled(format!("{:>6.1}", cpu_pct), Style::default().fg(cpu)),
+        Span::styled(
+            format!("{:>6.1}", cpu_pct),
+            process_cell_style(cpu, selected, false),
+        ),
         Span::styled(
             format!(" {:>8}", compact_memory(memory_bytes)),
-            Style::default().fg(CYAN),
+            process_cell_style(CYAN, selected, false),
         ),
-        Span::styled(format!(" {:>5}", threads), Style::default().fg(MUTED)),
+        Span::styled(
+            format!(" {:>5}", threads),
+            process_cell_style(MUTED, selected, false),
+        ),
     ])
 }
 
@@ -2147,6 +2260,7 @@ fn process_line_compact(
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_group_line_wide(
     program: &str,
     count: usize,
@@ -2154,6 +2268,7 @@ fn process_group_line_wide(
     memory_bytes: u64,
     threads: usize,
     expanded: bool,
+    selected: bool,
     width: usize,
 ) -> Line<'static> {
     let fixed = 7 + 17 + 7 + 9 + 6;
@@ -2163,23 +2278,33 @@ fn process_group_line_wide(
     let program = fit_cell(&format!("{arrow} {program}"), 16);
     let command = fit_cell(&format!("{count} processes"), command_width);
     let cpu = process_cpu_color(cpu_pct);
+    let marker = if selected { "›" } else { " " };
 
     Line::from(vec![
-        Span::styled(format!(" {:<6}", count_label), Style::default().fg(CYAN)),
+        Span::styled(
+            format!("{marker}{:<6}", count_label),
+            process_cell_style(CYAN, selected, false),
+        ),
         Span::styled(
             format!("{program:<16}"),
-            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+            process_cell_style(ORK_GREEN, selected, true),
         ),
         Span::styled(
             format!("{command:<command_width$}"),
-            Style::default().fg(MUTED),
+            process_cell_style(MUTED, selected, false),
         ),
-        Span::styled(format!("{:>6.1}", cpu_pct), Style::default().fg(cpu)),
+        Span::styled(
+            format!("{:>6.1}", cpu_pct),
+            process_cell_style(cpu, selected, false),
+        ),
         Span::styled(
             format!(" {:>8}", compact_memory(memory_bytes)),
-            Style::default().fg(CYAN),
+            process_cell_style(CYAN, selected, false),
         ),
-        Span::styled(format!(" {:>5}", threads), Style::default().fg(MUTED)),
+        Span::styled(
+            format!(" {:>5}", threads),
+            process_cell_style(MUTED, selected, false),
+        ),
     ])
 }
 
@@ -2910,6 +3035,73 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn group_click_test_state() -> UiState {
+        UiState {
+            process_rows: Some(ProcessRowsHit {
+                rect: Rect::new(10, 10, 40, 1),
+                targets: vec![ProcessRowTarget::Group("chromium".to_string())],
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn single_click_selects_group_without_pinning() {
+        let mut state = group_click_test_state();
+
+        assert!(state.click_process_row(12, 10));
+        assert_eq!(state.process_selected_group.as_deref(), Some("chromium"));
+        assert_eq!(state.process_pinned_group, None);
+    }
+
+    #[test]
+    fn double_click_pins_group() {
+        let mut state = group_click_test_state();
+
+        assert!(state.click_process_row(12, 10));
+        assert!(state.click_process_row(12, 10));
+        assert_eq!(state.process_selected_group.as_deref(), Some("chromium"));
+        assert_eq!(state.process_pinned_group.as_deref(), Some("chromium"));
+    }
+
+    #[test]
+    fn pinned_group_is_taken_with_expanded_children() {
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "chromium".to_string(),
+                cpu_pct: 20.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "chromium".to_string(),
+                cpu_pct: 10.0,
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 30,
+                program: "llama".to_string(),
+                cpu_pct: 5.0,
+                ..ProcessStats::default()
+            },
+        ];
+        let expanded = HashSet::from(["chromium".to_string()]);
+        let (_, mut rows) =
+            grouped_process_rows(&processes, ProcessSortKey::Cpu, true, None, &expanded);
+        let pinned = take_pinned_group_rows(&mut rows, Some("chromium"));
+
+        assert_eq!(pinned.len(), 3);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            pinned[0],
+            ProcessDisplayRow::Group {
+                program: "chromium",
+                ..
+            }
+        ));
     }
 
     #[test]
