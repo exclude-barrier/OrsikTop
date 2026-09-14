@@ -5,9 +5,13 @@ mod gpu;
 mod llama;
 mod ui;
 
-use std::{fs, io, path::Path};
+use std::{
+    env, fs, io,
+    path::Path,
+    process::Command,
+};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -17,10 +21,25 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+const CARGO_UPDATE_COMMAND: &str =
+    "cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force";
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Update a standalone OrsikTop installation to the latest release.
+    Update,
+}
 
 #[derive(Parser, Debug)]
-#[command(name = "orsiktop", version, about = "btop for local LLM Orks")]
+#[command(
+    name = "orsiktop",
+    version,
+    about = "Fast terminal monitoring for local LLM Orks"
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// llama.cpp server base URL. When omitted, OrsikTop auto-discovers a local llama serve / llama-server process.
     #[arg(long, env = "ORSIKTOP_SERVER")]
     server: Option<String>,
@@ -55,6 +74,11 @@ impl Drop for TerminalGuard {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if let Some(Commands::Update) = args.command.as_ref() {
+        return run_updater();
+    }
+
     let mut settings = config::load();
     if let Some(server) = args.server.filter(|value| !value.trim().is_empty()) {
         settings.server = Some(server);
@@ -80,6 +104,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.hide_cursor()?;
 
     app::run(&mut terminal, &server, settings)
+}
+
+fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
+    let sibling_updater = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("orsiktop-update")))
+        .filter(|path| path.is_file());
+
+    let status = if let Some(path) = sibling_updater {
+        Command::new(path).status()
+    } else {
+        Command::new("orsiktop-update").status()
+    };
+
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("OrsikTop updater exited with status {status}").into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!(
+            "orsiktop-update was not found. Self-update is available for standalone installations created by the OrsikTop installer. If you installed OrsikTop with Cargo, update it with:\n{CARGO_UPDATE_COMMAND}"
+        )
+        .into()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn resolve_server(settings: &config::AppConfig) -> String {
