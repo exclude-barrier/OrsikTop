@@ -12,6 +12,12 @@ All notable changes to OrsikTop will be documented here.
   the config directory. Cargo installations are detected and answered with
   `cargo uninstall orsiktop` instead of being touched.
 
+### Changed
+
+- README restructured around a quick start (install, start llama.cpp with
+  metrics, run orsiktop), with a dedicated uninstalling section and
+  condensed installation/PATH text.
+
 ## [0.1.2] - 2026-09-14
 
 ### Fixed
