@@ -1,3 +1,10 @@
 /target
 .DS_Store
 *.log
+# OMP runtime artifacts (keep .omp/rules/ tracked)
+.omp/run/
+.omp/logs/
+.omp/cache/
+.omp/plans/
+.omp/browser-relay/
+.omp/agent/
