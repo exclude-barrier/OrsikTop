@@ -1,35 +1,40 @@
 # OrsikTop
 
-**Fast terminal monitoring for local LLM Orks**
+**Fast terminal monitoring for local LLM Orks.**
 
 [![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/exclude-barrier/OrsikTop)](https://github.com/exclude-barrier/OrsikTop/releases/latest)
 [![License](https://img.shields.io/github/license/exclude-barrier/OrsikTop)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-supported-5C6BC0)](https://github.com/ggml-org/llama.cpp)
 
-OrsikTop is a fast Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one dense terminal dashboard.
+OrsikTop is a Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one terminal dashboard.
+
+It is designed for people running local models with `llama.cpp` who want the important inference and system metrics visible without a browser, daemon, database or account.
 
 > Orsik = fantasy ork. Local models need tokens. Orks need more power.
+
 <img width="1440" alt="OrsikTop dashboard" src="assets/orsiktop.png" />
 
-## Current scope
+## Supported stack
 
-OrsikTop intentionally targets a narrow stack first:
+OrsikTop currently focuses on a deliberately narrow setup:
 
 - Linux
-- NVIDIA GPUs via NVML
-- llama.cpp (`llama-server` or `llama serve`)
-- local or manually configured llama.cpp endpoint
-- low-overhead terminal monitoring
+- `x86_64` prebuilt releases
+- NVIDIA GPUs through NVML
+- `llama.cpp` (`llama-server` or `llama serve`)
+- local or manually configured llama.cpp endpoints
+- terminal-first, low-overhead monitoring
 
-No daemon, browser, database or account is required.
+Broader GPU vendors, operating systems and inference backends are not the current focus.
 
-## Highlights
+## What OrsikTop monitors
 
 ### LLM inference
 
-OrsikTop reads llama.cpp telemetry directly and shows:
+OrsikTop reads llama.cpp telemetry and displays:
 
 - model and configured context size
 - current context usage
@@ -43,16 +48,17 @@ OrsikTop reads llama.cpp telemetry directly and shows:
 - cumulative prompt and generation time
 - 60-second prefill and decode history
 - connection state, uptime and smoothed polling latency
-- transient reconnect handling so a short polling hiccup does not immediately flash the server as offline
+- transient reconnect handling so short polling interruptions do not immediately show the server as offline
 
-`/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry; when `/slots` is unavailable, OrsikTop falls back gracefully instead of displaying misleading values.
+`/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
 
 ### NVIDIA GPU
 
-GPU telemetry comes directly from NVML. OrsikTop does **not** spawn `nvidia-smi` on every refresh.
+GPU telemetry is read directly through NVML. OrsikTop does **not** spawn `nvidia-smi` on every refresh.
 
 - GPU utilization
-- VRAM used / total and memory-controller utilization
+- VRAM used / total
+- memory-controller utilization
 - graphics and memory clocks
 - temperature
 - power draw and enforced power limit
@@ -85,23 +91,172 @@ Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes
 - mouse-wheel scrolling
 - `/` process search by program, command or PID
 
-## Install
+## Requirements
 
-### Recommended: standalone Linux installer
+For the recommended standalone installation you need:
 
-The recommended installation uses a prebuilt `x86_64` Linux release, so Rust is not required:
+- Linux on `x86_64`
+- an NVIDIA GPU with a working NVIDIA Linux driver / NVML
+- a recent `llama.cpp` server for LLM telemetry
+- `curl` for the installer
+
+Rust is **not** required when using the standalone installer.
+
+## Installation
+
+### Recommended: standalone installer
+
+Install the latest release with:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/exclude-barrier/OrsikTop/releases/latest/download/orsiktop-installer.sh | sh
 ```
 
-The installer is generated with `dist`, installs `orsiktop` and its updater into `~/.local/bin`, and attempts to add that directory to your `PATH` when needed.
+The installer is generated with `dist` and installs two executables into:
 
-If the installer updates your shell profile, restart the terminal or load the generated environment file for the current shell:
+```text
+~/.local/bin/
+├── orsiktop
+└── orsiktop-update
+```
+
+A successful installation currently ends with output similar to:
+
+```text
+downloading orsiktop 0.1.1 x86_64-unknown-linux-gnu
+installing to /home/user/.local/bin
+  orsiktop
+  orsiktop-update
+```
+
+Those final executable names are normal installer output. The installation is complete at that point.
+
+### Make OrsikTop available in the current shell
+
+The installer can configure future shells, but a child installer process cannot modify the `PATH` of the terminal that launched it.
+
+If `orsiktop` returns `command not found` immediately after installation, run:
 
 ```bash
-source "$HOME/.local/bin/env"
+export PATH="$HOME/.local/bin:$PATH"
+hash -r
+```
+
+Then verify the installation:
+
+```bash
+command -v orsiktop
+orsiktop --version
+```
+
+Expected output is similar to:
+
+```text
+/home/user/.local/bin/orsiktop
+orsiktop 0.1.1
+```
+
+You can then start OrsikTop with:
+
+```bash
+orsiktop
+```
+
+### Persistent PATH fallback
+
+Normally the installer handles the persistent PATH setup. If a newly opened terminal still cannot find `orsiktop`, add `~/.local/bin` to the startup file for your shell.
+
+**Bash:**
+
+```bash
+grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.bashrc || \
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+**Zsh:**
+
+```bash
+grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.zshrc || \
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Fish:**
+
+```fish
+fish_add_path "$HOME/.local/bin"
+```
+
+## Updating
+
+Standalone installations include the updater next to the main binary.
+
+Update to the latest release with:
+
+```bash
+orsiktop update
+```
+
+`orsiktop update` launches `orsiktop-update`, which is installed by the standalone installer and updates OrsikTop from GitHub Releases.
+
+OrsikTop does **not** perform automatic background update checks.
+
+If OrsikTop was installed with Cargo instead of the standalone installer, update it with Cargo:
+
+```bash
+cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force
+```
+
+## Cargo / source installation
+
+Cargo remains available for developers and as a fallback installation method.
+
+Install directly from GitHub:
+
+```bash
+cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
+```
+
+Or install from a local checkout:
+
+```bash
+git clone https://github.com/exclude-barrier/OrsikTop.git
+cd OrsikTop
+cargo install --path . --locked --force
+```
+
+Cargo normally installs binaries into `~/.cargo/bin`.
+
+If a Cargo installation succeeds but `orsiktop` is not found:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+hash -r
+```
+
+For a persistent Bash setup, for example:
+
+```bash
+grep -qxF 'export PATH="$HOME/.cargo/bin:$PATH"' ~/.bashrc || \
+  echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+```
+
+## Quick start
+
+Start llama.cpp with metrics enabled.
+
+Classic `llama-server` form:
+
+```bash
+llama-server -m /path/to/model.gguf --metrics
+```
+
+Newer `llama serve` form:
+
+```bash
+llama serve -hf user/model:Q4_K_M --metrics
 ```
 
 Then start OrsikTop:
@@ -110,75 +265,21 @@ Then start OrsikTop:
 orsiktop
 ```
 
-Release artifacts include SHA-256 checksums and are published with GitHub artifact attestations.
-
-### Update
-
-For a standalone installation made with the installer:
-
-```bash
-orsiktop update
-```
-
-`orsiktop update` delegates to the `orsiktop-update` program installed alongside OrsikTop and updates from GitHub Releases. OrsikTop does not perform automatic background update checks.
-
-If OrsikTop was installed with Cargo, update it with Cargo instead:
-
-```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force
-```
-
-### Cargo / source install
-
-Cargo remains available as a developer or fallback installation method:
-
-```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
-```
-
-Or from a local checkout:
-
-```bash
-git clone https://github.com/exclude-barrier/OrsikTop.git
-cd OrsikTop
-cargo install --path . --locked --force
-```
-
-Cargo normally installs the binary into `~/.cargo/bin`. If `orsiktop` is not found after a Cargo install, make sure that directory is in your `PATH`.
-
-## Quick start
-
-Start llama.cpp with metrics enabled:
-
-```bash
-llama-server -m /path/to/model.gguf --metrics
-```
-
-or with the newer CLI form:
-
-```bash
-llama serve -hf user/model:Q4_K_M --metrics
-```
-
-Then run:
-
-```bash
-orsiktop
-```
-
-### Auto discovery
+## Auto discovery
 
 With **Auto discovery = ON**, OrsikTop scans local `/proc` entries for a running `llama-server` or `llama serve` process and derives its `--host` and `--port` automatically.
 
-A wildcard bind such as `0.0.0.0` or `::` is reached through loopback. If no local llama.cpp process is found, OrsikTop falls back to the saved endpoint and then to:
+A wildcard bind such as `0.0.0.0` or `::` is reached through loopback.
+
+If no local llama.cpp process is found, OrsikTop uses the saved endpoint and finally falls back to:
 
 ```text
 http://127.0.0.1:8080
 ```
 
-This is only local process discovery; OrsikTop does **not** scan the LAN for llama.cpp servers.
+Auto discovery only inspects local processes. OrsikTop does **not** scan your LAN for llama.cpp servers.
 
-For a remote or fixed endpoint, disable Auto discovery in Settings and enter the desired host and port.
+For a remote or fixed endpoint, disable Auto discovery in Settings and enter the desired host and port, or use `--server` for a one-off override.
 
 ## Controls
 
@@ -196,7 +297,7 @@ For a remote or fixed endpoint, disable Auto discovery in Settings and enter the
 | Expand / collapse process group | right-click group |
 | Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` |
 
-The main telemetry refresh can be changed live from **100 ms to 10,000 ms**.
+The main telemetry refresh interval can be changed live from **100 ms to 10,000 ms**.
 
 ## Settings
 
@@ -234,9 +335,21 @@ or, when `XDG_CONFIG_HOME` is not set:
 
 Saved settings include the LLM endpoint, GPU index, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
 
-## CLI overrides
+## CLI
 
-CLI arguments and environment variables remain available for one-off overrides:
+Show the built-in help:
+
+```bash
+orsiktop --help
+```
+
+Show the installed version:
+
+```bash
+orsiktop --version
+```
+
+Available one-off overrides:
 
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
@@ -252,7 +365,75 @@ orsiktop --interval-ms 500
 orsiktop --gpu-index 1
 ```
 
-## Build
+Update a standalone installation:
+
+```bash
+orsiktop update
+```
+
+## Troubleshooting
+
+### `orsiktop: command not found`
+
+First confirm that the standalone installer created the binary:
+
+```bash
+ls -l "$HOME/.local/bin/orsiktop"
+```
+
+If it exists, activate the path in the current shell:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+hash -r
+orsiktop --version
+```
+
+If a new terminal still cannot find it, use the persistent PATH instructions in the installation section above.
+
+### LLM telemetry is offline or incomplete
+
+Make sure llama.cpp was started with metrics enabled:
+
+```bash
+--metrics
+```
+
+You can test the metrics endpoint directly:
+
+```bash
+curl http://127.0.0.1:8080/metrics
+```
+
+Adjust the port if your llama.cpp server uses a different one.
+
+If you use a fixed or remote server, either configure it in OrsikTop Settings or run:
+
+```bash
+orsiktop --server http://HOST:PORT
+```
+
+### GPU data is unavailable
+
+OrsikTop loads NVIDIA NVML dynamically through `nvml-wrapper`. A normal NVIDIA Linux driver installation provides NVML.
+
+Check that your NVIDIA driver is working:
+
+```bash
+nvidia-smi
+```
+
+OrsikTop does not bundle NVIDIA drivers or NVML libraries.
+
+## Release integrity
+
+Standalone releases are built and published through GitHub Actions with `dist`.
+
+Release artifacts include SHA-256 checksums and GitHub artifact attestations.
+
+The release page contains the installer, updater, prebuilt archive, checksums and source archive for each published version.
+
+## Build from source
 
 ```bash
 git clone https://github.com/exclude-barrier/OrsikTop.git
@@ -260,8 +441,6 @@ cd OrsikTop
 cargo build --release --locked
 ./target/release/orsiktop
 ```
-
-OrsikTop loads NVIDIA NVML dynamically through `nvml-wrapper`. A normal NVIDIA Linux driver installation provides NVML; OrsikTop does not bundle NVIDIA libraries.
 
 ## Architecture
 
@@ -292,8 +471,10 @@ Features are added when they improve monitoring rather than simply making the TU
 
 ## Status
 
-OrsikTop is still early software. The current implementation is focused on llama.cpp + NVIDIA + Linux before adding broader backend or platform support.
+OrsikTop is still early software. The current implementation is intentionally focused on **llama.cpp + NVIDIA + Linux** before adding broader backend or platform support.
+
+Bug reports and focused feature requests are welcome through GitHub Issues.
 
 ## License
 
-Apache License 2.0
+Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
