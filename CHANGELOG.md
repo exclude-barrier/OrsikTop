@@ -4,6 +4,27 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-14
+
+### Added
+
+- Standalone Linux x86_64 installation through a `dist`-generated shell installer.
+- Installation into `~/.local/bin` with PATH setup when required.
+- Standalone `orsiktop-update` updater and the user-facing `orsiktop update` command.
+- SHA-256 release checksums and GitHub artifact attestations for release artifacts.
+- RustSec dependency auditing in CI, with warnings such as soundness advisories treated as failures.
+- Dependabot configuration for Cargo and GitHub Actions.
+- Repository security policy.
+
+### Changed
+
+- Release packaging and GitHub Release publishing now use `dist` 0.33.0.
+- `ratatui` updated from 0.29.0 to 0.30.2, removing the vulnerable transitive `lru` version.
+- `crossterm` updated from 0.28.1 to 0.29.0.
+- `sysinfo` updated from 0.33.1 to 0.39.6.
+- Cargo installation remains available as a developer and fallback installation path.
+- CLI package description now consistently uses “Fast terminal monitoring for local LLM Orks”.
+
 ## [0.1.0] - 2026-09-13
 
 ### Added
