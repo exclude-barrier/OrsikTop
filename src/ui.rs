@@ -21,6 +21,10 @@ use crate::{
 pub const MIN_REFRESH_MS: u64 = 100;
 pub const MAX_REFRESH_MS: u64 = 10_000;
 pub const REFRESH_STEP_MS: u64 = 100;
+/// Floor for the LLM worker's /metrics poll. LLM token counters do not
+/// change meaningfully faster than this, so fast UI refresh rates should not
+/// multiply the HTTP polling overhead.
+pub const MIN_LLM_POLL_MS: u64 = 250;
 
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_MAX_SAMPLES: usize = 720;
