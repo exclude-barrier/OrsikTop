@@ -9,7 +9,7 @@
 [![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-supported-5C6BC0)](https://github.com/ggml-org/llama.cpp)
 
-OrsikTop is a Rust TUI for monitoring **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one terminal dashboard.
+OrsikTop is a Rust TUI that shows **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one terminal dashboard.
 
 It is designed for people running local models with `llama.cpp` who want the important inference and system metrics visible without a browser, daemon, database or account.
 
@@ -17,18 +17,38 @@ It is designed for people running local models with `llama.cpp` who want the imp
 
 <img width="1440" alt="OrsikTop dashboard" src="assets/orsiktop.png" />
 
-## Supported stack
+## Quick start
 
-OrsikTop currently focuses on a deliberately narrow setup:
+You need Linux on `x86_64`, an NVIDIA GPU with a working NVIDIA driver, a recent `llama.cpp`, and `curl` for the installer. Rust is **not** required.
 
-- Linux
-- `x86_64` prebuilt releases
-- NVIDIA GPUs through NVML
-- `llama.cpp` (`llama-server` or `llama serve`)
-- local or manually configured llama.cpp endpoints
-- terminal-first, low-overhead monitoring
+**1. Install OrsikTop:**
 
-Broader GPU vendors, operating systems and inference backends are not the current focus.
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/exclude-barrier/OrsikTop/releases/latest/download/orsiktop-installer.sh | sh
+```
+
+**2. Start llama.cpp with metrics enabled:**
+
+```bash
+llama-server -m /path/to/model.gguf --metrics
+```
+
+or with the newer `llama serve` form:
+
+```bash
+llama serve -hf user/model:Q4_K_M --metrics
+```
+
+**3. Run OrsikTop:**
+
+```bash
+orsiktop
+```
+
+OrsikTop finds the local llama.cpp process automatically (auto discovery) and shows model, throughput, GPU, system and process telemetry in the terminal.
+
+If `orsiktop` returns `command not found` right after installation, see [PATH setup](#make-orsiktop-available-in-the-current-shell).
 
 ## What OrsikTop monitors
 
@@ -91,16 +111,18 @@ Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes
 - mouse-wheel scrolling
 - `/` process search by program, command or PID
 
-## Requirements
+## Supported stack
 
-For the recommended standalone installation you need:
+OrsikTop currently focuses on a deliberately narrow setup:
 
-- Linux on `x86_64`
-- an NVIDIA GPU with a working NVIDIA Linux driver / NVML
-- a recent `llama.cpp` server for LLM telemetry
-- `curl` for the installer
+- Linux
+- `x86_64` prebuilt releases
+- NVIDIA GPUs through NVML
+- `llama.cpp` (`llama-server` or `llama serve`)
+- local or manually configured llama.cpp endpoints
+- terminal-first, low-overhead monitoring
 
-Rust is **not** required when using the standalone installer.
+Broader GPU vendors, operating systems and inference backends are not the current focus.
 
 ## Installation
 
@@ -134,9 +156,7 @@ Those final executable names are normal installer output. The installation is co
 
 ### Make OrsikTop available in the current shell
 
-The installer can configure future shells, but a child installer process cannot modify the `PATH` of the terminal that launched it.
-
-If `orsiktop` returns `command not found` immediately after installation, run:
+The installer can configure future shells, but it cannot change the `PATH` of the terminal that launched it. If `orsiktop` returns `command not found` right after installation, run:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -157,11 +177,7 @@ Expected output is similar to:
 orsiktop 0.1.2
 ```
 
-You can then start OrsikTop with:
-
-```bash
-orsiktop
-```
+You can then start OrsikTop with `orsiktop`.
 
 ### Persistent PATH fallback
 
@@ -189,27 +205,7 @@ source ~/.zshrc
 fish_add_path "$HOME/.local/bin"
 ```
 
-## Updating
-
-Standalone installations include the updater next to the main binary.
-
-Update to the latest release with:
-
-```bash
-orsiktop update
-```
-
-`orsiktop update` launches `orsiktop-update`, which is installed by the standalone installer and updates OrsikTop from GitHub Releases.
-
-OrsikTop does **not** perform automatic background update checks.
-
-If OrsikTop was installed with Cargo instead of the standalone installer, update it with Cargo:
-
-```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force
-```
-
-## Cargo / source installation
+### Install with Cargo
 
 Cargo remains available for developers and as a fallback installation method.
 
@@ -243,26 +239,44 @@ grep -qxF 'export PATH="$HOME/.cargo/bin:$PATH"' ~/.bashrc || \
   echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
 ```
 
-## Quick start
+## Updating
 
-Start llama.cpp with metrics enabled.
-
-Classic `llama-server` form:
+Standalone installations include the updater next to the main binary:
 
 ```bash
-llama-server -m /path/to/model.gguf --metrics
+orsiktop update
 ```
 
-Newer `llama serve` form:
+`orsiktop update` launches `orsiktop-update`, which updates OrsikTop from GitHub Releases.
+
+OrsikTop does **not** perform automatic background update checks.
+
+If OrsikTop was installed with Cargo instead of the standalone installer, update it with Cargo:
 
 ```bash
-llama serve -hf user/model:Q4_K_M --metrics
+cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force
 ```
 
-Then start OrsikTop:
+## Uninstalling
+
+Standalone installations uninstall themselves:
 
 ```bash
-orsiktop
+orsiktop uninstall
+```
+
+This removes `~/.local/bin/orsiktop` and `~/.local/bin/orsiktop-update` and prints every file it removed. Your saved settings are kept; add `--purge` to remove them as well:
+
+```bash
+orsiktop uninstall --purge
+```
+
+which also deletes the config directory (`$XDG_CONFIG_HOME/orsiktop`, usually `~/.config/orsiktop`).
+
+If OrsikTop was installed with Cargo, `orsiktop uninstall` detects that, leaves the binaries in place, and tells you to run:
+
+```bash
+cargo uninstall orsiktop
 ```
 
 ## Auto discovery
@@ -349,7 +363,15 @@ Show the installed version:
 orsiktop --version
 ```
 
-Available one-off overrides:
+Subcommands:
+
+| Command | Effect |
+| --- | --- |
+| `orsiktop update` | Updates a standalone installation to the latest release |
+| `orsiktop uninstall` | Removes the standalone binaries, keeps the config |
+| `orsiktop uninstall --purge` | Removes the binaries and the config directory |
+
+Available one-off overrides for a single run:
 
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
@@ -363,12 +385,6 @@ Examples:
 orsiktop --server http://192.168.1.20:8081
 orsiktop --interval-ms 500
 orsiktop --gpu-index 1
-```
-
-Update a standalone installation:
-
-```bash
-orsiktop update
 ```
 
 ## Troubleshooting
