@@ -101,14 +101,18 @@ pub fn save(config: &AppConfig) -> io::Result<()> {
     fs::write(path, format!("{}\n", lines.join("\n")))
 }
 
-fn config_path() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(dir).join("orsiktop/config"));
+        return Some(PathBuf::from(dir).join("orsiktop"));
     }
     env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .map(|home| home.join(".config/orsiktop/config"))
+        .map(|home| home.join(".config/orsiktop"))
+}
+
+pub fn config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("config"))
 }
 
 fn parse_config(text: &str) -> AppConfig {

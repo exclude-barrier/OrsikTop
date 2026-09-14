@@ -5,7 +5,7 @@ mod gpu;
 mod llama;
 mod ui;
 
-use std::{env, fs, io, path::Path, process::Command};
+use std::{env, fs, io, path::Path, path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -24,6 +24,12 @@ const CARGO_UPDATE_COMMAND: &str =
 enum Commands {
     /// Update a standalone OrsikTop installation to the latest release.
     Update,
+    /// Remove the OrsikTop binaries, and optionally the saved config.
+    Uninstall {
+        /// Also remove the saved OrsikTop config (endpoint, GPU index, refresh settings).
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -71,8 +77,11 @@ impl Drop for TerminalGuard {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    if let Some(Commands::Update) = args.command.as_ref() {
-        return run_updater();
+    if let Some(command) = args.command.as_ref() {
+        return match command {
+            Commands::Update => run_updater(),
+            Commands::Uninstall { purge } => run_uninstall(*purge),
+        };
     }
 
     let mut settings = config::load();
@@ -123,6 +132,72 @@ fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
         .into()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn run_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let exe = env::current_exe()
+        .map_err(|error| format!("could not determine the running binary: {error}"))?;
+    let dir = exe
+        .parent()
+        .ok_or("could not determine the installation directory")?;
+
+    let cargo_install = is_cargo_install_dir(dir);
+    let mut lines = Vec::new();
+
+    if cargo_install {
+        lines.push(
+            "OrsikTop was installed with Cargo, so the binaries were left in place. Remove it with:"
+                .to_string(),
+        );
+        lines.push("cargo uninstall orsiktop".to_string());
+    } else {
+        for path in uninstall_files(dir) {
+            fs::remove_file(&path)
+                .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+            lines.push(format!("removed {}", path.display()));
+        }
+    }
+
+    if let Some(config_dir) = config::config_dir() {
+        if purge {
+            match fs::remove_dir_all(&config_dir) {
+                Ok(()) => lines.push(format!("removed {}", config_dir.display())),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(
+                        format!("failed to remove {}: {error}", config_dir.display()).into(),
+                    )
+                }
+            }
+        } else if config_dir.is_dir() {
+            lines.push(format!(
+                "kept config at {} (remove it with: orsiktop uninstall --purge)",
+                config_dir.display()
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("no OrsikTop binaries found; nothing to remove".to_string());
+    }
+    println!("{}", lines.join("\n"));
+    Ok(())
+}
+
+fn is_cargo_install_dir(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name == "bin")
+        && dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .is_some_and(|name| name == ".cargo")
+}
+
+fn uninstall_files(dir: &Path) -> Vec<PathBuf> {
+    ["orsiktop", "orsiktop-update"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn resolve_server(settings: &config::AppConfig) -> String {
@@ -264,5 +339,32 @@ mod tests {
             ..config::AppConfig::default()
         };
         assert_eq!(resolve_server(&settings), "http://10.0.0.5:8080");
+    }
+
+    #[test]
+    fn uninstall_files_only_lists_existing_orsiktop_binaries() {
+        let dir =
+            std::env::temp_dir().join(format!("orsiktop-uninstall-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let main_bin = dir.join("orsiktop");
+        let updater = dir.join("orsiktop-update");
+        let unrelated = dir.join("llama-server");
+        fs::write(&main_bin, b"binary").unwrap();
+        fs::write(&unrelated, b"binary").unwrap();
+
+        assert_eq!(uninstall_files(&dir), vec![main_bin.clone()]);
+
+        fs::write(&updater, b"binary").unwrap();
+        assert_eq!(uninstall_files(&dir), vec![main_bin, updater]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_install_dir_is_recognized() {
+        let cargo_dir = Path::new("/home/user/.cargo/bin");
+        let other_dir = Path::new("/home/user/.local/bin");
+        assert!(is_cargo_install_dir(cargo_dir));
+        assert!(!is_cargo_install_dir(other_dir));
     }
 }
