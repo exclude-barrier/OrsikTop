@@ -10,17 +10,93 @@ permissions:
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      tag-flag: ${{ steps.release.outputs.tag-flag }}
+      publishing: ${{ steps.release.outputs.publishing }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: release
+        name: Resolve release event
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          echo "tag=" >> "$GITHUB_OUTPUT"
+          echo "tag-flag=" >> "$GITHUB_OUTPUT"
+          echo "publishing=false" >> "$GITHUB_OUTPUT"
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            exit 0
+          fi
+
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "tag-flag=--tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "publishing=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$REF_NAME" != "main" || "$COMMIT_MESSAGE" != Release\ v* ]]; then
+            exit 0
+          fi
+
+          version=$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ && in_package { exit }
+            in_package && /^version = / {
+              gsub(/version = |"/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+
+          if [[ -z "$version" ]]; then
+            echo "Could not determine package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          tag="v$version"
+          echo "Preparing $tag from $GITHUB_SHA"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; refusing to recreate it." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" "$GITHUB_SHA" -m "OrsikTop $tag"
+          git push origin "$tag"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag-flag=--tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publishing=true" >> "$GITHUB_OUTPUT"
+
   plan:
+    needs: [prepare]
+    if: ${{ github.event_name == 'pull_request' || needs.prepare.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      tag: ${{ needs.prepare.outputs.tag }}
+      tag-flag: ${{ needs.prepare.outputs.tag-flag }}
+      publishing: ${{ needs.prepare.outputs.publishing }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -28,6 +104,8 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install dist
         shell: bash
@@ -40,8 +118,13 @@ jobs:
           path: ~/.cargo/bin/dist
 
       - id: plan
+        shell: bash
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          if [[ "${{ needs.prepare.outputs.publishing }}" == "true" ]]; then
+            dist host --steps=create --tag="${{ needs.prepare.outputs.tag }}" --output-format=json > plan-dist-manifest.json
+          else
+            dist plan --output-format=json > plan-dist-manifest.json
+          fi
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
@@ -72,6 +155,8 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install Rust non-interactively if needed
         if: ${{ matrix.container }}
@@ -139,6 +224,8 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install cached dist
         uses: actions/download-artifact@v8
@@ -185,6 +272,8 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install cached dist
         uses: actions/download-artifact@v8
