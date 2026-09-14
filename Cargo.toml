@@ -5,6 +5,8 @@ edition = "2021"
 description = "Fast terminal monitoring for local LLM Orks"
 license = "Apache-2.0"
 repository = "https://github.com/exclude-barrier/OrsikTop"
+homepage = "https://github.com/exclude-barrier/OrsikTop"
+readme = "README.md"
 keywords = ["llm", "llama-cpp", "tui", "monitoring", "nvidia"]
 categories = ["command-line-utilities"]
 
@@ -16,3 +18,7 @@ ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1.0"
 sysinfo = "0.39"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
