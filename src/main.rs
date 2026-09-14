@@ -5,11 +5,7 @@ mod gpu;
 mod llama;
 mod ui;
 
-use std::{
-    env, fs, io,
-    path::Path,
-    process::Command,
-};
+use std::{env, fs, io, path::Path, process::Command};
 
 use clap::{Parser, Subcommand};
 use crossterm::{
