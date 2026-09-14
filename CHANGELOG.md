@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-14
+
 ### Fixed
 
 - Standalone installer no longer executes `orsiktop` / `orsiktop update` during
