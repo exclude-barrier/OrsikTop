@@ -4,6 +4,14 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `orsiktop uninstall` removes a standalone installation
+  (`~/.local/bin/orsiktop` and `~/.local/bin/orsiktop-update`) and prints
+  every file it removed. `orsiktop uninstall --purge` additionally removes
+  the config directory. Cargo installations are detected and answered with
+  `cargo uninstall orsiktop` instead of being touched.
+
 ## [0.1.2] - 2026-09-14
 
 ### Fixed
