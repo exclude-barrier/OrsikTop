@@ -14,7 +14,7 @@ use ratatui::{
 use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
-    gpu::GpuStats,
+    gpu::{self, GpuStats},
     llama::LlmStats,
 };
 
@@ -1068,28 +1068,65 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
                 fixed_data_pair("FAN", fan_text, ORK_GREEN, 13),
             ],
         ),
-        Line::from(vec![
-            label_span(" I/O    "),
-            Span::raw(" ".repeat(bar_width + 7)),
-            fixed_data_pair(
-                "MEMCTRL",
-                format!("{:.0}%", gpu.memory_utilization),
+        match gpu::pcie_utilization_pct(
+            gpu.pcie_rx_mb_s,
+            gpu.pcie_tx_mb_s,
+            gpu.pcie_link_speed_gts,
+            gpu.pcie_link_width,
+        ) {
+            Some(pct) => meter_line(
+                "I/O",
+                pct,
+                bar_width,
                 CYAN,
-                17,
+                format!("{:>3.0}%", pct),
+                vec![
+                    fixed_data_pair(
+                        "MEMCTRL",
+                        format!("{:.0}%", gpu.memory_utilization),
+                        CYAN,
+                        17,
+                    ),
+                    fixed_data_pair(
+                        "PCIe RX",
+                        optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                        CYAN,
+                        22,
+                    ),
+                    fixed_data_pair(
+                        "TX",
+                        optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                        CYAN,
+                        18,
+                    ),
+                ],
             ),
-            fixed_data_pair(
-                "PCIe RX",
-                optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
-                CYAN,
-                22,
-            ),
-            fixed_data_pair(
-                "TX",
-                optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
-                CYAN,
-                18,
-            ),
-        ]),
+            None => Line::from(vec![
+                label_span(" I/O    "),
+                Span::styled(
+                    format!("{:<width$}", " \u{2014}", width = bar_width + 11),
+                    Style::default().fg(MUTED),
+                ),
+                fixed_data_pair(
+                    "MEMCTRL",
+                    format!("{:.0}%", gpu.memory_utilization),
+                    CYAN,
+                    17,
+                ),
+                fixed_data_pair(
+                    "PCIe RX",
+                    optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                    CYAN,
+                    22,
+                ),
+                fixed_data_pair(
+                    "TX",
+                    optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                    CYAN,
+                    18,
+                ),
+            ]),
+        },
         Line::from(vec![
             label_span("        "),
             Span::raw(" ".repeat(bar_width + 7)),
@@ -4751,5 +4788,84 @@ mod tests {
     #[test]
     fn nan_percent_is_safely_clamped() {
         assert_eq!(clamp_percent(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn io_row_renders_meter_or_dash_placeholder_at_fixed_width() {
+        let base = GpuStats {
+            available: true,
+            index: 0,
+            name: "Test".to_string(),
+            ..Default::default()
+        };
+        let with_link = GpuStats {
+            pcie_rx_mb_s: Some(15753.6),
+            pcie_tx_mb_s: Some(15753.6),
+            pcie_link_speed_gts: Some(16.0),
+            pcie_link_width: Some(16),
+            ..base.clone()
+        };
+        let without_link = GpuStats { ..base };
+
+        let row = |gpu: &GpuStats| match gpu::pcie_utilization_pct(
+            gpu.pcie_rx_mb_s,
+            gpu.pcie_tx_mb_s,
+            gpu.pcie_link_speed_gts,
+            gpu.pcie_link_width,
+        ) {
+            Some(pct) => meter_line(
+                "I/O",
+                pct,
+                14,
+                CYAN,
+                format!("{:>3.0}%", pct),
+                vec![
+                    fixed_data_pair(
+                        "MEMCTRL",
+                        format!("{:.0}%", gpu.memory_utilization),
+                        CYAN,
+                        17,
+                    ),
+                    fixed_data_pair(
+                        "PCIe RX",
+                        optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                        CYAN,
+                        22,
+                    ),
+                    fixed_data_pair(
+                        "TX",
+                        optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                        CYAN,
+                        18,
+                    ),
+                ],
+            ),
+            None => Line::from(vec![
+                label_span(" I/O    "),
+                Span::styled(
+                    format!("{:<width$}", " \u{2014}", width = 14 + 11),
+                    Style::default().fg(MUTED),
+                ),
+                fixed_data_pair(
+                    "MEMCTRL",
+                    format!("{:.0}%", gpu.memory_utilization),
+                    CYAN,
+                    17,
+                ),
+                fixed_data_pair(
+                    "PCIe RX",
+                    optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                    CYAN,
+                    22,
+                ),
+                fixed_data_pair(
+                    "TX",
+                    optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                    CYAN,
+                    18,
+                ),
+            ]),
+        };
+        assert_eq!(row(&with_link).width(), row(&without_link).width());
     }
 }
