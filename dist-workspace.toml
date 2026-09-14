@@ -1,0 +1,15 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu"]
+install-path = "~/.local/bin"
+install-updater = true
+checksum = "sha256"
+hosting = ["github"]
+github-attestations = true
+pr-run-mode = "plan"
+install-success-msg = "OrsikTop is installed. Run `orsiktop` to start it and `orsiktop update` to update it."
