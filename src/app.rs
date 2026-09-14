@@ -20,7 +20,8 @@ use crate::{
     gpu::{GpuMonitor, GpuStats},
     llama::{LlamaMonitor, LlmStats},
     ui::{
-        self, ProcessStats, SystemStats, UiState, MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
+        self, ProcessStats, SystemStats, UiState, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
+        REFRESH_STEP_MS,
     },
 };
 
@@ -389,7 +390,7 @@ fn spawn_fast_worker(
                 Err(TrySendError::Disconnected(_)) => break,
             }
 
-            sleep_until_next_cycle(cycle_started, &refresh_ms, &stop);
+            sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_REFRESH_MS, &stop);
         }
     });
 }
@@ -608,7 +609,7 @@ fn spawn_llm_worker(
                 Err(TrySendError::Disconnected(_)) => break,
             }
 
-            sleep_until_next_cycle(cycle_started, &refresh_ms, &stop);
+            sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_LLM_POLL_MS, &stop);
         }
     });
 }
@@ -645,17 +646,30 @@ fn stabilize_llm_sample(
     stats
 }
 
-fn sleep_until_next_cycle(started: Instant, refresh_ms: &AtomicU64, stop: &AtomicBool) {
+/// Sleeps until the next cycle boundary, clamping the live refresh value to
+/// `[min_ms, MAX_REFRESH_MS]`. Callers pass their own floor: `MIN_REFRESH_MS`
+/// for the fast worker and `MIN_LLM_POLL_MS` for the LLM worker, so a fast UI
+/// refresh cannot drive the /metrics HTTP poll faster than 250 ms.
+fn next_cycle_target(refresh_ms: &AtomicU64, min_ms: u64) -> Duration {
+    Duration::from_millis(
+        refresh_ms
+            .load(Ordering::Relaxed)
+            .clamp(min_ms, MAX_REFRESH_MS),
+    )
+}
+
+fn sleep_until_next_cycle(
+    started: Instant,
+    refresh_ms: &AtomicU64,
+    min_ms: u64,
+    stop: &AtomicBool,
+) {
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let target = Duration::from_millis(
-            refresh_ms
-                .load(Ordering::Relaxed)
-                .clamp(MIN_REFRESH_MS, MAX_REFRESH_MS),
-        );
+        let target = next_cycle_target(refresh_ms, min_ms);
         let elapsed = started.elapsed();
         if elapsed >= target {
             break;
@@ -734,5 +748,34 @@ mod tests {
         assert_eq!(current.io_wait, 25);
         let io_wait = io_wait_percent(previous, current).unwrap();
         assert!((io_wait - 5.555555556).abs() < 0.001);
+    }
+
+    #[test]
+    fn cycle_target_clamps_to_worker_floor() {
+        let fast = AtomicU64::new(100);
+        assert_eq!(
+            next_cycle_target(&fast, MIN_LLM_POLL_MS),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            next_cycle_target(&fast, MIN_REFRESH_MS),
+            Duration::from_millis(100)
+        );
+
+        let slow = AtomicU64::new(5000);
+        assert_eq!(
+            next_cycle_target(&slow, MIN_LLM_POLL_MS),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            next_cycle_target(&slow, MIN_REFRESH_MS),
+            Duration::from_millis(5000)
+        );
+
+        let unbounded = AtomicU64::new(60_000);
+        assert_eq!(
+            next_cycle_target(&unbounded, MIN_LLM_POLL_MS),
+            Duration::from_millis(MAX_REFRESH_MS)
+        );
     }
 }
