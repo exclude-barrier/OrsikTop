@@ -4,6 +4,19 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Standalone installer no longer executes `orsiktop` / `orsiktop update` during
+  installation. Backticks in the `dist` install success message were embedded in
+  a double-quoted shell line and expanded as command substitutions, which made
+  the installer appear to hang after "installing to ~/.local/bin".
+
+### Security
+
+- Pinned `rustls` 0.23.45 in Cargo.lock, fixing RUSTSEC-2026-0285 (medium:
+  TLS 1.3 handshake messages accepted across encryption level boundaries).
+  No manifest or API changes.
+
 ## [0.1.1] - 2026-09-14
 
 ### Added

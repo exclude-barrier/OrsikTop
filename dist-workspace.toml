@@ -13,4 +13,7 @@ checksum = "sha256"
 hosting = ["github"]
 github-attestations = true
 pr-run-mode = "plan"
-install-success-msg = "OrsikTop is installed. Run `orsiktop` to start it and `orsiktop update` to update it."
+# Backticks would be expanded as command substitutions by the shell installer
+# (the message is embedded in a double-quoted `say "..."` line), which would
+# execute `orsiktop` / `orsiktop update` during installation.
+install-success-msg = "OrsikTop is installed. Run orsiktop to start it and orsiktop update to update it."
