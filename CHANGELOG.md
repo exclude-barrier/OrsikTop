@@ -17,6 +17,10 @@ All notable changes to OrsikTop will be documented here.
 - README restructured around a quick start (install, start llama.cpp with
   metrics, run orsiktop), with a dedicated uninstalling section and
   condensed installation/PATH text.
+- SECURITY.md release integrity section now references the actual release
+  artifact names (`orsiktop-x86_64-unknown-linux-gnu.tar.xz`) and documents
+  GitHub artifact attestations with a verified `gh attestation verify`
+  command, replacing the outdated "not cryptographically signed" statement.
 
 ## [0.1.2] - 2026-09-14
 

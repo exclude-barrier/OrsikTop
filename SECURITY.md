@@ -44,7 +44,14 @@ Official release artifacts are published through the GitHub Releases page. Relea
 Example:
 
 ```bash
-sha256sum -c orsiktop-linux-x86_64.tar.gz.sha256
+sha256sum -c orsiktop-x86_64-unknown-linux-gnu.tar.xz.sha256
 ```
 
-At this time, release artifacts are checksummed but not cryptographically signed.
+Release artifacts are also covered by GitHub artifact attestations, which provide cryptographic evidence of where and how each artifact was built. Attestations are attached to the release assets and can be verified locally with:
+
+```bash
+gh attestation verify orsiktop-x86_64-unknown-linux-gnu.tar.xz \
+  --repo exclude-barrier/OrsikTop
+```
+
+At this time, release artifacts are checksummed and attested but not GPG-signed.
