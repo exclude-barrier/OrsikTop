@@ -44,8 +44,11 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     server: &str,
     initial_settings: config::AppConfig,
+    // True when `server` was resolved via local auto-discovery.
+    server_auto: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut server = server.to_string();
+    let mut server_auto = server_auto;
     let mut settings = initial_settings.sanitized();
     let mut refresh_ms = settings.refresh_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
     settings.refresh_ms = refresh_ms;
@@ -98,6 +101,7 @@ pub fn run(
                 &mut ui_state,
                 &server,
                 refresh_ms,
+                server_auto,
             )
         })?;
 
@@ -152,6 +156,7 @@ pub fn run(
                                         .store(settings.gpu_index as u64, Ordering::Relaxed);
                                     if server_changed {
                                         server = next_server.clone();
+                                        server_auto = crate::server_is_auto_discovered(&settings);
                                         snapshot.llm = LlmStats::default();
                                         ui_state.reset_llm_connection_state();
                                         let _ = server_tx.send(next_server);

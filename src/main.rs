@@ -97,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     settings = settings.sanitized();
     let server = resolve_server(&settings);
+    let server_auto = server_is_auto_discovered(&settings);
 
     enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
@@ -108,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    app::run(&mut terminal, &server, settings)
+    app::run(&mut terminal, &server, settings, server_auto)
 }
 
 fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
@@ -209,6 +210,10 @@ fn resolve_server(settings: &config::AppConfig) -> String {
         .or_else(|| settings.server.clone())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+}
+
+pub(crate) fn server_is_auto_discovered(settings: &config::AppConfig) -> bool {
+    settings.auto_discovery && discover_local_llama_server().is_some()
 }
 
 fn discover_local_llama_server() -> Option<String> {

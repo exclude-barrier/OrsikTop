@@ -824,6 +824,7 @@ impl UiState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     system: &SystemStats,
@@ -832,6 +833,7 @@ pub fn draw(
     state: &mut UiState,
     server: &str,
     refresh_ms: u64,
+    server_auto: bool,
 ) {
     let area = frame.area();
     state.clear_process_interaction();
@@ -873,7 +875,7 @@ pub fn draw(
             .split(area)
     };
 
-    draw_header(frame, rows[0], llm, state, server, refresh_ms);
+    draw_header(frame, rows[0], llm, state, server, refresh_ms, server_auto);
     draw_gpu(frame, rows[1], gpu);
     draw_llm_and_system(frame, rows[2], system, llm, state);
 
@@ -912,6 +914,7 @@ fn draw_header(
     state: &UiState,
     server: &str,
     refresh_ms: u64,
+    server_auto: bool,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -953,6 +956,9 @@ fn draw_header(
             Span::styled("LLM ENDPOINT ", Style::default().fg(WHITE)),
             Span::styled(endpoint, Style::default().fg(MUTED)),
         ]);
+        if server_auto {
+            spans.push(Span::styled(" ·auto", Style::default().fg(MUTED)));
+        }
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
@@ -1365,7 +1371,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
             llm_metric_cell(&live_tg, metric_width, tg_live_color, tg_active),
         ]),
         Line::from(vec![
-            label_span(" SERVER AVG "),
+            label_span(" AVG (LIFE) "),
             llm_metric_cell(
                 &format!("{:.1} tok/s", llm.prompt_avg_tps),
                 metric_width,
@@ -3300,7 +3306,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, st
             fit_cell(&state.process_search_query, 30)
         )
     } else {
-        " [esc] quit  [h] help  [q] settings  [/] search ".to_string()
+        " [esc] quit  [h] help  [q] settings  [/] search  [dbl] pin ".to_string()
     };
     let help_width = help.chars().count() as u16;
     frame.render_widget(
