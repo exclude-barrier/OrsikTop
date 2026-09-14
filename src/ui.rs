@@ -848,7 +848,8 @@ pub fn draw(
     let llm_height = if llm.connected { 12 } else { 5 };
     let system_height = system_panel_height(system);
     let middle_height = llm_height.max(system_height);
-    let history_required = 3 + 7 + middle_height + 5 + 3;
+    let gpu_height = if enc_dec_idle(gpu) { 6 } else { 7 };
+    let history_required = 3 + gpu_height + middle_height + 5 + 3;
     let show_history = area.height >= history_required;
 
     let rows = if show_history {
@@ -856,7 +857,7 @@ pub fn draw(
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Length(7),
+                Constraint::Length(gpu_height),
                 Constraint::Length(middle_height),
                 Constraint::Min(5),
                 Constraint::Length(3),
@@ -867,7 +868,7 @@ pub fn draw(
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Length(7),
+                Constraint::Length(gpu_height),
                 Constraint::Length(middle_height),
                 Constraint::Min(0),
                 Constraint::Length(3),
@@ -983,7 +984,17 @@ fn draw_header(
     }
 }
 
+/// Encoder/decoder utilization is idle when both are missing or below 1%.
+/// On a pure LLM card this is always the case, so the ENC/DEC row is
+/// hidden and its LIMIT pair moves to the I/O row.
+fn enc_dec_idle(gpu: &GpuStats) -> bool {
+    let enc_idle = gpu.encoder_utilization.map(|v| v < 1.0).unwrap_or(true);
+    let dec_idle = gpu.decoder_utilization.map(|v| v < 1.0).unwrap_or(true);
+    enc_idle && dec_idle
+}
+
 fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
+    let idle = enc_dec_idle(gpu);
     let title = if gpu.available {
         format!(" GPU{} · {} ", gpu.index, gpu.name)
     } else {
@@ -1028,6 +1039,37 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     let vclk_text = optional_number(gpu.memory_clock_mhz, 0, " MHz");
     let power_pct_value = power_pct.unwrap_or(0.0);
     let power_tint = power_pct.map(power_color).unwrap_or(MUTED);
+    let io_suffix = || {
+        let mut suffix = vec![
+            fixed_data_pair(
+                "MEMCTRL",
+                format!("{:.0}%", gpu.memory_utilization),
+                CYAN,
+                17,
+            ),
+            fixed_data_pair(
+                "PCIe RX",
+                optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
+                CYAN,
+                22,
+            ),
+            fixed_data_pair(
+                "TX",
+                optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
+                CYAN,
+                18,
+            ),
+        ];
+        if idle {
+            suffix.push(fixed_data_pair(
+                "LIMIT",
+                gpu.limit_reason.clone(),
+                limit_reason_color(&gpu.limit_reason),
+                20,
+            ));
+        }
+        suffix
+    };
 
     let mut lines = vec![
         meter_line(
@@ -1090,54 +1132,24 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
                 bar_width,
                 CYAN,
                 format!("{:>3.0}%", pct),
-                vec![
-                    fixed_data_pair(
-                        "MEMCTRL",
-                        format!("{:.0}%", gpu.memory_utilization),
-                        CYAN,
-                        17,
-                    ),
-                    fixed_data_pair(
-                        "PCIe RX",
-                        optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
-                        CYAN,
-                        22,
-                    ),
-                    fixed_data_pair(
-                        "TX",
-                        optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
-                        CYAN,
-                        18,
-                    ),
-                ],
+                io_suffix(),
             ),
-            None => Line::from(vec![
-                label_span(" I/O    "),
-                Span::styled(
-                    format!("{:<width$}", " \u{2014}", width = bar_width + 11),
-                    Style::default().fg(MUTED),
-                ),
-                fixed_data_pair(
-                    "MEMCTRL",
-                    format!("{:.0}%", gpu.memory_utilization),
-                    CYAN,
-                    17,
-                ),
-                fixed_data_pair(
-                    "PCIe RX",
-                    optional_number(gpu.pcie_rx_mb_s, 1, " MB/s"),
-                    CYAN,
-                    22,
-                ),
-                fixed_data_pair(
-                    "TX",
-                    optional_number(gpu.pcie_tx_mb_s, 1, " MB/s"),
-                    CYAN,
-                    18,
-                ),
-            ]),
+            None => {
+                let mut spans = vec![
+                    label_span(" I/O    "),
+                    Span::styled(
+                        format!("{:<width$}", " \u{2014}", width = bar_width + 11),
+                        Style::default().fg(MUTED),
+                    ),
+                ];
+                spans.extend(io_suffix());
+                Line::from(spans)
+            }
         },
-        Line::from(vec![
+    ];
+
+    if !idle {
+        lines.push(Line::from(vec![
             label_span("        "),
             Span::raw(" ".repeat(bar_width + 7)),
             fixed_data_pair(
@@ -1158,8 +1170,8 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
                 limit_reason_color(&gpu.limit_reason),
                 20,
             ),
-        ]),
-    ];
+        ]));
+    }
 
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1356,7 +1368,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
             label_span("UPTIME "),
             value_span(&llm_uptime_text(state), MUTED),
             llm_sep(),
-            label_span("LAST "),
+            label_span("POLL "),
             value_span(&llm_last_sample_text(state, llm), MUTED),
         ]),
         Line::from(state_line),
@@ -3398,10 +3410,41 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Compact notice shown when the terminal is too small for the settings
+/// popup; nothing is rendered when the area cannot fit the notice itself.
+fn draw_settings_too_small(frame: &mut Frame, area: Rect) {
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let width = 48.min(area.width);
+    let height = 3.min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" SETTINGS ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Terminal too small for settings (need 54x15)",
+            Style::default().fg(MUTED),
+        ))),
+        inner,
+    );
+}
+
 fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let width = area.width.saturating_sub(6).min(74);
     let height = 18.min(area.height.saturating_sub(4));
     if width < 54 || height < 15 {
+        draw_settings_too_small(frame, area);
         return;
     }
 
@@ -4877,5 +4920,20 @@ mod tests {
             ]),
         };
         assert_eq!(row(&with_link).width(), row(&without_link).width());
+    }
+
+    #[test]
+    fn enc_dec_idle_detects_missing_or_sub_percent_utilization() {
+        let gpu = |enc: Option<f64>, dec: Option<f64>| GpuStats {
+            encoder_utilization: enc,
+            decoder_utilization: dec,
+            ..GpuStats::default()
+        };
+
+        assert!(enc_dec_idle(&gpu(None, None)));
+        assert!(enc_dec_idle(&gpu(Some(0.0), Some(0.0))));
+        assert!(enc_dec_idle(&gpu(Some(0.5), None)));
+        assert!(!enc_dec_idle(&gpu(Some(1.0), None)));
+        assert!(!enc_dec_idle(&gpu(None, Some(5.0))));
     }
 }
