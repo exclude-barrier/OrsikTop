@@ -87,7 +87,56 @@ Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes
 
 ## Install
 
-From a local checkout:
+### Recommended: standalone Linux installer
+
+The recommended installation uses a prebuilt `x86_64` Linux release, so Rust is not required:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/exclude-barrier/OrsikTop/releases/latest/download/orsiktop-installer.sh | sh
+```
+
+The installer is generated with `dist`, installs `orsiktop` and its updater into `~/.local/bin`, and attempts to add that directory to your `PATH` when needed.
+
+If the installer updates your shell profile, restart the terminal or load the generated environment file for the current shell:
+
+```bash
+source "$HOME/.local/bin/env"
+```
+
+Then start OrsikTop:
+
+```bash
+orsiktop
+```
+
+Release artifacts include SHA-256 checksums and are published with GitHub artifact attestations.
+
+### Update
+
+For a standalone installation made with the installer:
+
+```bash
+orsiktop update
+```
+
+`orsiktop update` delegates to the `orsiktop-update` program installed alongside OrsikTop and updates from GitHub Releases. OrsikTop does not perform automatic background update checks.
+
+If OrsikTop was installed with Cargo, update it with Cargo instead:
+
+```bash
+cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force
+```
+
+### Cargo / source install
+
+Cargo remains available as a developer or fallback installation method:
+
+```bash
+cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
+```
+
+Or from a local checkout:
 
 ```bash
 git clone https://github.com/exclude-barrier/OrsikTop.git
@@ -95,17 +144,7 @@ cd OrsikTop
 cargo install --path . --locked --force
 ```
 
-Or directly from GitHub:
-
-```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
-```
-
-Cargo normally installs the binary into `~/.cargo/bin`:
-
-```bash
-orsiktop
-```
+Cargo normally installs the binary into `~/.cargo/bin`. If `orsiktop` is not found after a Cargo install, make sure that directory is in your `PATH`.
 
 ## Quick start
 
@@ -228,7 +267,7 @@ OrsikTop loads NVIDIA NVML dynamically through `nvml-wrapper`. A normal NVIDIA L
 
 ```text
 src/
-├── main.rs    terminal setup, CLI and llama.cpp discovery
+├── main.rs    terminal setup, CLI, updater entry point and llama.cpp discovery
 ├── config.rs  persistent runtime settings
 ├── app.rs     event loop and telemetry workers
 ├── llama.rs   llama.cpp /metrics, /slots and /props
