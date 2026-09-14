@@ -39,6 +39,7 @@ jobs:
         uses: actions-rust-lang/audit@v1
         with:
           createIssues: false
+          denyWarnings: true
 
       - name: CLI smoke test
         run: cargo run --locked -- --help
