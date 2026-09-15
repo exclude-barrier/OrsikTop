@@ -5,8 +5,8 @@
 //! Re-exports the per-subsystem telemetry structs so consumers (and the UI)
 //! import from this module only.
 
-pub use crate::gpu::GpuStats;
 pub use crate::llama::LlmStats;
+pub use crate::providers::GpuStats;
 
 /// Minimum UI/worker refresh interval.
 pub const MIN_REFRESH_MS: u64 = 100;
@@ -35,8 +35,7 @@ pub struct ProcessStats {
 /// stable across reboots and enumeration changes). A vendor UUID (e.g.
 /// NVIDIA's `GPU-...`) is kept as an optional secondary selector; the
 /// human-readable name is never part of the identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DeviceId {
     /// PCI bus:device.function (e.g. `0000:01:00.0`), when known.
     pub pci_bdf: Option<String>,
@@ -44,7 +43,6 @@ pub struct DeviceId {
     pub uuid: Option<String>,
 }
 
-#[allow(dead_code)]
 impl DeviceId {
     pub fn new(pci_bdf: Option<String>, uuid: Option<String>) -> Self {
         Self { pci_bdf, uuid }

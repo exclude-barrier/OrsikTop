@@ -24,7 +24,7 @@ use crate::{
         DashboardSnapshot, FastSnapshot, GpuSelector, ProcessStats, SystemStats, MAX_REFRESH_MS,
         MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
-    gpu::GpuMonitor,
+    gpu::new_gpu_provider,
     llama::{LlamaMonitor, LlmStats},
     ui::{self, UiState},
 };
@@ -299,7 +299,7 @@ fn spawn_fast_worker(
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mut gpu = GpuMonitor::new(current_selector.clone());
+        let mut gpu = new_gpu_provider(current_selector.clone());
         let mut system = System::new();
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
@@ -316,7 +316,7 @@ fn spawn_fast_worker(
                 .clone();
             if requested_selector != current_selector {
                 current_selector = requested_selector;
-                gpu = GpuMonitor::new(current_selector.clone());
+                gpu = new_gpu_provider(current_selector.clone());
             }
             let process_interval =
                 Duration::from_millis(process_refresh_ms.load(Ordering::Relaxed).clamp(
