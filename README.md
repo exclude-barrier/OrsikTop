@@ -347,7 +347,7 @@ or, when `XDG_CONFIG_HOME` is not set:
 ~/.config/orsiktop/config
 ```
 
-Saved settings include the LLM endpoint, GPU index, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
+Saved settings include the LLM endpoint, GPU selection, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
 
 ## CLI
 
@@ -377,14 +377,15 @@ Available one-off overrides for a single run:
 | --- | --- | --- |
 | `--server` | `ORSIKTOP_SERVER` | llama.cpp endpoint; disables auto discovery for that run |
 | `--interval-ms`, `-i` | `ORSIKTOP_INTERVAL_MS` | main telemetry refresh interval |
-| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | NVIDIA GPU index |
+| `--gpu` | `ORSIKTOP_GPU` | NVIDIA GPU by PCI BDF, vendor UUID or legacy index |
+| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy NVIDIA GPU index (prefer `--gpu`) |
 
 Examples:
 
 ```bash
 orsiktop --server http://192.168.1.20:8081
 orsiktop --interval-ms 500
-orsiktop --gpu-index 1
+orsiktop --gpu 0000:41:00.0
 ```
 
 ## Troubleshooting

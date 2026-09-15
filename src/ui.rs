@@ -14,17 +14,11 @@ use ratatui::{
 use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
-    gpu::{self, GpuStats},
-    llama::LlmStats,
+    domain::{
+        GpuSelector, GpuStats, LlmStats, ProcessStats, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+    },
+    gpu,
 };
-
-pub const MIN_REFRESH_MS: u64 = 100;
-pub const MAX_REFRESH_MS: u64 = 10_000;
-pub const REFRESH_STEP_MS: u64 = 100;
-/// Floor for the LLM worker's /metrics poll. LLM token counters do not
-/// change meaningfully faster than this, so fast UI refresh rates should not
-/// multiply the HTTP polling overhead.
-pub const MIN_LLM_POLL_MS: u64 = 250;
 
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_MAX_SAMPLES: usize = 720;
@@ -44,34 +38,6 @@ const RED: Color = Color::Rgb(235, 75, 75);
 const CYAN: Color = Color::Rgb(70, 195, 220);
 const WHITE: Color = Color::Rgb(225, 225, 225);
 const PROCESS_SELECTED_BG: Color = Color::Rgb(24, 54, 24);
-
-#[derive(Clone, Debug, Default)]
-pub struct ProcessStats {
-    pub pid: u32,
-    pub program: String,
-    pub command: String,
-    pub cpu_pct: f64,
-    pub memory_bytes: u64,
-    pub threads: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SystemStats {
-    pub cpu_usage: f64,
-    pub per_cpu_usage: Vec<f64>,
-    pub cpu_topology: CpuTopology,
-    pub cpu_frequency_mhz: Option<f64>,
-    pub cpu_temperature_c: Option<f64>,
-    pub io_wait_pct: Option<f64>,
-    pub load_one: f64,
-    pub load_five: f64,
-    pub load_fifteen: f64,
-    pub memory_used_bytes: u64,
-    pub memory_total_bytes: u64,
-    pub swap_used_bytes: u64,
-    pub swap_total_bytes: u64,
-    pub processes: Vec<ProcessStats>,
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RefreshControls {
@@ -565,7 +531,7 @@ impl UiState {
         self.settings_field = SettingsField::Host;
         self.settings_host = host;
         self.settings_port = port.to_string();
-        self.settings_gpu = settings.gpu_index.to_string();
+        self.settings_gpu = settings.gpu_selector.as_string();
         self.settings_refresh_ms = settings.refresh_ms.to_string();
         self.settings_process_refresh_ms = settings.process_refresh_ms.to_string();
         self.settings_offline_grace_ms = settings.offline_grace_ms.to_string();
@@ -645,7 +611,9 @@ impl UiState {
             SettingsField::Port if ch.is_ascii_digit() && self.settings_port.len() < 5 => {
                 self.settings_port.push(ch);
             }
-            SettingsField::Gpu if ch.is_ascii_digit() && self.settings_gpu.len() < 3 => {
+            SettingsField::Gpu
+                if !ch.is_control() && !ch.is_whitespace() && self.settings_gpu.len() < 40 =>
+            {
                 self.settings_gpu.push(ch);
             }
             SettingsField::Refresh if ch.is_ascii_digit() && self.settings_refresh_ms.len() < 6 => {
@@ -676,7 +644,7 @@ impl UiState {
 
     pub fn settings_config(&self) -> Result<AppConfig, String> {
         let endpoint = build_endpoint(&self.settings_host, &self.settings_port)?;
-        let gpu_index = parse_setting_u64(&self.settings_gpu, "GPU", 0, 255)? as u32;
+        let gpu_selector = GpuSelector::parse(&self.settings_gpu);
         let refresh_ms = parse_setting_u64(
             &self.settings_refresh_ms,
             "Refresh",
@@ -698,7 +666,7 @@ impl UiState {
 
         Ok(AppConfig {
             server: Some(endpoint),
-            gpu_index,
+            gpu_selector,
             refresh_ms,
             process_refresh_ms,
             offline_grace_ms,
@@ -4690,7 +4658,7 @@ mod tests {
         let mut state = UiState::default();
         let settings = AppConfig {
             server: Some("http://127.0.0.1:8081".to_string()),
-            gpu_index: 1,
+            gpu_selector: GpuSelector::PciBusId("0000:41:00.0".to_string()),
             refresh_ms: 200,
             process_refresh_ms: 1500,
             offline_grace_ms: 3000,

@@ -6,13 +6,26 @@ All notable changes to OrsikTop will be documented here.
 
 ### Added
 
+- Vendor-neutral GPU discovery from Linux DRM/sysfs: PCI BDF, vendor/device
+  and class IDs, bound driver, render node and connected outputs, independent of
+  enumeration order.
+- Stable GPU selection by PCI BDF or vendor UUID through the new `--gpu`
+  option (env `ORSIKTOP_GPU`) and the in-app settings; `--gpu-index` is kept as
+  a legacy alias.
+
+### Changed
+
+- GPU selection no longer depends on a fragile ordinal NVML index. The config
+  stores a stable selector (`gpu=`) and migrates legacy `gpu_index=` values
+  automatically (a `gpu=` key always wins).
+- Telemetry is split into normalized domain models behind a small filesystem
+  abstraction so hardware parsing is fixture-testable without physical GPUs.
+
 - `orsiktop uninstall` removes a standalone installation
   (`~/.local/bin/orsiktop` and `~/.local/bin/orsiktop-update`) and prints
   every file it removed. `orsiktop uninstall --purge` additionally removes
   the config directory. Cargo installations are detected and answered with
   `cargo uninstall orsiktop` instead of being touched.
-
-### Changed
 
 - README restructured around a quick start (install, start llama.cpp with
   metrics, run orsiktop), with a dedicated uninstalling section and

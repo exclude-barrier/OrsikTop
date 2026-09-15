@@ -4,7 +4,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
-        Arc,
+        Arc, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -14,31 +14,22 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEve
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use std::path::PathBuf;
+
+use crate::system::{RealSys, Sys};
 use crate::{
     config,
     cpu::{detect_cpu_topology, CpuTopology},
-    gpu::{GpuMonitor, GpuStats},
-    llama::{LlamaMonitor, LlmStats},
-    ui::{
-        self, ProcessStats, SystemStats, UiState, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
-        REFRESH_STEP_MS,
+    domain::{
+        DashboardSnapshot, FastSnapshot, GpuSelector, ProcessStats, SystemStats, MAX_REFRESH_MS,
+        MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
+    gpu::GpuMonitor,
+    llama::{LlamaMonitor, LlmStats},
+    ui::{self, UiState},
 };
 
 const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-
-#[derive(Clone, Debug, Default)]
-struct DashboardSnapshot {
-    llm: LlmStats,
-    gpu: GpuStats,
-    system: SystemStats,
-}
-
-#[derive(Clone, Debug, Default)]
-struct FastSnapshot {
-    gpu: GpuStats,
-    system: SystemStats,
-}
 
 pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -55,14 +46,14 @@ pub fn run(
     let refresh_shared = Arc::new(AtomicU64::new(refresh_ms));
     let process_refresh_shared = Arc::new(AtomicU64::new(settings.process_refresh_ms));
     let offline_grace_shared = Arc::new(AtomicU64::new(settings.offline_grace_ms));
-    let gpu_index_shared = Arc::new(AtomicU64::new(settings.gpu_index as u64));
+    let gpu_selector_shared = Arc::new(RwLock::new(settings.gpu_selector.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let (fast_tx, fast_rx) = mpsc::sync_channel::<FastSnapshot>(2);
     let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmStats>(2);
     let (server_tx, server_rx) = mpsc::channel::<String>();
 
     spawn_fast_worker(
-        Arc::clone(&gpu_index_shared),
+        Arc::clone(&gpu_selector_shared),
         Arc::clone(&process_refresh_shared),
         Arc::clone(&refresh_shared),
         Arc::clone(&stop),
@@ -152,8 +143,10 @@ pub fn run(
                                         .store(settings.process_refresh_ms, Ordering::Relaxed);
                                     offline_grace_shared
                                         .store(settings.offline_grace_ms, Ordering::Relaxed);
-                                    gpu_index_shared
-                                        .store(settings.gpu_index as u64, Ordering::Relaxed);
+                                    *gpu_selector_shared
+                                        .write()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        settings.gpu_selector.clone();
                                     if server_changed {
                                         server = next_server.clone();
                                         server_auto = crate::server_is_auto_discovered(&settings);
@@ -295,15 +288,18 @@ fn change_refresh(refresh_ms: &mut u64, increase: bool, shared: &AtomicU64) {
 }
 
 fn spawn_fast_worker(
-    gpu_index: Arc<AtomicU64>,
+    gpu_selector: Arc<RwLock<GpuSelector>>,
     process_refresh_ms: Arc<AtomicU64>,
     refresh_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<FastSnapshot>,
 ) {
     thread::spawn(move || {
-        let mut current_gpu_index = gpu_index.load(Ordering::Relaxed) as u32;
-        let mut gpu = GpuMonitor::new(current_gpu_index);
+        let mut current_selector = gpu_selector
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut gpu = GpuMonitor::new(current_selector.clone());
         let mut system = System::new();
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
@@ -314,10 +310,13 @@ fn spawn_fast_worker(
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
-            let requested_gpu_index = gpu_index.load(Ordering::Relaxed) as u32;
-            if requested_gpu_index != current_gpu_index {
-                current_gpu_index = requested_gpu_index;
-                gpu = GpuMonitor::new(current_gpu_index);
+            let requested_selector = gpu_selector
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if requested_selector != current_selector {
+                current_selector = requested_selector;
+                gpu = GpuMonitor::new(current_selector.clone());
             }
             let process_interval =
                 Duration::from_millis(process_refresh_ms.load(Ordering::Relaxed).clamp(
@@ -370,8 +369,8 @@ fn spawn_fast_worker(
                     cpu_usage: system.global_cpu_usage() as f64,
                     per_cpu_usage,
                     cpu_topology: topology,
-                    cpu_frequency_mhz: read_cpu_frequency_mhz(),
-                    cpu_temperature_c: read_cpu_temperature_c(),
+                    cpu_frequency_mhz: read_cpu_frequency_mhz(&RealSys),
+                    cpu_temperature_c: read_cpu_temperature_c(&RealSys),
                     io_wait_pct,
                     load_one,
                     load_five,
@@ -481,8 +480,8 @@ fn read_load_average() -> Option<(f64, f64, f64)> {
     ))
 }
 
-fn read_cpu_frequency_mhz() -> Option<f64> {
-    let text = fs::read_to_string("/proc/cpuinfo").ok()?;
+fn read_cpu_frequency_mhz(sys: &dyn Sys) -> Option<f64> {
+    let text = sys.read_to_string(&PathBuf::from("/proc/cpuinfo"))?;
     let mut total = 0.0;
     let mut count = 0u64;
 
@@ -505,14 +504,20 @@ fn read_cpu_frequency_mhz() -> Option<f64> {
     (count > 0).then_some(total / count as f64)
 }
 
-fn read_cpu_temperature_c() -> Option<f64> {
+fn read_cpu_temperature_c(sys: &dyn Sys) -> Option<f64> {
     let mut preferred = Vec::new();
     let mut fallback = Vec::new();
-    let hwmons = fs::read_dir("/sys/class/hwmon").ok()?;
+    let hwmons = sys.read_dir(&PathBuf::from("/sys/class/hwmon"))?;
 
-    for entry in hwmons.flatten() {
-        let path = entry.path();
-        let name = fs::read_to_string(path.join("name"))
+    for entry in hwmons {
+        if !entry.name.starts_with("hwmon") || entry.name == "hwmon" {
+            continue;
+        }
+        let name = sys
+            .read_to_string(&PathBuf::from(format!(
+                "/sys/class/hwmon/{}/name",
+                entry.name
+            )))
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
@@ -525,17 +530,21 @@ fn read_cpu_temperature_c() -> Option<f64> {
             continue;
         }
 
-        let Ok(sensors) = fs::read_dir(&path) else {
+        let Some(sensors) =
+            sys.read_dir(&PathBuf::from(format!("/sys/class/hwmon/{}", entry.name)))
+        else {
             continue;
         };
-        for sensor in sensors.flatten() {
-            let filename = sensor.file_name();
-            let filename = filename.to_string_lossy();
+        for sensor in sensors {
+            let filename = sensor.name;
             if !filename.starts_with("temp") || !filename.ends_with("_input") {
                 continue;
             }
 
-            let Ok(raw) = fs::read_to_string(sensor.path()) else {
+            let Some(raw) = sys.read_to_string(&PathBuf::from(format!(
+                "/sys/class/hwmon/{}/{}",
+                entry.name, filename
+            ))) else {
                 continue;
             };
             let Ok(millidegrees) = raw.trim().parse::<f64>() else {
@@ -547,7 +556,11 @@ fn read_cpu_temperature_c() -> Option<f64> {
             }
 
             let stem = filename.trim_end_matches("_input");
-            let label = fs::read_to_string(path.join(format!("{stem}_label")))
+            let label = sys
+                .read_to_string(&PathBuf::from(format!(
+                    "/sys/class/hwmon/{}/{}_label",
+                    entry.name, stem
+                )))
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if label.contains("package") || label.contains("tctl") || label.contains("cpu") {
@@ -782,5 +795,50 @@ mod tests {
             next_cycle_target(&unbounded, MIN_LLM_POLL_MS),
             Duration::from_millis(MAX_REFRESH_MS)
         );
+    }
+
+    #[cfg(test)]
+    mod hwmon_fixture_tests {
+        use super::*;
+        use crate::system::FixtureSys;
+
+        /// coretemp with a package sensor (preferred) and a die sensor
+        /// (fallback), plus a GPU hwmon that must be ignored.
+        fn hwmon_fixture() -> FixtureSys {
+            let mut fixture = FixtureSys::default();
+            fixture
+                .dir_entry("/sys/class/hwmon", "hwmon0", false, true)
+                .dir_entry("/sys/class/hwmon", "hwmon1", false, true)
+                .dir_entry("/sys/class/hwmon", "hwmon2", false, true)
+                .file("/sys/class/hwmon/hwmon0/name", "coretemp\n")
+                .file("/sys/class/hwmon/hwmon0/temp1_input", "63000\n")
+                .file("/sys/class/hwmon/hwmon0/temp1_label", "Package id 0\n")
+                .file("/sys/class/hwmon/hwmon0/temp2_input", "55000\n")
+                .file("/sys/class/hwmon/hwmon0/temp2_label", "Core 0\n")
+                .file("/sys/class/hwmon/hwmon1/name", "nvme\n")
+                .file("/sys/class/hwmon/hwmon1/temp1_input", "49000\n")
+                .dir_entry("/sys/class/hwmon/hwmon0", "temp1_input", false, false)
+                .dir_entry("/sys/class/hwmon/hwmon0", "temp2_input", false, false)
+                .dir_entry("/sys/class/hwmon/hwmon1", "temp1_input", false, false);
+            fixture
+        }
+
+        #[test]
+        fn hwmon_temperature_prefers_package_sensor_and_skips_non_cpu() {
+            let fixture = hwmon_fixture();
+            let temperature = read_cpu_temperature_c(&fixture);
+            assert_eq!(temperature, Some(63.0));
+        }
+
+        #[test]
+        fn hwmon_temperature_ignores_impossible_values() {
+            let mut fixture = FixtureSys::default();
+            fixture
+                .dir_entry("/sys/class/hwmon", "hwmon0", false, true)
+                .file("/sys/class/hwmon/hwmon0/temp1_input", "-100000\n")
+                .dir_entry("/sys/class/hwmon/hwmon0", "temp1_input", false, false);
+
+            assert_eq!(read_cpu_temperature_c(&fixture), None);
+        }
     }
 }
