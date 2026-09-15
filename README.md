@@ -122,7 +122,7 @@ OrsikTop currently focuses on a deliberately narrow setup:
 - local or manually configured llama.cpp endpoints
 - terminal-first, low-overhead monitoring
 
-Broader GPU vendors, operating systems and inference backends are not the current focus.
+Broader GPU vendors, operating systems and inference backends are not the current focus. The GPU layer already sits behind a vendor-neutral provider interface (NVIDIA NVML is the first backend).
 
 ## Installation
 
@@ -146,7 +146,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.1.3 x86_64-unknown-linux-gnu
+downloading orsiktop 0.1.4 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -174,7 +174,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.1.3
+orsiktop 0.1.4
 ```
 
 You can then start OrsikTop with `orsiktop`.
@@ -463,13 +463,17 @@ cargo build --release --locked
 
 ```text
 src/
-├── main.rs    terminal setup, CLI, updater entry point and llama.cpp discovery
-├── config.rs  persistent runtime settings
-├── app.rs     event loop and telemetry workers
-├── llama.rs   llama.cpp /metrics, /slots and /props
-├── gpu.rs     NVIDIA NVML telemetry
-├── cpu.rs     CPU topology / Linux CPU helpers
-└── ui.rs      ratatui rendering, controls and histories
+├── main.rs      terminal setup, CLI and updater entry point
+├── config.rs    persistent runtime settings
+├── domain.rs    normalized, vendor-neutral telemetry models
+├── app.rs       event loop and telemetry workers
+├── llama.rs     llama.cpp /metrics, /slots and /props
+├── discovery.rs vendor-neutral GPU discovery (Linux DRM/sysfs)
+├── providers/   GpuProvider interface and vendor backends
+│   └── nvidia.rs  NVIDIA NVML backend
+├── gpu.rs       GPU provider factory and PCIe link math
+├── cpu.rs       CPU topology / Linux CPU helpers
+└── ui.rs        ratatui rendering, controls and histories
 ```
 
 GPU/system sampling and llama.cpp HTTP polling run independently. A slow `/metrics` or `/slots` response therefore does not block keyboard/mouse input or fast GPU updates.
@@ -488,7 +492,7 @@ Features are added when they improve monitoring rather than simply making the TU
 
 ## Status
 
-OrsikTop is still early software. The current implementation is intentionally focused on **llama.cpp + NVIDIA + Linux** before adding broader backend or platform support.
+OrsikTop is still early software. The current implementation is intentionally focused on **llama.cpp + NVIDIA + Linux** before adding broader backend or platform support. The GPU layer already runs behind a vendor-neutral provider interface, so AMD and Intel backends can be added without changing the UI or the sampling loop.
 
 Bug reports and focused feature requests are welcome through GitHub Issues.
 

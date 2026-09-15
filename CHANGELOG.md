@@ -4,6 +4,19 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-15
+
+### Changed
+
+- GPU telemetry now runs behind a vendor-neutral `GpuProvider` interface
+  (`src/providers/`). The NVIDIA NVML backend is the first implementation;
+  application code and the UI no longer reference NVML or any vendor API
+  directly, which is the seam for AMD and Intel backends.
+- NVML device enumeration (PCI BDF / UUID per device) is cached when the
+  provider is created instead of re-enumerated on every sample.
+- Each GPU sample now carries the stable device identity (PCI BDF + vendor
+  UUID) used for selection; rendering it in the dashboard is a follow-up.
+
 ## [0.1.3] - 2026-09-15
 
 ### Added
