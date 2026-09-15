@@ -1,6 +1,8 @@
 /target
 .DS_Store
 *.log
+# graphify knowledge-graph artifacts (rebuilt locally via post-commit hook)
+graphify-out/
 # OMP runtime artifacts (keep .omp/rules/ tracked)
 .omp/run/
 .omp/logs/
