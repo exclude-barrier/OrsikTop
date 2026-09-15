@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-15
+
 ### Added
 
 - Vendor-neutral GPU discovery from Linux DRM/sysfs: PCI BDF, vendor/device
