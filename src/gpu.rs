@@ -4,6 +4,8 @@ use nvml_wrapper::{
     Nvml,
 };
 
+use crate::domain::GpuSelector;
+
 #[derive(Clone, Debug, Default)]
 pub struct GpuStats {
     pub available: bool,
@@ -33,40 +35,65 @@ pub struct GpuStats {
 pub struct GpuMonitor {
     nvml: Option<Nvml>,
     init_error: String,
-    gpu_index: u32,
+    selector: GpuSelector,
 }
 
 impl GpuMonitor {
-    pub fn new(gpu_index: u32) -> Self {
+    pub fn new(selector: GpuSelector) -> Self {
         match Nvml::init() {
             Ok(nvml) => Self {
                 nvml: Some(nvml),
                 init_error: String::new(),
-                gpu_index,
+                selector,
             },
             Err(err) => Self {
                 nvml: None,
                 init_error: format!("NVML unavailable: {err}"),
-                gpu_index,
+                selector,
             },
         }
+    }
+
+    /// NVML index for the selected device, or `None` when NVML has no
+    /// devices or the selector matches none of them.
+    fn resolve_index(&self) -> Option<u32> {
+        let nvml = self.nvml.as_ref()?;
+        let count = nvml.device_count().ok()?;
+        let mut devices = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            if let Ok(device) = nvml.device_by_index(index) {
+                let uuid = device.uuid().ok();
+                let bus_id = device.pci_info().ok().map(|pci| pci.bus_id);
+                devices.push((index, uuid, bus_id));
+            }
+        }
+        self.selector.resolve(&devices)
     }
 
     pub fn sample(&self) -> GpuStats {
         let Some(nvml) = &self.nvml else {
             return GpuStats {
-                index: self.gpu_index,
                 error: self.init_error.clone(),
                 ..Default::default()
             };
         };
 
-        let device = match nvml.device_by_index(self.gpu_index) {
+        let index = match self.resolve_index() {
+            Some(index) => index,
+            None => {
+                return GpuStats {
+                    error: "no NVIDIA GPU matches the selection".to_string(),
+                    ..Default::default()
+                }
+            }
+        };
+
+        let device = match nvml.device_by_index(index) {
             Ok(device) => device,
             Err(err) => {
                 return GpuStats {
-                    index: self.gpu_index,
-                    error: format!("cannot access NVIDIA GPU {}: {err}", self.gpu_index),
+                    index,
+                    error: format!("cannot access NVIDIA GPU {index}: {err}"),
                     ..Default::default()
                 }
             }
@@ -79,7 +106,7 @@ impl GpuMonitor {
 
         let mut stats = GpuStats {
             available: true,
-            index: self.gpu_index,
+            index,
             name: device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string()),
             utilization: utilization.as_ref().map(|v| v.gpu as f64).unwrap_or(0.0),
             memory_utilization: utilization.as_ref().map(|v| v.memory as f64).unwrap_or(0.0),
@@ -136,7 +163,7 @@ impl GpuMonitor {
 
 impl Default for GpuMonitor {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(GpuSelector::Auto)
     }
 }
 

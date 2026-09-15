@@ -1,4 +1,6 @@
-use std::{collections::HashSet, fs};
+use std::{collections::HashSet, path::PathBuf};
+
+use crate::system::{RealSys, Sys};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum CpuVendor {
@@ -73,18 +75,24 @@ impl CpuTopology {
 }
 
 pub fn detect_cpu_topology(logical_cpus: usize) -> CpuTopology {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    detect_topology(logical_cpus, &RealSys)
+}
+
+pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
+    let cpuinfo = sys
+        .read_to_string(&PathBuf::from("/proc/cpuinfo"))
+        .unwrap_or_default();
     let (vendor, model) = parse_cpu_identity(&cpuinfo);
-    let core_groups = read_core_groups(logical_cpus);
+    let core_groups = read_core_groups(logical_cpus, sys);
     let physical_cores = count_unique_groups(&core_groups);
 
-    let mut core_kinds = detect_kernel_core_groups(logical_cpus);
+    let mut core_kinds = detect_kernel_core_groups(logical_cpus, sys);
 
     // cpu_capacity is architecture-neutral Linux scheduler information. Prefer it
     // over model-name tables so future heterogeneous CPUs can work without an
     // OrsikTop update when the kernel exposes distinct capacities.
     if !has_both_core_kinds(&core_kinds) {
-        if let Some(capacity_kinds) = detect_capacity_classes(logical_cpus) {
+        if let Some(capacity_kinds) = detect_capacity_classes(logical_cpus, sys) {
             core_kinds = capacity_kinds;
         }
     }
@@ -93,7 +101,7 @@ pub fn detect_cpu_topology(logical_cpus: usize) -> CpuTopology {
     // SMT topology is a conservative fallback: P-cores have more sibling
     // threads than E-cores on the Intel generations this fallback targets.
     if !has_both_core_kinds(&core_kinds) && vendor == CpuVendor::Intel {
-        if let Some(topology_kinds) = detect_smt_classes(logical_cpus) {
+        if let Some(topology_kinds) = detect_smt_classes(logical_cpus, sys) {
             core_kinds = topology_kinds;
         }
     }
@@ -161,16 +169,16 @@ fn clean_model_name(value: &str) -> String {
         .join(" ")
 }
 
-fn detect_kernel_core_groups(logical_cpus: usize) -> Vec<CpuCoreKind> {
+fn detect_kernel_core_groups<S: Sys>(logical_cpus: usize, sys: &S) -> Vec<CpuCoreKind> {
     let mut kinds = vec![CpuCoreKind::Unknown; logical_cpus];
 
-    if let Some(cpus) = read_cpu_list_file("/sys/devices/cpu_core/cpus") {
+    if let Some(cpus) = read_cpu_list_file(sys, "/sys/devices/cpu_core/cpus") {
         apply_kind(&mut kinds, &cpus, CpuCoreKind::Performance);
     }
-    if let Some(cpus) = read_cpu_list_file("/sys/devices/cpu_atom/cpus") {
+    if let Some(cpus) = read_cpu_list_file(sys, "/sys/devices/cpu_atom/cpus") {
         apply_kind(&mut kinds, &cpus, CpuCoreKind::Efficiency);
     }
-    if let Some(cpus) = read_cpu_list_file("/sys/devices/cpu_lowpower/cpus") {
+    if let Some(cpus) = read_cpu_list_file(sys, "/sys/devices/cpu_lowpower/cpus") {
         apply_kind(&mut kinds, &cpus, CpuCoreKind::Efficiency);
     }
 
@@ -185,9 +193,14 @@ fn apply_kind(kinds: &mut [CpuCoreKind], cpus: &[usize], kind: CpuCoreKind) {
     }
 }
 
-fn detect_capacity_classes(logical_cpus: usize) -> Option<Vec<CpuCoreKind>> {
+fn detect_capacity_classes<S: Sys>(logical_cpus: usize, sys: &S) -> Option<Vec<CpuCoreKind>> {
     let capacities = (0..logical_cpus)
-        .map(|cpu| read_u64(format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity")))
+        .map(|cpu| {
+            read_u64(
+                sys,
+                &PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity")),
+            )
+        })
         .collect::<Vec<_>>();
 
     classify_capacity_values(&capacities)
@@ -227,12 +240,13 @@ fn classify_capacity_values(capacities: &[Option<u64>]) -> Option<Vec<CpuCoreKin
     has_both_core_kinds(&kinds).then_some(kinds)
 }
 
-fn detect_smt_classes(logical_cpus: usize) -> Option<Vec<CpuCoreKind>> {
+fn detect_smt_classes<S: Sys>(logical_cpus: usize, sys: &S) -> Option<Vec<CpuCoreKind>> {
     let sibling_counts = (0..logical_cpus)
         .map(|cpu| {
-            read_cpu_list_file(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
-            ))
+            read_cpu_list_file(
+                sys,
+                format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+            )
             .map(|cpus| cpus.len())
         })
         .collect::<Vec<_>>();
@@ -275,11 +289,11 @@ fn classify_sibling_counts(counts: &[Option<usize>]) -> Option<Vec<CpuCoreKind>>
     .then_some(kinds)
 }
 
-fn read_core_groups(logical_cpus: usize) -> Vec<Option<String>> {
+fn read_core_groups<S: Sys>(logical_cpus: usize, sys: &S) -> Vec<Option<String>> {
     (0..logical_cpus)
         .map(|cpu| {
             let list_path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list");
-            if let Some(cpus) = read_cpu_list_file(&list_path) {
+            if let Some(cpus) = read_cpu_list_file(sys, &list_path) {
                 return Some(
                     cpus.into_iter()
                         .map(|value| value.to_string())
@@ -288,13 +302,12 @@ fn read_core_groups(logical_cpus: usize) -> Vec<Option<String>> {
                 );
             }
 
-            let package = fs::read_to_string(format!(
+            let package = sys.read_to_string(&PathBuf::from(format!(
                 "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
-            ))
-            .ok()?;
-            let core =
-                fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_id"))
-                    .ok()?;
+            )))?;
+            let core = sys.read_to_string(&PathBuf::from(format!(
+                "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
+            )))?;
             Some(format!("{}:{}", package.trim(), core.trim()))
         })
         .collect()
@@ -380,13 +393,13 @@ fn has_both_core_kinds(kinds: &[CpuCoreKind]) -> bool {
             .any(|kind| matches!(kind, CpuCoreKind::Efficiency))
 }
 
-fn read_cpu_list_file(path: impl AsRef<std::path::Path>) -> Option<Vec<usize>> {
-    let text = fs::read_to_string(path).ok()?;
+fn read_cpu_list_file<S: Sys>(sys: &S, path: impl AsRef<std::path::Path>) -> Option<Vec<usize>> {
+    let text = sys.read_to_string(path.as_ref())?;
     parse_cpu_list(&text)
 }
 
-fn read_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+fn read_u64<S: Sys>(sys: &S, path: &std::path::Path) -> Option<u64> {
+    sys.read_to_string(path)?.trim().parse().ok()
 }
 
 fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
@@ -506,5 +519,87 @@ mod tests {
             ])
         );
         assert_eq!(classify_sibling_counts(&[Some(2), Some(2)]), None);
+    }
+}
+#[cfg(test)]
+mod fixture_tests {
+    use super::*;
+    use crate::system::FixtureSys;
+
+    /// Intel hybrid layout: 4 P cores (2 threads each), 8 E cores (1 thread),
+    /// with scheduler capacity exposed but no cpu_core/cpu_atom files.
+    fn hybrid_sys(logical: usize) -> FixtureSys {
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Core(TM) Ultra 7\n",
+        );
+        for cpu in 0..logical {
+            let is_p = cpu < 8;
+            let list = if is_p {
+                let pair = cpu / 2 * 2;
+                format!("{pair},{}", pair + 1)
+            } else {
+                cpu.to_string()
+            };
+            fixture
+                .file(
+                    &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                    list,
+                )
+                .file(
+                    &format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"),
+                    if is_p { "1024" } else { "512" },
+                );
+        }
+        fixture
+    }
+
+    #[test]
+    fn fixture_detects_hybrid_topology_without_kernel_core_files() {
+        let fixture = hybrid_sys(16);
+        let topology = detect_topology(16, &fixture);
+
+        assert_eq!(topology.vendor, CpuVendor::Intel);
+        assert_eq!(topology.performance_threads(), 8);
+        assert_eq!(topology.efficiency_threads(), 8);
+        assert_eq!(topology.physical_cores, Some(12));
+        assert!(topology.is_hybrid());
+
+        // P core 0 groups threads 0 and 1.
+        let core0 = &topology
+            .physical_core_groups
+            .iter()
+            .find(|core| core.logical_cpus.contains(&0))
+            .unwrap();
+        assert_eq!(core0.kind, CpuCoreKind::Performance);
+        assert_eq!(core0.logical_cpus, vec![0, 1]);
+    }
+
+    #[test]
+    fn fixture_detects_homogeneous_topology_as_unknown_kinds() {
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 9 7950X\n",
+        );
+        for cpu in 0..32 {
+            let pair = cpu % 16;
+            let list = format!("{pair},{}", pair + 16);
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                list,
+            );
+        }
+
+        let topology = detect_topology(32, &fixture);
+        assert_eq!(topology.vendor, CpuVendor::Amd);
+        assert!(!topology.is_hybrid());
+        assert!(topology
+            .core_kinds
+            .iter()
+            .all(|kind| { matches!(kind, CpuCoreKind::Unknown) }));
+        assert_eq!(topology.performance_cores, None);
+        assert_eq!(topology.physical_cores, Some(16));
     }
 }

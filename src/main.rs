@@ -1,8 +1,12 @@
 mod app;
 mod config;
 mod cpu;
+#[allow(dead_code)] // consumed by the GPU provider layer (S5+)
+mod discovery;
+mod domain;
 mod gpu;
 mod llama;
+mod system;
 mod ui;
 
 use std::{env, fs, io, path::Path, path::PathBuf, process::Command};
@@ -15,6 +19,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+
+use crate::domain::GpuSelector;
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const CARGO_UPDATE_COMMAND: &str =
@@ -55,8 +61,13 @@ struct Args {
     )]
     interval_ms: Option<u64>,
 
-    /// NVIDIA GPU index to monitor. Overrides the saved setting for this run.
-    #[arg(long, env = "ORSIKTOP_GPU_INDEX")]
+    /// NVIDIA GPU to monitor: a PCI bus ID (`0000:41:00.0`), a vendor UUID
+    /// (`GPU-…`), or a legacy NVML index. Overrides the saved setting.
+    #[arg(long, env = "ORSIKTOP_GPU")]
+    gpu: Option<String>,
+
+    /// Legacy NVIDIA GPU index. Prefer `--gpu`.
+    #[arg(long, conflicts_with = "gpu", env = "ORSIKTOP_GPU_INDEX")]
     gpu_index: Option<u32>,
 }
 
@@ -92,8 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(interval_ms) = args.interval_ms {
         settings.refresh_ms = interval_ms;
     }
-    if let Some(gpu_index) = args.gpu_index {
-        settings.gpu_index = gpu_index;
+    if let Some(gpu) = args.gpu {
+        settings.gpu_selector = GpuSelector::parse(&gpu);
+    } else if let Some(gpu_index) = args.gpu_index {
+        settings.gpu_selector = GpuSelector::Index(gpu_index);
     }
     settings = settings.sanitized();
     let server = resolve_server(&settings);
