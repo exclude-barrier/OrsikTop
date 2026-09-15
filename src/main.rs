@@ -6,6 +6,7 @@ mod discovery;
 mod domain;
 mod gpu;
 mod llama;
+mod providers;
 mod system;
 mod ui;
 
