@@ -52,8 +52,10 @@ pub fn new_gpu_provider(selector: GpuSelector, gpus: &[DiscoveredGpu]) -> Box<dy
 /// Resolve a vendor-neutral [`GpuSelector`] against the BDF-sorted discovery
 /// list. Returns the position and the matched device, or `None` when nothing
 /// matches. `Auto` prefers the first NVIDIA device (BDF order) and falls back
-/// to the first device overall; `Index` is positional (discovery order is
-/// stable, by BDF); `PciBusId` matches on the device key. `Uuid` is not
+/// to the first device overall; `Index` is the n-th *NVIDIA* device (the
+/// legacy NVML ordinal — NVML only enumerates NVIDIA GPUs, so this preserves
+/// the pre-vendor-neutral behavior where `0` was the first NVIDIA GPU even on
+/// iGPU + dGPU machines); `PciBusId` matches on the device key. `Uuid` is not
 /// resolvable here and never reaches this function.
 fn resolve_discovered<'a>(
     selector: &GpuSelector,
@@ -66,7 +68,12 @@ fn resolve_discovered<'a>(
             .find(|(_, gpu)| gpu.vendor == GpuVendor::Nvidia)
             .or_else(|| gpus.first().map(|gpu| (0, gpu)))
             .map(|(position, gpu)| (position as u32, gpu)),
-        GpuSelector::Index(index) => gpus.get(*index as usize).map(|gpu| (*index, gpu)),
+        GpuSelector::Index(index) => gpus
+            .iter()
+            .enumerate()
+            .filter(|(_, gpu)| gpu.vendor == GpuVendor::Nvidia)
+            .nth(*index as usize)
+            .map(|(position, gpu)| (position as u32, gpu)),
         GpuSelector::PciBusId(bdf) => gpus
             .iter()
             .enumerate()
@@ -209,12 +216,14 @@ mod tests {
         assert_eq!(index, 2);
         assert_eq!(picked.vendor, GpuVendor::Nvidia);
 
-        // Index is positional; out of range matches nothing.
+        // Index is the n-th NVIDIA device (legacy NVML ordinal). With the
+        // single NVIDIA at position 2, Index(0) selects it; Index(1) is out
+        // of range (only one NVIDIA device).
         assert_eq!(
-            resolve_discovered(&GpuSelector::Index(1), &gpus).map(|(i, _)| i),
-            Some(1)
+            resolve_discovered(&GpuSelector::Index(0), &gpus).map(|(i, g)| (i, g.vendor)),
+            Some((2, GpuVendor::Nvidia))
         );
-        assert_eq!(resolve_discovered(&GpuSelector::Index(3), &gpus), None);
+        assert_eq!(resolve_discovered(&GpuSelector::Index(1), &gpus), None);
 
         // PciBusId matches the device key; unknown BDF matches nothing.
         assert_eq!(
@@ -247,6 +256,38 @@ mod tests {
         let (index, picked) = resolve_discovered(&GpuSelector::Auto, &gpus).unwrap();
         assert_eq!(index, 0);
         assert_eq!(picked.vendor, GpuVendor::Intel);
+    }
+
+    #[test]
+    fn index_selects_the_nth_nvidia_on_igpu_dgpu_machines() {
+        // The regression scenario: an iGPU (BDF-sorted first) plus a discrete
+        // NVIDIA. The legacy NVML ordinal `0` must select the NVIDIA dGPU, not
+        // the iGPU that sits at discovery position 0.
+        let gpus = vec![
+            gpu(GpuVendor::Intel, "0000:00:02.0"),
+            gpu(GpuVendor::Nvidia, "0000:01:00.0"),
+        ];
+        assert_eq!(
+            resolve_discovered(&GpuSelector::Index(0), &gpus).map(|(i, g)| (i, g.vendor)),
+            Some((1, GpuVendor::Nvidia))
+        );
+        assert_eq!(resolve_discovered(&GpuSelector::Index(1), &gpus), None);
+
+        // Dual-NVIDIA: the ordinal is the n-th NVIDIA in BDF order.
+        let dual = vec![
+            gpu(GpuVendor::Intel, "0000:00:02.0"),
+            gpu(GpuVendor::Nvidia, "0000:01:00.0"),
+            gpu(GpuVendor::Nvidia, "0000:41:00.0"),
+        ];
+        assert_eq!(
+            resolve_discovered(&GpuSelector::Index(0), &dual).map(|(i, _)| i),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_discovered(&GpuSelector::Index(1), &dual).map(|(i, _)| i),
+            Some(2)
+        );
+        assert_eq!(resolve_discovered(&GpuSelector::Index(2), &dual), None);
     }
 
     #[test]

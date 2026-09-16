@@ -2,6 +2,18 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- `gpu=0` (and `--gpu` / `--gpu-index` with a bare number) no longer selects
+  the first *discovered* device overall — it again selects the n-th **NVIDIA**
+  GPU (the legacy NVML ordinal the value always meant). On iGPU + dGPU
+  machines the iGPU is usually BDF-sorted first, so a migrated `gpu_index=0`
+  config silently pointed at the iGPU and the GPU panel showed nothing. The
+  fix keeps `Auto`, `--gpu <BDF>` and `--gpu GPU-…` selection unchanged and is
+  consistent with how the NVIDIA provider already resolves numeric indices.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added
