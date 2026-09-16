@@ -23,8 +23,6 @@ pub trait Sys {
     /// List a directory. `None` if the directory is missing or unreadable.
     fn read_dir(&self, path: &Path) -> Option<Vec<SysEntry>>;
     /// Direct symlink target (not resolved). `None` if not a symlink or
-    /// the target cannot be read.
-    #[allow(dead_code)]
     fn symlink_target(&self, path: &Path) -> Option<String>;
 }
 

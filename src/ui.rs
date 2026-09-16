@@ -15,7 +15,8 @@ use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        GpuSelector, GpuStats, LlmStats, ProcessStats, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+        GpuSelector, GpuStats, LlmStats, ProcessIdentity, ProcessStats, SystemStats,
+        MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
 };
@@ -79,7 +80,7 @@ struct ProcessHeaderHit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProcessRowTarget {
-    Process(u32),
+    Process(ProcessIdentity),
     Group(String),
 }
 
@@ -101,9 +102,9 @@ pub struct UiState {
     llm_connected_since: Option<Instant>,
     llm_connected_flash_until: Option<Instant>,
     llm_was_connected: bool,
-    process_selected_pid: Option<u32>,
-    process_pinned_pid: Option<u32>,
-    last_process_click: Option<(u32, Instant)>,
+    process_selected_pid: Option<ProcessIdentity>,
+    process_pinned_pid: Option<ProcessIdentity>,
+    last_process_click: Option<(ProcessIdentity, Instant)>,
     process_selected_group: Option<String>,
     process_pinned_group: Option<String>,
     last_process_group_click: Option<(String, Instant)>,
@@ -180,14 +181,21 @@ impl Default for UiState {
 impl UiState {
     pub fn push_sample(&mut self, gpu: &GpuStats, system: &SystemStats) {
         let now = Instant::now();
-        let vram = percent(gpu.memory_used_mib, gpu.memory_total_mib);
+        let vram = match (gpu.memory_used_mib, gpu.memory_total_mib) {
+            (Some(used), Some(total)) if total > 0.0 => Some(percent(used, total)),
+            _ => None,
+        };
         let ram = percent(
             system.memory_used_bytes as f64,
             system.memory_total_bytes as f64,
         );
 
-        push_history_at(&mut self.gpu_history, gpu.utilization, now);
-        push_history_at(&mut self.vram_history, vram, now);
+        if let Some(utilization) = gpu.utilization {
+            push_history_at(&mut self.gpu_history, utilization, now);
+        }
+        if let Some(vram) = vram {
+            push_history_at(&mut self.vram_history, vram, now);
+        }
         push_history_at(&mut self.cpu_history, system.cpu_usage, now);
         push_history_at(&mut self.ram_history, ram, now);
     }
@@ -313,7 +321,7 @@ impl UiState {
             rows.len() + pinned_group_rows.len() + usize::from(pinned.is_some()),
         );
         if let Some(process) = pinned {
-            targets.push(ProcessRowTarget::Process(process.pid));
+            targets.push(ProcessRowTarget::Process(process.identity()));
         }
         targets.extend(pinned_group_rows.iter().map(process_row_target));
         targets.extend(rows.iter().map(process_row_target));
@@ -343,8 +351,11 @@ impl UiState {
         }
 
         match selected {
-            ProcessRowTarget::Process(pid) => {
-                if let Some(process) = processes.iter().find(|process| process.pid == pid) {
+            ProcessRowTarget::Process(identity) => {
+                if let Some(process) = processes
+                    .iter()
+                    .find(|process| process.identity() == identity)
+                {
                     let group = ProcessRowTarget::Group(process.program.clone());
                     if targets.contains(&group) {
                         self.select_process_target(&group);
@@ -354,7 +365,7 @@ impl UiState {
             }
             ProcessRowTarget::Group(program) => {
                 if let Some(process) = processes.iter().find(|process| process.program == program) {
-                    let process_target = ProcessRowTarget::Process(process.pid);
+                    let process_target = ProcessRowTarget::Process(process.identity());
                     if targets.contains(&process_target) {
                         self.select_process_target(&process_target);
                         return;
@@ -402,16 +413,18 @@ impl UiState {
     }
 
     pub fn clamp_process_selection(&mut self, processes: &[ProcessStats]) {
-        if self
-            .process_selected_pid
-            .is_some_and(|pid| !processes.iter().any(|process| process.pid == pid))
-        {
+        if self.process_selected_pid.is_some_and(|identity| {
+            !processes
+                .iter()
+                .any(|process| process.identity() == identity)
+        }) {
             self.process_selected_pid = None;
         }
-        if self
-            .process_pinned_pid
-            .is_some_and(|pid| !processes.iter().any(|process| process.pid == pid))
-        {
+        if self.process_pinned_pid.is_some_and(|identity| {
+            !processes
+                .iter()
+                .any(|process| process.identity() == identity)
+        }) {
             self.process_pinned_pid = None;
         }
         let programs = processes
@@ -965,8 +978,10 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
     let idle = enc_dec_idle(gpu);
     let title = if gpu.available {
         format!(" GPU{} · {} ", gpu.index, gpu.name)
+    } else if gpu.error.is_empty() {
+        format!(" GPU{} · unavailable ", gpu.index)
     } else {
-        format!(" GPU{} · NVIDIA / NVML unavailable ", gpu.index)
+        format!(" GPU · {} ", gpu.error)
     };
 
     let block = Block::default()
@@ -989,7 +1004,10 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         return;
     }
 
-    let vram_pct = percent(gpu.memory_used_mib, gpu.memory_total_mib);
+    let vram_pct = match (gpu.memory_used_mib, gpu.memory_total_mib) {
+        (Some(used), Some(total)) if total > 0.0 => Some(percent(used, total)),
+        _ => None,
+    };
     let power_pct = match (gpu.power_w, gpu.power_limit_w) {
         (Some(power), Some(limit)) if limit > 0.0 => Some(percent(power, limit)),
         _ => None,
@@ -1011,7 +1029,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         let mut suffix = vec![
             fixed_data_pair(
                 "MEMCTRL",
-                format!("{:.0}%", gpu.memory_utilization),
+                optional_number(gpu.memory_utilization, 0, "%"),
                 CYAN,
                 17,
             ),
@@ -1039,38 +1057,58 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
         suffix
     };
 
-    let mut lines = vec![
-        meter_line(
+    let gpu_row = match gpu.utilization {
+        Some(utilization) => meter_line(
             "GPU",
-            gpu.utilization,
+            utilization,
             bar_width,
             ORK_GREEN,
-            format!("{:>3.0}%", gpu.utilization),
+            format!("{:>3.0}%", utilization),
             vec![
                 fixed_data_pair("CORE", core_text, ORK_GREEN, 21),
                 fixed_data_pair("PSTATE", gpu.pstate.clone(), CYAN, 16),
             ],
         ),
-        meter_line(
-            "VRAM",
-            vram_pct,
+        None => unavailable_meter_line(
+            "GPU",
             bar_width,
-            vram_color(vram_pct),
-            format!("{:>3.0}%", vram_pct),
             vec![
-                fixed_data_pair(
-                    "USED",
-                    format!(
-                        "{:.1}/{:.1} GiB",
-                        gpu.memory_used_mib / 1024.0,
-                        gpu.memory_total_mib / 1024.0
-                    ),
-                    vram_color(vram_pct),
-                    25,
-                ),
+                fixed_data_pair("CORE", core_text, ORK_GREEN, 21),
+                fixed_data_pair("PSTATE", gpu.pstate.clone(), CYAN, 16),
+            ],
+        ),
+    };
+    let used_text = match (gpu.memory_used_mib, gpu.memory_total_mib) {
+        (Some(used), Some(total)) => {
+            format!("{:.1}/{:.1} GiB", used / 1024.0, total / 1024.0)
+        }
+        _ => "—".to_string(),
+    };
+    let vram_tint = vram_pct.map(vram_color).unwrap_or(MUTED);
+    let vram_row = match vram_pct {
+        Some(pct) => meter_line(
+            "VRAM",
+            pct,
+            bar_width,
+            vram_tint,
+            format!("{:>3.0}%", pct),
+            vec![
+                fixed_data_pair("USED", used_text, vram_tint, 25),
                 fixed_data_pair("VCLK", vclk_text, CYAN, 20),
             ],
         ),
+        None => unavailable_meter_line(
+            "VRAM",
+            bar_width,
+            vec![
+                fixed_data_pair("USED", used_text, vram_tint, 25),
+                fixed_data_pair("VCLK", vclk_text, CYAN, 20),
+            ],
+        ),
+    };
+    let mut lines = vec![
+        gpu_row,
+        vram_row,
         meter_line(
             "PWR",
             power_pct_value,
@@ -1705,22 +1743,14 @@ fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
 
 fn system_panel_height(system: &SystemStats) -> u16 {
     if system.cpu_topology.is_hybrid() && !system.cpu_topology.physical_core_groups.is_empty() {
-        let p = system
-            .cpu_topology
-            .physical_core_groups
-            .iter()
-            .filter(|core| core.kind == CpuCoreKind::Performance)
-            .count();
-        let e = system
-            .cpu_topology
-            .physical_core_groups
-            .iter()
-            .filter(|core| core.kind == CpuCoreKind::Efficiency)
-            .count();
-        let rows = p.max(e).max(1);
-        return (rows as u16 + 9).max(12);
+        let groups = &system.cpu_topology.physical_core_groups;
+        let count = |kind: CpuCoreKind| groups.iter().filter(|core| core.kind == kind).count();
+        let rows = count(CpuCoreKind::Performance)
+            .max(count(CpuCoreKind::Efficiency))
+            .max(1);
+        return (rows as u16 + 10).max(13);
     }
-    12
+    13
 }
 
 fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
@@ -1798,6 +1828,11 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         .filter(|value| value.is_finite())
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "—".to_string());
+    let power = system
+        .cpu_power_w
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| format!("{value:.1} W"))
+        .unwrap_or_else(|| "—".to_string());
 
     let busiest = system
         .per_cpu_usage
@@ -1838,6 +1873,17 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                     system.load_one, system.load_five, system.load_fifteen
                 ),
                 WHITE,
+            ),
+        ]),
+        Line::from(vec![
+            label_span(" POWER "),
+            value_span(
+                &power,
+                if system.cpu_power_w.is_some() {
+                    CYAN
+                } else {
+                    MUTED
+                },
             ),
         ]),
     ];
@@ -1903,14 +1949,18 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
 fn system_panel_title(topology: &CpuTopology, width: u16) -> String {
     let model = compact_cpu_model(topology);
     let topology_text = if topology.is_hybrid() {
-        match (topology.performance_cores, topology.efficiency_cores) {
+        let mut text = match (topology.performance_cores, topology.efficiency_cores) {
             (Some(p), Some(e)) => format!("{p}P+{e}E/{}T", topology.logical_cpus),
             _ => format!(
                 "P{}T+E{}T",
                 topology.performance_threads(),
                 topology.efficiency_threads()
             ),
+        };
+        if let Some(low) = topology.low_power_cores.filter(|low| *low > 0) {
+            text.push_str(&format!("+{low}L"));
         }
+        text
     } else if let Some(cores) = topology.physical_cores {
         format!("{cores}C/{}T", topology.logical_cpus)
     } else if topology.logical_cpus > 0 {
@@ -2190,6 +2240,7 @@ fn core_heatmap_numbered_line(
             match kind {
                 CpuCoreKind::Performance => "P",
                 CpuCoreKind::Efficiency => "E",
+                CpuCoreKind::LowPower => "L",
                 CpuCoreKind::Unknown => "?",
             }
         } else {
@@ -2413,6 +2464,7 @@ struct ProcessGroup<'a> {
     members: Vec<&'a ProcessStats>,
     cpu_pct: f64,
     memory_bytes: u64,
+    gpu_bytes: u64,
     threads: usize,
     min_pid: u32,
 }
@@ -2428,6 +2480,7 @@ enum ProcessDisplayRow<'a> {
         count: usize,
         cpu_pct: f64,
         memory_bytes: u64,
+        gpu_bytes: u64,
         threads: usize,
         expanded: bool,
     },
@@ -2435,7 +2488,7 @@ enum ProcessDisplayRow<'a> {
 
 fn process_row_target(row: &ProcessDisplayRow<'_>) -> ProcessRowTarget {
     match row {
-        ProcessDisplayRow::Process { process, .. } => ProcessRowTarget::Process(process.pid),
+        ProcessDisplayRow::Process { process, .. } => ProcessRowTarget::Process(process.identity()),
         ProcessDisplayRow::Group { program, .. } => ProcessRowTarget::Group((*program).to_string()),
     }
 }
@@ -2445,7 +2498,7 @@ fn grouped_process_rows<'a>(
     processes: &'a [ProcessStats],
     key: ProcessSortKey,
     descending: bool,
-    pinned_pid: Option<u32>,
+    pinned_pid: Option<ProcessIdentity>,
     expanded_groups: &HashSet<String>,
 ) -> (Option<&'a ProcessStats>, Vec<ProcessDisplayRow<'a>>) {
     grouped_process_rows_filtered(
@@ -2462,7 +2515,7 @@ fn grouped_process_rows_filtered<'a>(
     processes: &'a [ProcessStats],
     key: ProcessSortKey,
     descending: bool,
-    pinned_pid: Option<u32>,
+    pinned_pid: Option<ProcessIdentity>,
     expanded_groups: &HashSet<String>,
     search_query: Option<&str>,
 ) -> (Option<&'a ProcessStats>, Vec<ProcessDisplayRow<'a>>) {
@@ -2488,6 +2541,7 @@ fn grouped_process_rows_filtered<'a>(
             program,
             cpu_pct: members.iter().map(|process| process.cpu_pct).sum(),
             memory_bytes: members.iter().map(|process| process.memory_bytes).sum(),
+            gpu_bytes: members.iter().map(|process| process.gpu_bytes()).sum(),
             threads: members.iter().map(|process| process.threads).sum(),
             min_pid: members.iter().map(|process| process.pid).min().unwrap_or(0),
             members,
@@ -2528,6 +2582,7 @@ fn grouped_process_rows_filtered<'a>(
             count: group.members.len(),
             cpu_pct: group.cpu_pct,
             memory_bytes: group.memory_bytes,
+            gpu_bytes: group.gpu_bytes,
             threads: group.threads,
             expanded,
         });
@@ -2713,8 +2768,8 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
     for row in visible_rows {
         match row {
             ProcessDisplayRow::Process { process, child } => {
-                let is_selected = state.process_selected_pid == Some(process.pid)
-                    || state.process_pinned_pid == Some(process.pid);
+                let is_selected = state.process_selected_pid == Some(process.identity())
+                    || state.process_pinned_pid == Some(process.identity());
                 lines.push(if wide {
                     process_line_wide(process, table_width as usize, is_selected, child)
                 } else {
@@ -2726,6 +2781,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
                 count,
                 cpu_pct,
                 memory_bytes,
+                gpu_bytes,
                 threads,
                 expanded,
             } => {
@@ -2737,6 +2793,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, processes: &[ProcessStats], sta
                         count,
                         cpu_pct,
                         memory_bytes,
+                        gpu_bytes,
                         threads,
                         expanded,
                         is_selected,
@@ -2815,11 +2872,13 @@ fn sorted_processes_with_pin(
     processes: &[ProcessStats],
     key: ProcessSortKey,
     descending: bool,
-    pinned_pid: Option<u32>,
+    pinned_pid: Option<ProcessIdentity>,
 ) -> (Option<&ProcessStats>, Vec<&ProcessStats>) {
     let mut sorted = sorted_processes(processes, key, descending);
-    let pinned = pinned_pid.and_then(|pid| {
-        let index = sorted.iter().position(|process| process.pid == pid)?;
+    let pinned = pinned_pid.and_then(|identity| {
+        let index = sorted
+            .iter()
+            .position(|process| process.identity() == identity)?;
         Some(sorted.remove(index))
     });
     (pinned, sorted)
@@ -2887,7 +2946,7 @@ fn process_header_hits(inner: Rect, table_width: u16, wide: bool) -> Vec<Process
             key: ProcessSortKey::Program,
         });
         x = x.saturating_add(16);
-        let command_width = width.saturating_sub(7 + 17 + 7 + 9 + 6).max(12) as u16;
+        let command_width = width.saturating_sub(7 + 17 + 7 + 9 + 6 + 7).max(12) as u16;
         x = x.saturating_add(command_width);
     } else {
         let program_width = width.saturating_sub(7 + 7 + 9 + 6).max(8) as u16;
@@ -2971,7 +3030,7 @@ fn process_header_compact(width: usize, active: ProcessSortKey, descending: bool
 }
 
 fn process_header_wide(width: usize, active: ProcessSortKey, descending: bool) -> Line<'static> {
-    let fixed = 7 + 17 + 7 + 9 + 6;
+    let fixed = 7 + 17 + 7 + 9 + 6 + 7;
     let command_width = width.saturating_sub(fixed).max(12);
     Line::from(vec![
         Span::raw(" "),
@@ -2993,6 +3052,11 @@ fn process_header_wide(width: usize, active: ProcessSortKey, descending: bool) -
         process_header_button("MEM", ProcessSortKey::Memory, active, descending, 8, true),
         Span::raw(" "),
         process_header_button("THR", ProcessSortKey::Threads, active, descending, 5, true),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<6}", "GPU"),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -3092,12 +3156,13 @@ fn process_group_line_wide(
     count: usize,
     cpu_pct: f64,
     memory_bytes: u64,
+    gpu_bytes: u64,
     threads: usize,
     expanded: bool,
     selected: bool,
     width: usize,
 ) -> Line<'static> {
-    let fixed = 7 + 17 + 7 + 9 + 6;
+    let fixed = 7 + 17 + 7 + 9 + 6 + 7;
     let command_width = width.saturating_sub(fixed).max(12);
     let count_label = format!("×{count}");
     let arrow = if expanded { "▾" } else { "▸" };
@@ -3105,6 +3170,7 @@ fn process_group_line_wide(
     let command = fit_cell(&format!("{count} processes"), command_width);
     let cpu = process_cpu_color(cpu_pct);
     let marker = if selected { "›" } else { " " };
+    let gpu_text = gpu_cell(gpu_bytes);
 
     Line::from(vec![
         Span::styled(
@@ -3131,6 +3197,10 @@ fn process_group_line_wide(
             format!(" {:>5}", threads),
             process_cell_style(MUTED, selected, false),
         ),
+        Span::styled(
+            format!(" {:>6}", gpu_text),
+            process_cell_style(CYAN, selected, false),
+        ),
     ])
 }
 
@@ -3140,12 +3210,13 @@ fn process_line_wide(
     selected: bool,
     child: bool,
 ) -> Line<'static> {
-    let fixed = 7 + 17 + 7 + 9 + 6;
+    let fixed = 7 + 17 + 7 + 9 + 6 + 7;
     let command_width = width.saturating_sub(fixed).max(12);
     let program = fit_cell(&process.program, 16);
     let command = fit_cell(&process.command, command_width);
     let cpu = process_cpu_color(process.cpu_pct);
     let program_bold = is_llm_process(&process.program, &process.command);
+    let gpu_text = gpu_cell(process.gpu_bytes());
     let marker = if selected {
         "›"
     } else if child {
@@ -3182,6 +3253,10 @@ fn process_line_wide(
         Span::styled(
             format!(" {:>5}", process.threads),
             process_cell_style(MUTED, selected, false),
+        ),
+        Span::styled(
+            format!(" {:>6}", gpu_text),
+            process_cell_style(CYAN, selected, false),
         ),
     ])
 }
@@ -3228,6 +3303,16 @@ fn compact_memory(bytes: u64) -> String {
     }
 }
 
+/// GPU-resident memory for the wide process table. Shows a dash when the
+/// process holds no DRM fd (explicit, never a faked zero).
+fn gpu_cell(bytes: u64) -> String {
+    if bytes > 0 {
+        compact_memory(bytes)
+    } else {
+        "—".to_string()
+    }
+}
+
 fn process_cpu_color(cpu_pct: f64) -> Color {
     if cpu_pct >= 100.0 {
         ORANGE
@@ -3263,7 +3348,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, st
     let status = if !llm.error.is_empty() {
         friendly_llm_error(&llm.error)
     } else if !gpu.error.is_empty() {
-        format!("GPU/NVML · {}", gpu.error)
+        format!("GPU · {}", gpu.error)
     } else {
         "READY · MORE POWER, HAPPIER ORKS".to_string()
     };
@@ -3652,6 +3737,26 @@ fn meter_line(
         format!(" {value:<8}"),
         Style::default().fg(WHITE),
     ));
+    spans.extend(suffix);
+    Line::from(spans)
+}
+
+/// A `meter_line`-shaped placeholder for a metric the driver does not expose
+/// (e.g. GPU utilization on Intel, where no busy counter is surfaced). The
+/// pre-suffix width matches `meter_line` (`6 + width + 9` cells) so the trailing
+/// data pairs stay aligned with the rows above and below.
+fn unavailable_meter_line(
+    label: &'static str,
+    width: usize,
+    suffix: Vec<Span<'static>>,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(format!(" {label:<5}"), Style::default().fg(MUTED)),
+        Span::styled(
+            format!("{:<width$}", " \u{2014}", width = width + 9),
+            Style::default().fg(MUTED),
+        ),
+    ];
     spans.extend(suffix);
     Line::from(spans)
 }
@@ -4087,6 +4192,7 @@ mod tests {
                 count,
                 cpu_pct,
                 memory_bytes,
+                gpu_bytes,
                 threads,
                 expanded,
             } => {
@@ -4094,6 +4200,7 @@ mod tests {
                 assert_eq!(*count, 2);
                 assert_eq!(*cpu_pct, 200.0);
                 assert_eq!(*memory_bytes, 5_000);
+                assert_eq!(*gpu_bytes, 0);
                 assert_eq!(*threads, 15);
                 assert!(!expanded);
             }
@@ -4204,7 +4311,10 @@ mod tests {
             ..UiState::default()
         };
         state.process_home(&processes);
-        assert_eq!(state.process_selected_pid, Some(20));
+        assert_eq!(
+            state.process_selected_pid,
+            Some(ProcessIdentity::new(20, 0))
+        );
     }
 
     #[test]
@@ -4258,8 +4368,12 @@ mod tests {
             },
         ];
 
-        let (pinned, rest) =
-            sorted_processes_with_pin(&processes, ProcessSortKey::Cpu, true, Some(30));
+        let (pinned, rest) = sorted_processes_with_pin(
+            &processes,
+            ProcessSortKey::Cpu,
+            true,
+            Some(ProcessIdentity::new(30, 0)),
+        );
         assert_eq!(pinned.map(|process| process.pid), Some(30));
         assert_eq!(
             rest.iter().map(|process| process.pid).collect::<Vec<_>>(),
@@ -4271,7 +4385,10 @@ mod tests {
         UiState {
             process_rows: Some(ProcessRowsHit {
                 rect: Rect::new(10, 10, 40, 2),
-                targets: vec![ProcessRowTarget::Process(10), ProcessRowTarget::Process(20)],
+                targets: vec![
+                    ProcessRowTarget::Process(ProcessIdentity::new(10, 0)),
+                    ProcessRowTarget::Process(ProcessIdentity::new(20, 0)),
+                ],
             }),
             ..Default::default()
         }
@@ -4349,7 +4466,10 @@ mod tests {
         let mut state = process_click_test_state();
 
         assert!(state.click_process_row(12, 10));
-        assert_eq!(state.process_selected_pid, Some(10));
+        assert_eq!(
+            state.process_selected_pid,
+            Some(ProcessIdentity::new(10, 0))
+        );
         assert_eq!(state.process_pinned_pid, None);
     }
 
@@ -4359,8 +4479,11 @@ mod tests {
 
         assert!(state.click_process_row(12, 10));
         assert!(state.click_process_row(12, 10));
-        assert_eq!(state.process_selected_pid, Some(10));
-        assert_eq!(state.process_pinned_pid, Some(10));
+        assert_eq!(
+            state.process_selected_pid,
+            Some(ProcessIdentity::new(10, 0))
+        );
+        assert_eq!(state.process_pinned_pid, Some(ProcessIdentity::new(10, 0)));
     }
 
     #[test]
@@ -4369,10 +4492,13 @@ mod tests {
 
         assert!(state.click_process_row(12, 10));
         assert!(state.click_process_row(12, 10));
-        assert_eq!(state.process_pinned_pid, Some(10));
+        assert_eq!(state.process_pinned_pid, Some(ProcessIdentity::new(10, 0)));
 
         assert!(state.click_process_row(12, 11));
-        assert_eq!(state.process_selected_pid, Some(20));
+        assert_eq!(
+            state.process_selected_pid,
+            Some(ProcessIdentity::new(20, 0))
+        );
         assert_eq!(state.process_pinned_pid, None);
     }
 
@@ -4405,7 +4531,10 @@ mod tests {
         assert_eq!(state.process_selected_pid, None);
 
         state.move_process_selection(1, &processes);
-        assert_eq!(state.process_selected_pid, Some(30));
+        assert_eq!(
+            state.process_selected_pid,
+            Some(ProcessIdentity::new(30, 0))
+        );
         assert_eq!(state.process_selected_group, None);
     }
 
@@ -4440,7 +4569,10 @@ mod tests {
         assert_eq!(state.process_selected_group.as_deref(), Some("chromium"));
 
         state.move_process_selection(1, &processes);
-        assert!(matches!(state.process_selected_pid, Some(10 | 20)));
+        assert!(matches!(
+            state.process_selected_pid,
+            Some(ProcessIdentity { pid: 10 | 20, .. })
+        ));
         assert_eq!(state.process_selected_group, None);
     }
 
@@ -4465,7 +4597,7 @@ mod tests {
             state.move_process_selection(1, &processes);
         }
 
-        assert_eq!(state.process_selected_pid, Some(5));
+        assert_eq!(state.process_selected_pid, Some(ProcessIdentity::new(5, 0)));
         assert_eq!(state.process_scroll, 2);
     }
 
@@ -4484,7 +4616,7 @@ mod tests {
             },
         ];
         let mut state = UiState {
-            process_selected_pid: Some(10),
+            process_selected_pid: Some(ProcessIdentity::new(10, 0)),
             process_scroll_visible: 10,
             ..UiState::default()
         };
@@ -4511,7 +4643,10 @@ mod tests {
         state.clamp_process_selection(&processes);
 
         assert_eq!(state.process_selected_group, None);
-        assert_eq!(state.process_selected_pid, Some(10));
+        assert_eq!(
+            state.process_selected_pid,
+            Some(ProcessIdentity::new(10, 0))
+        );
     }
 
     #[test]
@@ -4843,7 +4978,7 @@ mod tests {
                 vec![
                     fixed_data_pair(
                         "MEMCTRL",
-                        format!("{:.0}%", gpu.memory_utilization),
+                        optional_number(gpu.memory_utilization, 0, "%"),
                         CYAN,
                         17,
                     ),
@@ -4869,7 +5004,7 @@ mod tests {
                 ),
                 fixed_data_pair(
                     "MEMCTRL",
-                    format!("{:.0}%", gpu.memory_utilization),
+                    optional_number(gpu.memory_utilization, 0, "%"),
                     CYAN,
                     17,
                 ),

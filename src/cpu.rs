@@ -26,6 +26,9 @@ impl CpuVendor {
 pub enum CpuCoreKind {
     Performance,
     Efficiency,
+    /// Intel low-power E-core (LP-E), a distinct low-power class below
+    /// regular E-cores. Exposed by the kernel's `cpu_lowpower` mask.
+    LowPower,
     #[default]
     Unknown,
 }
@@ -44,11 +47,17 @@ pub struct CpuTopology {
     pub physical_cores: Option<usize>,
     pub performance_cores: Option<usize>,
     pub efficiency_cores: Option<usize>,
+    /// Physical low-power E-cores (LP-E); `None` when the kernel does not
+    /// expose a distinct low-power class.
+    pub low_power_cores: Option<usize>,
     pub core_kinds: Vec<CpuCoreKind>,
     pub physical_core_groups: Vec<CpuPhysicalCore>,
 }
 
 impl CpuTopology {
+    /// True when both Performance and Efficiency classes are present. This is
+    /// the UI routing gate for the two-class P/E minibar; a P-only-with-LP-E or
+    /// E-only-with-LP-E layout is heterogeneous but renders via the heatmap.
     pub fn is_hybrid(&self) -> bool {
         self.core_kinds
             .iter()
@@ -60,18 +69,16 @@ impl CpuTopology {
     }
 
     pub fn performance_threads(&self) -> usize {
-        self.core_kinds
-            .iter()
-            .filter(|kind| matches!(kind, CpuCoreKind::Performance))
-            .count()
+        count_kind(&self.core_kinds, CpuCoreKind::Performance)
     }
 
     pub fn efficiency_threads(&self) -> usize {
-        self.core_kinds
-            .iter()
-            .filter(|kind| matches!(kind, CpuCoreKind::Efficiency))
-            .count()
+        count_kind(&self.core_kinds, CpuCoreKind::Efficiency)
     }
+}
+
+fn count_kind(kinds: &[CpuCoreKind], target: CpuCoreKind) -> usize {
+    kinds.iter().filter(|kind| **kind == target).count()
 }
 
 pub fn detect_cpu_topology(logical_cpus: usize) -> CpuTopology {
@@ -91,7 +98,7 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
     // cpu_capacity is architecture-neutral Linux scheduler information. Prefer it
     // over model-name tables so future heterogeneous CPUs can work without an
     // OrsikTop update when the kernel exposes distinct capacities.
-    if !has_both_core_kinds(&core_kinds) {
+    if !has_multiple_core_kinds(&core_kinds) {
         if let Some(capacity_kinds) = detect_capacity_classes(logical_cpus, sys) {
             core_kinds = capacity_kinds;
         }
@@ -100,18 +107,19 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
     // Older Intel hybrid kernels may not expose cpu_core/cpu_atom or capacity.
     // SMT topology is a conservative fallback: P-cores have more sibling
     // threads than E-cores on the Intel generations this fallback targets.
-    if !has_both_core_kinds(&core_kinds) && vendor == CpuVendor::Intel {
+    if !has_multiple_core_kinds(&core_kinds) && vendor == CpuVendor::Intel {
         if let Some(topology_kinds) = detect_smt_classes(logical_cpus, sys) {
             core_kinds = topology_kinds;
         }
     }
 
-    if !has_both_core_kinds(&core_kinds) {
+    if !has_multiple_core_kinds(&core_kinds) {
         core_kinds.fill(CpuCoreKind::Unknown);
     }
 
     let performance_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::Performance);
     let efficiency_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::Efficiency);
+    let low_power_cores = count_kind_groups(&core_groups, &core_kinds, CpuCoreKind::LowPower);
     let physical_core_groups = build_physical_core_groups(&core_groups, &core_kinds);
 
     CpuTopology {
@@ -121,6 +129,7 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
         physical_cores,
         performance_cores,
         efficiency_cores,
+        low_power_cores,
         core_kinds,
         physical_core_groups,
     }
@@ -178,8 +187,14 @@ fn detect_kernel_core_groups<S: Sys>(logical_cpus: usize, sys: &S) -> Vec<CpuCor
     if let Some(cpus) = read_cpu_list_file(sys, "/sys/devices/cpu_atom/cpus") {
         apply_kind(&mut kinds, &cpus, CpuCoreKind::Efficiency);
     }
+    // `cpu_core` / `cpu_atom` / `cpu_lowpower` are the Intel x86 *perf
+    // hybrid-PMU* groups (arch/x86/events/intel/core.c), each a cpumask of the
+    // logical CPUs assigned to that PMU. A CPU is assigned to exactly one PMU,
+    // so the three masks are mutually disjoint: applying all three (in any
+    // order) classifies each core exactly once. `cpu_lowpower` is the LP-E
+    // uarch and exists only on parts with a third "tiny" PMU.
     if let Some(cpus) = read_cpu_list_file(sys, "/sys/devices/cpu_lowpower/cpus") {
-        apply_kind(&mut kinds, &cpus, CpuCoreKind::Efficiency);
+        apply_kind(&mut kinds, &cpus, CpuCoreKind::LowPower);
     }
 
     kinds
@@ -370,7 +385,7 @@ fn count_kind_groups(
     kinds: &[CpuCoreKind],
     target: CpuCoreKind,
 ) -> Option<usize> {
-    if !has_both_core_kinds(kinds) || groups.len() != kinds.len() {
+    if !has_multiple_core_kinds(kinds) || groups.len() != kinds.len() {
         return None;
     }
 
@@ -384,6 +399,24 @@ fn count_kind_groups(
     Some(unique.len())
 }
 
+/// True when the resolved kinds contain more than one distinct class (P/E,
+/// P/LP-E, or E/LP-E). This is the "hybrid resolved" gate: a single class —
+/// homogeneous or an unresolved lone Unknown — is not a multi-class layout.
+fn has_multiple_core_kinds(kinds: &[CpuCoreKind]) -> bool {
+    [
+        CpuCoreKind::Performance,
+        CpuCoreKind::Efficiency,
+        CpuCoreKind::LowPower,
+        CpuCoreKind::Unknown,
+    ]
+    .iter()
+    .filter(|kind| kinds.contains(kind))
+    .count()
+        >= 2
+}
+
+/// True when both the Performance and Efficiency classes are present. Used by
+/// the P/E-only classifiers, which never emit the LowPower class.
 fn has_both_core_kinds(kinds: &[CpuCoreKind]) -> bool {
     kinds
         .iter()
@@ -402,7 +435,7 @@ fn read_u64<S: Sys>(sys: &S, path: &std::path::Path) -> Option<u64> {
     sys.read_to_string(path)?.trim().parse().ok()
 }
 
-fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
+pub(crate) fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
     let mut cpus = Vec::new();
     for part in text.trim().split(',').filter(|part| !part.is_empty()) {
         if let Some((start, end)) = part.split_once('-') {
@@ -601,5 +634,109 @@ mod fixture_tests {
             .all(|kind| { matches!(kind, CpuCoreKind::Unknown) }));
         assert_eq!(topology.performance_cores, None);
         assert_eq!(topology.physical_cores, Some(16));
+    }
+
+    #[test]
+    fn fixture_detects_low_power_group_disjoint_from_atom() {
+        // The kernel hybrid-PMU masks are mutually disjoint: 2 P cores, 2
+        // regular E cores, 2 LP-E cores — no CPU appears in two groups.
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Core(TM) Ultra 9\n",
+        );
+        fixture
+            .file("/sys/devices/cpu_core/cpus", "0-1")
+            .file("/sys/devices/cpu_atom/cpus", "2-3")
+            .file("/sys/devices/cpu_lowpower/cpus", "4-5");
+        for cpu in 0..6usize {
+            let list = cpu.to_string();
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                list,
+            );
+        }
+
+        let topology = detect_topology(6, &fixture);
+        assert!(topology.is_hybrid());
+        assert_eq!(topology.performance_cores, Some(2));
+        assert_eq!(topology.efficiency_cores, Some(2));
+        assert_eq!(topology.low_power_cores, Some(2));
+        assert_eq!(
+            topology.core_kinds,
+            vec![
+                CpuCoreKind::Performance,
+                CpuCoreKind::Performance,
+                CpuCoreKind::Efficiency,
+                CpuCoreKind::Efficiency,
+                CpuCoreKind::LowPower,
+                CpuCoreKind::LowPower,
+            ]
+        );
+    }
+
+    #[test]
+    fn fixture_detects_performance_and_low_power_without_regular_e() {
+        // P + LP-E only (no regular E cores): the kernel files already resolve
+        // multiple classes, so the capacity/SMT fallbacks must not overwrite them.
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Core(TM) Ultra 9\n",
+        );
+        fixture
+            .file("/sys/devices/cpu_core/cpus", "0-1")
+            .file("/sys/devices/cpu_lowpower/cpus", "2-3");
+        for cpu in 0..4usize {
+            let list = cpu.to_string();
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                list,
+            );
+            // Distinct capacities that would otherwise confuse a P/E-only classifier.
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"),
+                if cpu < 2 { "1024" } else { "384" },
+            );
+        }
+
+        let topology = detect_topology(4, &fixture);
+        assert_eq!(topology.performance_cores, Some(2));
+        assert_eq!(topology.efficiency_cores, Some(0));
+        assert_eq!(topology.low_power_cores, Some(2));
+        assert_eq!(
+            topology.core_kinds,
+            vec![
+                CpuCoreKind::Performance,
+                CpuCoreKind::Performance,
+                CpuCoreKind::LowPower,
+                CpuCoreKind::LowPower,
+            ]
+        );
+    }
+
+    #[test]
+    fn fixture_p_e_without_low_power_keeps_zero_low_power() {
+        // The 288V shape: P + E, no cpu_lowpower file. LP-E must stay Some(0).
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Core(TM) Ultra 9\n",
+        );
+        fixture
+            .file("/sys/devices/cpu_core/cpus", "0-3")
+            .file("/sys/devices/cpu_atom/cpus", "4-7");
+        for cpu in 0..8usize {
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                cpu.to_string(),
+            );
+        }
+
+        let topology = detect_topology(8, &fixture);
+        assert!(topology.is_hybrid());
+        assert_eq!(topology.performance_cores, Some(4));
+        assert_eq!(topology.efficiency_cores, Some(4));
+        assert_eq!(topology.low_power_cores, Some(0));
     }
 }

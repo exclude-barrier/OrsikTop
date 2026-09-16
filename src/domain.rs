@@ -5,6 +5,7 @@
 //! Re-exports the per-subsystem telemetry structs so consumers (and the UI)
 //! import from this module only.
 
+pub use crate::drm::DrmProcessGpu;
 pub use crate::llama::LlmStats;
 pub use crate::providers::GpuStats;
 
@@ -27,6 +28,48 @@ pub struct ProcessStats {
     pub cpu_pct: f64,
     pub memory_bytes: u64,
     pub threads: usize,
+    /// Process start time in epoch seconds (from /proc/<pid>/stat).
+    /// Together with `pid` it forms a robust [`ProcessIdentity`] that
+    /// survives kernel PID reuse.
+    pub start_time: u64,
+    /// Per-device GPU usage from DRM fdinfo (S8). One entry per PCI BDF the
+    /// process has an open render node for; empty when the process holds no
+    /// DRM fd (explicit, never faked).
+    pub gpu: Vec<DrmProcessGpu>,
+}
+
+impl ProcessStats {
+    /// Robust identity of this process instance.
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            start_time: self.start_time,
+        }
+    }
+    /// Total GPU-resident memory across all devices this process holds a
+    /// render node for (S8). Zero when it holds none.
+    pub fn gpu_bytes(&self) -> u64 {
+        self.gpu.iter().map(|g| g.resident_bytes).sum()
+    }
+}
+
+/// Robust identity for a running process.
+///
+/// The kernel recycles PIDs, so a bare PID can refer to an entirely
+/// different process after a restart. Pairing it with the process start
+/// time (`/proc/<pid>/stat` field 22, exposed here in epoch seconds) makes
+/// the identity unique for the life of the process: a reused PID carries a
+/// different start time.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
+impl ProcessIdentity {
+    pub fn new(pid: u32, start_time: u64) -> Self {
+        Self { pid, start_time }
+    }
 }
 
 /// Stable identity for a GPU device, independent of enumeration order.
@@ -56,6 +99,95 @@ impl DeviceId {
             .as_deref()
             .or(self.uuid.as_deref())
             .unwrap_or("")
+    }
+}
+
+/// Vendor family of a discovered GPU, independent of the provider backend.
+///
+/// This is a normalized domain concept (not discovery-specific); it is
+/// defined here next to [`DeviceId`] and imported by the discovery module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Other,
+    Unknown,
+}
+
+/// Evidence used to attribute a GPU to the inference server process.
+///
+/// Kept for diagnostics (S18) so a mapping decision can be explained:
+/// [`NvmlCompute`] means the vendor API reported the process as a running
+/// compute client of that device; [`RenderNodeFd`] means the process holds an
+/// open DRM render node that resolves to the device's PCI BDF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuEvidence {
+    /// NVIDIA NVML reported the PID among the device's compute processes.
+    NvmlCompute,
+    /// The process opened a DRM render node that maps to the device BDF.
+    RenderNodeFd,
+}
+
+/// One GPU attributed to the inference server process.
+///
+/// `device` (via [`DeviceId::key`]) is the stable identity; `name` and
+/// `vendor` are display-only and never part of equality or dedup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MappedGpu {
+    pub device: DeviceId,
+    /// Human-readable card name (e.g. `card0`), for display only.
+    pub name: String,
+    pub vendor: GpuVendor,
+    pub evidence: GpuEvidence,
+}
+
+#[allow(dead_code)] // consumed by the UI (S23) and diagnostics (S18)
+impl MappedGpu {
+    /// Stable display key: PCI BDF, else vendor UUID, else a stable
+    /// unknown-marker so two unkeyed devices are not merged.
+    pub fn key(&self) -> &str {
+        if self.device.key().is_empty() {
+            return "<unkeyed>";
+        }
+        self.device.key()
+    }
+}
+
+/// The result of mapping the inference server process to the GPU(s) it uses.
+///
+/// Represented explicitly rather than guessed: a single device, several
+/// devices, or `Unknown` when evidence is insufficient (e.g. the process is
+/// not running locally or exposes no usable GPU evidence). `Default` is
+/// [`GpuMapping::None`], matching a snapshot with no mapping computed yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GpuMapping {
+    /// No mapping has been computed yet (e.g. before the first process scan).
+    #[default]
+    None,
+    /// The server uses exactly one GPU.
+    Single(MappedGpu),
+    /// The server uses more than one GPU (e.g. tensor parallel across cards).
+    Multi(Vec<MappedGpu>),
+    /// Evidence is insufficient to determine which GPU(s) the server uses.
+    Unknown,
+}
+
+#[allow(dead_code)] // consumed by the UI (S23) and diagnostics (S18)
+impl GpuMapping {
+    /// True when no GPU is attributed (either not computed or unknown).
+    pub fn is_empty(&self) -> bool {
+        matches!(self, GpuMapping::None | GpuMapping::Unknown)
+    }
+
+    /// Number of GPUs attributed, or `None` when unknown/not computed.
+    pub fn len(&self) -> Option<usize> {
+        match self {
+            GpuMapping::None => Some(0),
+            GpuMapping::Single(_) => Some(1),
+            GpuMapping::Multi(devices) => Some(devices.len()),
+            GpuMapping::Unknown => None,
+        }
     }
 }
 
@@ -293,6 +425,40 @@ mod tests {
         );
         assert_eq!(GpuSelector::Auto.resolve(&[]), None);
     }
+
+    fn mapped(bdf: &str) -> MappedGpu {
+        MappedGpu {
+            device: DeviceId::new(Some(bdf.into()), None),
+            name: "card0".into(),
+            vendor: GpuVendor::Amd,
+            evidence: GpuEvidence::RenderNodeFd,
+        }
+    }
+
+    #[test]
+    fn gpu_mapping_states_are_explicit() {
+        // Default is None (not yet computed) — distinct from Unknown.
+        let default = GpuMapping::default();
+        assert!(matches!(default, GpuMapping::None));
+        assert_ne!(default, GpuMapping::Unknown);
+
+        // None/Unknown report no attributed GPUs.
+        assert!(default.is_empty());
+        assert!(GpuMapping::Unknown.is_empty());
+        assert_eq!(default.len(), Some(0));
+        assert_eq!(GpuMapping::Unknown.len(), None);
+
+        // Single and Multi report their device counts.
+        assert_eq!(GpuMapping::Single(mapped("0000:01:00.0")).len(), Some(1));
+        assert!(!GpuMapping::Single(mapped("0000:01:00.0")).is_empty());
+        assert_eq!(
+            GpuMapping::Multi(vec![mapped("0000:01:00.0"), mapped("0000:02:00.0")]).len(),
+            Some(2)
+        );
+
+        // The display key is the stable BDF.
+        assert_eq!(mapped("0000:01:00.0").key(), "0000:01:00.0");
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -302,6 +468,9 @@ pub struct SystemStats {
     pub cpu_topology: crate::cpu::CpuTopology,
     pub cpu_frequency_mhz: Option<f64>,
     pub cpu_temperature_c: Option<f64>,
+    /// RAPL package power (W). `None` when no RAPL package zone is readable
+    /// (`energy_uj` is root-only on current kernels).
+    pub cpu_power_w: Option<f64>,
     pub io_wait_pct: Option<f64>,
     pub load_one: f64,
     pub load_five: f64,
@@ -318,6 +487,8 @@ pub struct SystemStats {
 pub struct FastSnapshot {
     pub gpu: GpuStats,
     pub system: SystemStats,
+    /// Which GPU(s) the inference server process uses, when determined.
+    pub gpu_map: GpuMapping,
 }
 
 /// Latest coherent snapshot held by the app and rendered by the UI.
@@ -326,4 +497,6 @@ pub struct DashboardSnapshot {
     pub gpu: GpuStats,
     pub system: SystemStats,
     pub llm: LlmStats,
+    /// Which GPU(s) the inference server process uses, when determined.
+    pub gpu_map: GpuMapping,
 }

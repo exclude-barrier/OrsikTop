@@ -1,16 +1,27 @@
 mod app;
 mod config;
 mod cpu;
+mod cpu_sensors;
+mod diagnostics;
 #[allow(dead_code)] // consumed by the GPU provider layer (S5+)
 mod discovery;
+mod discovery_llm;
 mod domain;
+mod drm;
 mod gpu;
+mod gpu_map;
 mod llama;
 mod providers;
 mod system;
 mod ui;
 
-use std::{env, fs, io, path::Path, path::PathBuf, process::Command};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant},
+};
 
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -26,11 +37,17 @@ use crate::domain::GpuSelector;
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const CARGO_UPDATE_COMMAND: &str =
     "cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force";
+/// Maximum wall time for the `orsiktop-update` helper. It downloads and
+/// replaces binaries, so a slow network can legitimately take minutes; the
+/// bound only catches a hung process.
+const UPDATER_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Update a standalone OrsikTop installation to the latest release.
     Update,
+    /// Print a diagnostics summary for bug reports (no secrets).
+    Diag,
     /// Remove the OrsikTop binaries, and optionally the saved config.
     Uninstall {
         /// Also remove the saved OrsikTop config (endpoint, GPU index, refresh settings).
@@ -93,6 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return match command {
             Commands::Update => run_updater(),
             Commands::Uninstall { purge } => run_uninstall(*purge),
+            Commands::Diag => diagnostics::run(),
         };
     }
 
@@ -111,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     settings = settings.sanitized();
     let server = resolve_server(&settings);
+    let server_pid = resolve_server_pid(&settings);
     let server_auto = server_is_auto_discovered(&settings);
 
     enable_raw_mode()?;
@@ -123,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    app::run(&mut terminal, &server, settings, server_auto)
+    app::run(&mut terminal, &server, server_pid, settings, server_auto)
 }
 
 fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
@@ -132,20 +151,79 @@ fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|exe| exe.parent().map(|dir| dir.join("orsiktop-update")))
         .filter(|path| path.is_file());
 
-    let status = if let Some(path) = sibling_updater {
-        Command::new(path).status()
+    let result = if let Some(path) = sibling_updater {
+        run_updater_command(Command::new(path))
     } else {
-        Command::new("orsiktop-update").status()
+        run_updater_command(Command::new("orsiktop-update"))
     };
 
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("OrsikTop updater exited with status {status}").into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!(
+    match result {
+        Ok(()) => Ok(()),
+        Err(UpdaterError::NotFound) => Err(format!(
             "orsiktop-update was not found. Self-update is available for standalone installations created by the OrsikTop installer. If you installed OrsikTop with Cargo, update it with:\n{CARGO_UPDATE_COMMAND}"
         )
         .into()),
-        Err(error) => Err(error.into()),
+        Err(UpdaterError::TimedOut) => Err(format!(
+            "orsiktop-update did not finish within {} s and was terminated.",
+            UPDATER_TIMEOUT_MS / 1_000
+        )
+        .into()),
+        Err(UpdaterError::Failed(message)) => Err(message.into()),
+    }
+}
+
+fn run_updater_command(mut command: Command) -> Result<(), UpdaterError> {
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            UpdaterError::NotFound
+        } else {
+            UpdaterError::Failed(error.to_string())
+        }
+    })?;
+    wait_for_child(
+        &mut child,
+        Duration::from_millis(UPDATER_TIMEOUT_MS),
+        Duration::from_millis(100),
+    )
+}
+
+enum UpdaterError {
+    NotFound,
+    TimedOut,
+    Failed(String),
+}
+
+/// Waits for `child` to exit, polling with `try_wait` against a `timeout`
+/// deadline and sleeping `poll` between polls. On deadline expiry the child
+/// is killed (and reaped) and `TimedOut` is returned, so a hung updater can
+/// never hang the caller. `poll` is a parameter (not a constant) so tests can
+/// drive the deadline with a short timeout and a short poll interval.
+fn wait_for_child(
+    child: &mut Child,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<(), UpdaterError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(UpdaterError::Failed(format!(
+                        "OrsikTop updater exited with status {status}"
+                    )))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => return Err(UpdaterError::Failed(error.to_string())),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(UpdaterError::TimedOut);
+        }
+        thread::sleep(poll);
     }
 }
 
@@ -215,140 +293,39 @@ fn uninstall_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Resolve the endpoint to monitor *and* the local process PID behind it,
+/// scanning `/proc` once.
+pub(crate) fn resolve_server_full(settings: &config::AppConfig) -> (String, Option<u32>) {
+    let candidates = discovery_llm::collect_candidates(
+        &system::RealSys,
+        settings.auto_discovery,
+        settings.server.as_deref(),
+    );
+    let endpoint = discovery_llm::select_endpoint(&candidates, DEFAULT_SERVER);
+    let pid = discovery_llm::selected_endpoint_pid(&candidates, &endpoint);
+    (endpoint, pid)
+}
+
 fn resolve_server(settings: &config::AppConfig) -> String {
-    let discovered = settings
-        .auto_discovery
-        .then(discover_local_llama_server)
-        .flatten();
-    discovered
-        .or_else(|| settings.server.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+    resolve_server_full(settings).0
 }
 
+/// The local process PID behind the resolved endpoint, when it was produced
+/// by a discovered `llama-server` / `llama serve` process (used to map the
+/// server to a GPU, S16). `None` for configured/remote endpoints.
+fn resolve_server_pid(settings: &config::AppConfig) -> Option<u32> {
+    resolve_server_full(settings).1
+}
+
+/// True when auto-discovery is enabled and at least one local llama server
+/// process is running. Recomputed after settings edits in `app::run`.
 pub(crate) fn server_is_auto_discovered(settings: &config::AppConfig) -> bool {
-    settings.auto_discovery && discover_local_llama_server().is_some()
-}
-
-fn discover_local_llama_server() -> Option<String> {
-    let mut candidates = Vec::new();
-
-    for entry in fs::read_dir("/proc").ok()?.flatten() {
-        let pid = entry.file_name().to_string_lossy().parse::<u32>().ok();
-        let Some(pid) = pid else {
-            continue;
-        };
-
-        let cmdline = match fs::read(entry.path().join("cmdline")) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        let args = parse_cmdline(&cmdline);
-        if !is_llama_server_process(&args) {
-            continue;
-        }
-
-        candidates.push((pid, endpoint_from_args(&args)));
-    }
-
-    candidates.sort_by_key(|(pid, _)| *pid);
-    candidates.into_iter().next().map(|(_, endpoint)| endpoint)
-}
-
-fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| String::from_utf8_lossy(arg).into_owned())
-        .collect()
-}
-
-fn is_llama_server_process(args: &[String]) -> bool {
-    let Some(executable) = args.first() else {
-        return false;
-    };
-    let executable = Path::new(executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(executable);
-
-    executable.contains("llama-server")
-        || (executable == "llama" && args.get(1).is_some_and(|arg| arg == "serve"))
-}
-
-fn endpoint_from_args(args: &[String]) -> String {
-    let host = cli_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = cli_value(args, "--port")
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(8080);
-    let host = connect_host(&host);
-    format!("http://{host}:{port}")
-}
-
-fn connect_host(host: &str) -> String {
-    let host = host.trim();
-    match host {
-        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
-        "::1" | "[::1]" => "[::1]".to_string(),
-        _ if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
-        _ => host.to_string(),
-    }
-}
-
-fn cli_value(args: &[String], flag: &str) -> Option<String> {
-    for (index, arg) in args.iter().enumerate() {
-        if arg == flag {
-            return args.get(index + 1).cloned();
-        }
-        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
-            return Some(value.to_string());
-        }
-    }
-    None
+    settings.auto_discovery && !discovery_llm::discover_processes(&system::RealSys).is_empty()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn recognizes_both_llama_server_cli_forms() {
-        let server = vec!["/usr/bin/llama-server".to_string()];
-        let serve = vec![
-            "/home/user/.local/bin/llama".to_string(),
-            "serve".to_string(),
-        ];
-        let unrelated = vec!["/usr/bin/llama".to_string(), "chat".to_string()];
-
-        assert!(is_llama_server_process(&server));
-        assert!(is_llama_server_process(&serve));
-        assert!(!is_llama_server_process(&unrelated));
-    }
-
-    #[test]
-    fn discovers_endpoint_from_llama_serve_args() {
-        let args = vec![
-            "/home/user/.local/bin/llama".to_string(),
-            "serve".to_string(),
-            "--host".to_string(),
-            "127.0.0.1".to_string(),
-            "--port".to_string(),
-            "8081".to_string(),
-        ];
-
-        assert_eq!(endpoint_from_args(&args), "http://127.0.0.1:8081");
-    }
-
-    #[test]
-    fn wildcard_bind_is_reached_through_loopback() {
-        let args = vec![
-            "/usr/bin/llama-server".to_string(),
-            "--host=0.0.0.0".to_string(),
-            "--port=9090".to_string(),
-        ];
-
-        assert_eq!(endpoint_from_args(&args), "http://127.0.0.1:9090");
-    }
 
     #[test]
     fn manual_server_is_used_when_auto_discovery_is_disabled() {
@@ -385,5 +362,46 @@ mod tests {
         let other_dir = Path::new("/home/user/.local/bin");
         assert!(is_cargo_install_dir(cargo_dir));
         assert!(!is_cargo_install_dir(other_dir));
+    }
+
+    #[test]
+    fn updater_wait_times_out_a_hung_process() {
+        // A process that outlives the deadline must be killed and reported
+        // as TimedOut, not hang the caller. 30 ms is far longer than the
+        // 10 ms poll, so the loop has time to observe the deadline.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let result = wait_for_child(
+            &mut child,
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(result, Err(UpdaterError::TimedOut)));
+        // The child must be reaped (wait() returns Some after kill), proving
+        // it was actually killed and not just abandoned.
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn updater_wait_returns_failure_for_nonzero_exit() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("spawn sh");
+        let result = wait_for_child(
+            &mut child,
+            Duration::from_millis(5_000),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(result, Err(UpdaterError::Failed(message)) if message.contains("3")));
+    }
+
+    #[test]
+    fn updater_wait_missing_binary_is_not_found() {
+        let result = run_updater_command(Command::new("definitely-not-a-real-updater-binary"));
+        assert!(matches!(result, Err(UpdaterError::NotFound)));
     }
 }

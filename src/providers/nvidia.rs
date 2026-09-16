@@ -104,13 +104,10 @@ impl GpuProvider for NvidiaGpuProvider {
             index,
             device: device_id,
             name: device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string()),
-            utilization: utilization.as_ref().map(|v| v.gpu as f64).unwrap_or(0.0),
-            memory_utilization: utilization.as_ref().map(|v| v.memory as f64).unwrap_or(0.0),
-            memory_used_mib: memory.as_ref().map(|m| bytes_to_mib(m.used)).unwrap_or(0.0),
-            memory_total_mib: memory
-                .as_ref()
-                .map(|m| bytes_to_mib(m.total))
-                .unwrap_or(0.0),
+            utilization: utilization.as_ref().map(|v| v.gpu as f64),
+            memory_utilization: utilization.as_ref().map(|v| v.memory as f64),
+            memory_used_mib: memory.as_ref().map(|m| bytes_to_mib(m.used)),
+            memory_total_mib: memory.as_ref().map(|m| bytes_to_mib(m.total)),
             temperature_c: device
                 .temperature(TemperatureSensor::Gpu)
                 .ok()
@@ -233,8 +230,8 @@ fn format_throttle_reasons(reasons: ThrottleReasons) -> String {
 }
 
 fn sanitize(stats: &mut GpuStats) {
-    stats.utilization = clamp_percent(stats.utilization);
-    stats.memory_utilization = clamp_percent(stats.memory_utilization);
+    stats.utilization = stats.utilization.map(clamp_percent);
+    stats.memory_utilization = stats.memory_utilization.map(clamp_percent);
     stats.encoder_utilization = stats.encoder_utilization.map(clamp_percent);
     stats.decoder_utilization = stats.decoder_utilization.map(clamp_percent);
     stats.fan_percent = stats
@@ -309,15 +306,15 @@ mod tests {
     #[test]
     fn clamps_utilization_but_allows_fan_above_100() {
         let mut stats = GpuStats {
-            utilization: 120.0,
-            memory_utilization: -4.0,
+            utilization: Some(120.0),
+            memory_utilization: Some(-4.0),
             fan_percent: Some(115.0),
             encoder_utilization: Some(140.0),
             ..Default::default()
         };
         sanitize(&mut stats);
-        assert_eq!(stats.utilization, 100.0);
-        assert_eq!(stats.memory_utilization, 0.0);
+        assert_eq!(stats.utilization, Some(100.0));
+        assert_eq!(stats.memory_utilization, Some(0.0));
         assert_eq!(stats.encoder_utilization, Some(100.0));
         assert_eq!(stats.fan_percent, Some(115.0));
     }
