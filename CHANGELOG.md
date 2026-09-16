@@ -2,6 +2,20 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [0.2.4] - 2026-09-16
+
+### Fixed
+
+- The SYSTEM panel's per-core minibar now renders on small hybrid CPUs. The
+  full-view height gate was hard-coded to 15 rows, calibrated against an
+  8-row hybrid box (e.g. an i9-12900K, 8P+8E). Hybrid boxes with fewer than
+  7 max(P,E) physical core rows — e.g. a 4P+4E Core Ultra (such as the 288V)
+  — got an inner panel height of 12 and silently collapsed to the compact
+  4-line view (CPU and RAM meters only), hiding the P-CORES/E-CORES minibar
+  entirely. The decision now lives in a single `system_full_view` check with
+  a height floor matching the minimum full-view content, and the line budget
+  of the full view fits the panel height the layout allocates exactly.
+
 ## [0.2.3] - 2026-09-16
 
 ### Fixed
