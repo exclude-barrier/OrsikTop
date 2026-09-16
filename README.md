@@ -157,7 +157,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.2.3 x86_64-unknown-linux-gnu
+downloading orsiktop 0.2.4 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -185,7 +185,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.2.3
+orsiktop 0.2.4
 ```
 
 You can then start OrsikTop with `orsiktop`.
