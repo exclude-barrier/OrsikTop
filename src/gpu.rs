@@ -52,11 +52,14 @@ pub fn new_gpu_provider(selector: GpuSelector, gpus: &[DiscoveredGpu]) -> Box<dy
 /// Resolve a vendor-neutral [`GpuSelector`] against the BDF-sorted discovery
 /// list. Returns the position and the matched device, or `None` when nothing
 /// matches. `Auto` prefers the first NVIDIA device (BDF order) and falls back
-/// to the first device overall; `Index` is the n-th *NVIDIA* device (the
+/// to the first device overall. `Index` is the n-th *NVIDIA* device (the
 /// legacy NVML ordinal — NVML only enumerates NVIDIA GPUs, so this preserves
 /// the pre-vendor-neutral behavior where `0` was the first NVIDIA GPU even on
-/// iGPU + dGPU machines); `PciBusId` matches on the device key. `Uuid` is not
-/// resolvable here and never reaches this function.
+/// iGPU + dGPU machines); on a machine without any NVIDIA GPU it falls back to
+/// the n-th device overall (the pre-0.2.1 positional behavior), so legacy
+/// `gpu=0` configs keep working on Intel/AMD-only machines. `PciBusId`
+/// matches on the device key. `Uuid` is not resolvable here and never reaches
+/// this function.
 fn resolve_discovered<'a>(
     selector: &GpuSelector,
     gpus: &'a [DiscoveredGpu],
@@ -68,12 +71,18 @@ fn resolve_discovered<'a>(
             .find(|(_, gpu)| gpu.vendor == GpuVendor::Nvidia)
             .or_else(|| gpus.first().map(|gpu| (0, gpu)))
             .map(|(position, gpu)| (position as u32, gpu)),
-        GpuSelector::Index(index) => gpus
-            .iter()
-            .enumerate()
-            .filter(|(_, gpu)| gpu.vendor == GpuVendor::Nvidia)
-            .nth(*index as usize)
-            .map(|(position, gpu)| (position as u32, gpu)),
+        GpuSelector::Index(index) => {
+            let index = *index as usize;
+            if gpus.iter().any(|gpu| gpu.vendor == GpuVendor::Nvidia) {
+                gpus.iter()
+                    .enumerate()
+                    .filter(|(_, gpu)| gpu.vendor == GpuVendor::Nvidia)
+                    .nth(index)
+                    .map(|(position, gpu)| (position as u32, gpu))
+            } else {
+                gpus.get(index).map(|gpu| (index as u32, gpu))
+            }
+        }
         GpuSelector::PciBusId(bdf) => gpus
             .iter()
             .enumerate()
@@ -288,6 +297,23 @@ mod tests {
             Some(2)
         );
         assert_eq!(resolve_discovered(&GpuSelector::Index(2), &dual), None);
+
+        // No NVIDIA device at all (e.g. an Intel APU laptop): the legacy
+        // ordinal falls back to the n-th device overall, so `gpu=0` still
+        // selects the (only) GPU instead of matching nothing.
+        let no_nvidia = vec![
+            gpu(GpuVendor::Intel, "0000:00:02.0"),
+            gpu(GpuVendor::Amd, "0000:01:00.0"),
+        ];
+        assert_eq!(
+            resolve_discovered(&GpuSelector::Index(0), &no_nvidia).map(|(i, g)| (i, g.vendor)),
+            Some((0, GpuVendor::Intel))
+        );
+        assert_eq!(
+            resolve_discovered(&GpuSelector::Index(1), &no_nvidia).map(|(i, g)| (i, g.vendor)),
+            Some((1, GpuVendor::Amd))
+        );
+        assert_eq!(resolve_discovered(&GpuSelector::Index(2), &no_nvidia), None);
     }
 
     #[test]
