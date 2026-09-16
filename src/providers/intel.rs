@@ -101,6 +101,21 @@ fn path_component_is_bdf(target: &str, bdf: &str) -> bool {
         .any(|c| c.as_os_str().to_string_lossy() == bdf)
 }
 
+/// A short, stable display name for a handful of well-known Intel GPU device
+/// IDs, so the panel can show e.g. `Intel Arc (Core Ultra 200V iGPU)` instead
+/// of the bare `card0` sysfs name. The kernel exposes no product name for these
+/// devices, so the map is the only name source; it is deliberately small.
+/// Unknown device IDs fall back to the card name (the pre-existing behavior),
+/// so nothing regresses and no name is invented for an unrecognized device.
+fn display_name(gpu: &DiscoveredGpu) -> String {
+    const KNOWN: &[(u16, &str)] = &[(0x64a0, "Intel Arc (Core Ultra 200V iGPU)")];
+    KNOWN
+        .iter()
+        .find(|(id, _)| *id == gpu.pci_device_id)
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| gpu.card.clone())
+}
+
 /// The directory the driver's GT sysfs attributes are read from. xe hangs them
 /// under the PCI device (`tile0/gt0/freq0`); i915 puts the root-GT attributes on
 /// the primary DRM card kobject, reachable through the card directory.
@@ -121,7 +136,7 @@ impl<S: Sys + Send> GpuProvider for IntelGpuProvider<S> {
                 available: false,
                 index: self.index,
                 device: self.gpu.device_id.clone(),
-                name: self.gpu.card.clone(),
+                name: display_name(&self.gpu),
                 error: format!("Intel GPU PCI device {bdf} not readable"),
                 ..Default::default()
             };
@@ -131,7 +146,7 @@ impl<S: Sys + Send> GpuProvider for IntelGpuProvider<S> {
             available: true,
             index: self.index,
             device: self.gpu.device_id.clone(),
-            name: self.gpu.card.clone(),
+            name: display_name(&self.gpu),
             // No utilization / memory-bandwidth / VRAM source in either driver.
             utilization: None,
             memory_utilization: None,
@@ -387,6 +402,31 @@ mod tests {
         assert_eq!(stats.memory_total_mib, None);
         assert_eq!(stats.power_w, None);
         assert_eq!(stats.fan_percent, None);
+    }
+
+    #[test]
+    fn display_name_maps_known_ids_and_falls_back_to_card() {
+        // The Core Ultra 200V APU (this machine's 0x8086:0x64a0) maps to a real
+        // name instead of the bare sysfs card name.
+        let apu = intel_gpu("xe", "0000:00:02.0", "card0");
+        let mut named = apu.clone();
+        named.pci_device_id = 0x64a0;
+        assert_eq!(
+            display_name(&named),
+            "Intel Arc (Core Ultra 200V iGPU)".to_string()
+        );
+
+        // A provider built over a known APU reports the mapped name on a real
+        // (fixture) sample, and an unknown one keeps the card name.
+        let mut sys = FixtureSys::default();
+        add_xe(&mut sys, "0000:00:02.0", Some(800), Some("none"));
+        assert_eq!(
+            provider(sys, named.clone()).sample().name,
+            "Intel Arc (Core Ultra 200V iGPU)"
+        );
+        let mut sys = FixtureSys::default();
+        add_xe(&mut sys, "0000:00:02.0", Some(800), Some("none"));
+        assert_eq!(provider(sys, apu).sample().name, "card0");
     }
 
     #[test]
