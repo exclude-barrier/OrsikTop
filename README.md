@@ -516,7 +516,7 @@ Features are added when they improve monitoring rather than simply making the TU
 
 ## Status
 
-OrsikTop is still early software. The GPU layer runs behind a vendor-neutral provider interface (NVIDIA, AMD and Intel backends), and the remaining focus is hardening (NVIDIA MIG, hardware support matrix, UX for heterogeneous hardware) rather than new vendor support.
+OrsikTop is still early software. The GPU layer runs behind a vendor-neutral provider interface (NVIDIA, AMD and Intel backends; see the [hardware support matrix](docs/HARDWARE_SUPPORT.md)), and the remaining focus is hardening (NVIDIA MIG) rather than new vendor support.
 
 Bug reports and focused feature requests are welcome through GitHub Issues.
 

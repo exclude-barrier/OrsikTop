@@ -1,0 +1,69 @@
+# Hardware support matrix
+
+Scope: which hardware and telemetry capabilities OrsikTop implements at the
+current HEAD, and which of them are live-verified versus fixture-tested only.
+The source code is the source of truth; this matrix reflects it, not the
+vendor abstractions.
+
+## Evidence levels
+
+Two levels:
+
+- **implemented** — code plus fixture tests that run in CI.
+- **live-verified** — additionally executed on real hardware.
+
+Live-verification environment for every live claim below: a dev box with an
+Intel Core Ultra 9 288V (hybrid P+E, no LP-E cores), an Intel Arc iGPU (xe
+driver, PCI `0000:00:02.0`), no NVIDIA/AMD GPU, no AMD CPU, a non-root user,
+and kernel `7.2.5-omarchy`. The opt-in live smokes are
+`discovery_real_system_smoke`, `intel_real_system_smoke`, and
+`drm_real_system_smoke` (all `#[ignore]`d, not part of CI; all three passed on
+this box).
+
+## Status values
+
+- **Supported** — implemented and live-verified where applicable.
+- **Partial** — implemented but with explicit gaps (see the last column).
+- **Unsupported** — not implemented.
+- **Untested** — implemented and fixture-tested, but never run on the target
+  hardware.
+
+A provider abstraction existing does not by itself count as support.
+
+## Matrix
+
+| Capability | Status | Evidence | Missing / why unverified |
+| --- | --- | --- | --- |
+| NVIDIA discrete GPU | Partial (Untested) | `src/providers/nvidia.rs` (NVML via `nvml-wrapper`): utilization, memory total/used/free, encoder/decoder, power, temperature, clocks, fan, PCIe link info; `sanitize()` clamps or drops non-finite values; init failure becomes an `error` string, never a fake zero; enumeration cached at construction; device resolved by UUID or PCI bus id, never a bare ordinal; fixture tests in `providers::nvidia` | Never live-verified: the dev box has no NVIDIA GPU, so `Nvml::init()` fails there and the provider degrades to empty (see `docs/S16_STAGE_SUMMARY.md` §4) |
+| AMD discrete GPU | Partial (Untested) | `src/providers/amd.rs` (amdgpu sysfs + per-BDF hwmon): `gpu_busy_percent`, `mem_info_vram_total`/`_used`, `product_name`; hwmon temperature, sclk/mclk, power, fan RPM; fixtures `samples_amd_dgpu_full_sensor_set`, `malformed_sysfs_values_degrade_to_none_not_fakes` (run in CI) | No AMD hardware on the live box |
+| Intel discrete GPU (Arc, xe/i915) | Partial | `src/providers/intel.rs`: xe per-GT sysfs graphics clock + throttle reasons; i915 root-GT `rps_cur_freq_mhz` + `throttle_reason_*` booleans (card dir, then `gt/gt0` fallback); hwmon exists only for dGfx and provides `temp1_input` + `power1_max` (PL1); by design `None`: GPU busy, memory bandwidth, VRAM total/used, instantaneous power draw, fan max; fixtures in `providers::intel` (i915 shapes built from kernel source) | Live-verified only for the xe branch on the dev box's iGPU (`intel_real_system_smoke`, `clock=Some(800.0)`); the dGfx hwmon branch and i915 are not live (no Arc dGPU on the box) |
+| Intel integrated GPU (iGPU/APU) | Supported | xe APU at `0000:00:02.0` on the dev box: all three `#[ignore]`d smokes pass (discovery, intel, drm); clock + throttle reason from GT sysfs; temperature and power limit degrade to `None` because APU iGPUs register no hwmon (documented by design, `docs/S7_STAGE_SUMMARY.md`) | — |
+| AMD integrated GPU / APU | Partial (Untested) | `src/providers/amd.rs`: VRAM is the kernel-reported system-memory carveout (`mem_info_vram_*`), reported as shared, never presented as discrete VRAM; where hwmon is absent, thermal/clock/power/fan degrade to `None`; fixtures cover the carveout shape | No AMD APU hardware |
+| NVIDIA MIG | Unsupported | No MIG code exists; the only MIG reference in `src/` is a comment at `src/gpu_map.rs:14` ("also capturing MIG placements"); no NVML MIG API calls | Planned as stage S17 (README hardening section) |
+| Multi-GPU systems | Partial (Untested) | Discovery enumerates every display-class PCI GPU, sorted by BDF (fixture `discovery::discovers_intel_xe_igpu_and_amd_dgpu_sorted_by_bdf`); `GpuSelector::Index(n)` is the n-th NVIDIA on mixed machines and the n-th overall on NVIDIA-less machines (`src/gpu.rs` `resolve_discovered`, `docs/S1_S4_STAGE_SUMMARY.md`); multi-GPU process evidence yields `GpuMapping::Multi` (fixture `multi_gpu_when_process_opens_two_render_nodes`) | The live box is single-GPU |
+| Heterogeneous GPU systems | Partial (Untested) | Mixed-vendor discovery + per-vendor provider dispatch is fixture-tested (the iGPU+dGPU discovery fixture above); `Auto` selects the first NVIDIA, else the first device (`src/gpu.rs` `resolve_discovered`) | Never run on a mixed-vendor machine |
+| Intel hybrid CPU (P + E cores) | Supported | `src/cpu.rs` `detect_topology`: hybrid-PMU cpumasks (`/sys/devices/cpu_core|cpu_atom|cpu_lowpower/cpus`), disjoint masks, each CPU in exactly one class → P/E/LP-E; live (`docs/S10_STAGE_SUMMARY.md`): P=4 E=4 LP=0, hybrid=true, matching sysfs on the 288V. LP-E (third class): implemented + fixture-tested (`fixture_detects_low_power_group_disjoint_from_atom`); UI renders the P/E minibar for two classes, LP-E via heatmap suffix + `+nL` title | LP-E not live: no LP-E cores on this box |
+| Conventional Intel CPU | Partial | Same topology pipeline; non-hybrid shapes covered by `cpu::fixture_tests` (`cpu_capacity` fallback, SMT sibling heuristic); vendor/model from `/proc/cpuinfo`; cpufreq/hwmon paths are vendor-neutral | The live box is a hybrid Intel; an all-P Intel has not been live-tested |
+| AMD CPU | Partial (Untested) | Vendor-neutral `/proc/cpuinfo` vendor/model; cpufreq + hwmon temperature walkers include AMD sensor names (`k10temp`, `zenpower`, `x86_pkg` — `src/cpu_sensors.rs`); no hybrid-PMU files → `cpu_capacity` fallback → SMT heuristic; fixtures in `cpu::fixture_tests` | No AMD CPU on the live box |
+| cpufreq | Supported | `src/cpu_sensors.rs`: per-policy frequencies, weighted average across policies (not per-core); live (`docs/S11_STAGE_SUMMARY.md`): `freq=Some(1505.9)` MHz | — |
+| hwmon temperatures / fans / power (CPU) | Partial | Temperature live on this box (coretemp, 46.0 °C; preferred package/Tctl over per-core; −20..150 °C range filter, out-of-range dropped, not clamped); power via RAPL (next row) — live result here is `None` (non-root); CPU fans: **not implemented** (no fan reading exists in `src/cpu_sensors.rs`). GPU fans: AMD hwmon fan RPM + NVIDIA NVML fan are implemented (both untested live); Intel has no fan telemetry (`None` by design) | CPU fan telemetry missing; power `None` under non-root (RAPL row) |
+| RAPL | Partial | Fully implemented: `/sys/class/powercap` `intel-rapl`, two `energy_uj` reads across a bounded ~50 ms window (kernel `udelay` bound where present); fixtures `power_none_without_rapl`, `power_none_when_energy_counter_unreadable` | `power=None` on the dev box because `energy_uj` is root-only (`0400 root:root`) and OrsikTop runs non-root (`docs/S11_STAGE_SUMMARY.md` §4); reports real watts under root or on a world-readable kernel |
+| DRM/sysfs discovery | Supported | `src/discovery.rs`: `/sys/class/drm` → PCI device dir, PCI class base 0x03 required, results sorted by BDF (enumeration order is never identity); vendor from driver binding (`nvidia`/`amdgpu`/`i915`/`xe`) else PCI vendor ID (0x10de/0x1002/0x8086); live: `discovery_real_system_smoke` on the xe card | — |
+| DRM fdinfo per-process telemetry | Supported | `src/drm.rs`: `/proc/<pid>/fd` → filter symlinks to `/dev/dri/*`, read `/proc/<pid>/fdinfo/<fd>`, parse canonical `drm-*` keys; per-BDF resident/total bytes, per-engine `busy_ns` or `cycles_busy/cycles_total` → derived utilization; baseline state pruned each cycle; 13 fixture tests + `drm_real_system_smoke` (observed the display server's DRM fds) | — |
+| Stable PCI BDF / UUID identity | Supported | `src/domain.rs` `DeviceId`: PCI BDF primary, vendor UUID secondary; `card0` names and NVML ordinals are never identity; enumeration is BDF-sorted; BDF live on this box | UUID resolution goes through NVML enumeration only (NVIDIA), so the UUID half is untested live |
+| llama.cpp server discovery | Partial (Untested) | `src/discovery_llm.rs`: `/proc` cmdline scan for `llama-server` / `llama serve`, endpoint from `--host`/`--port` args, deterministic order (lowest port, then endpoint string) — never by PID — de-duplicated, all candidates kept; configured `server=` honored via `ServerSource::Configured`; no live reachability probe (S15) | No llama-server runs on the dev box; only the no-server degradation was exercised (binary smoke, `docs/S15_STAGE_SUMMARY.md` / `docs/S16_STAGE_SUMMARY.md`) |
+| llama.cpp → GPU mapping | Partial (Untested) | `src/gpu_map.rs`: render-fd evidence (the process's open `/dev/dri` nodes) + NVML compute-app evidence, de-duplicated by stable key; explicit Single/Multi/Unknown states (`src/domain.rs`, `Default == None`); surfaced in the TUI by S23 (commit `88a7efc`: "LLM" chip on the GPU panel + `GPU <BDF/UUID>` line in the LLM panel); 12 `gpu_map::tests` + domain tests | NVML evidence branch not live (no NVIDIA), and no live server was ever mapped |
+| Multi-slot / parallel llama.cpp | Partial (Untested) | Slot-based sampling of a single server via `/slots` (slot-based live TPS, S14); multiple local servers are represented as candidates, switchable via `server=` (S15); one active `LlamaMonitor` follows the selected endpoint (`src/app.rs` `spawn_llm_worker`); no simultaneous polling of multiple servers | No live server on the dev box |
+| Unavailable/unsupported telemetry fallback | Supported | Project invariant: missing metric → `None` → rendered "—", never a fake 0. NVML init failure → `error` string; malformed sysfs → `None` (`malformed_sysfs_values_degrade_to_none_not_fakes`); non-root RAPL → `None` (observed live on this box); APU without hwmon → temp/power `None` (observed live on this box) | — |
+
+## Gaps → future work
+
+Items that should become engineering tasks:
+
+- Live verification on NVIDIA hardware (NVML provider, UUID identity, NVML half of server→GPU mapping) — needs a machine with a discrete NVIDIA GPU.
+- Live verification on AMD hardware (amdgpu dGPU + APU providers, AMD CPU sensor names) — needs AMD hardware.
+- Live verification of i915 + Intel Arc dGPU hwmon branch — needs that hardware; xe is already live.
+- NVIDIA MIG support — stage S17 (no code today).
+- CPU fan telemetry — not implemented.
+- RAPL under root (or world-readable `energy_uj`) — implemented, needs a root deployment to be live-verified.
+- Live llama.cpp validation: server discovery, GPU mapping, `/slots` sampling on a running server — stage S24 territory.
