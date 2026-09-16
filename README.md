@@ -15,7 +15,7 @@ It is designed for people running local models with `llama.cpp` who want the imp
 
 > Orsik = fantasy ork. Local models need tokens. Orks need more power.
 
-<img width="1440" alt="OrsikTop dashboard" src="assets/orsiktop.png" />
+<img width="1568" alt="OrsikTop dashboard" src="assets/orsiktop.png" />
 
 ## Quick start
 
