@@ -1448,26 +1448,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
     }
 
     if inner.height >= 11 {
-        if llm.spec_enabled {
-            let draft = format!("{} draft", grouped_f64(llm.spec_draft_tokens));
-            let accepted = match spec_total_acceptance {
-                Some(rate) => format!(
-                    "{} accepted · {rate:.1}%",
-                    grouped_f64(llm.spec_accepted_tokens)
-                ),
-                None => format!("{} accepted", grouped_f64(llm.spec_accepted_tokens)),
-            };
-            lines.push(Line::from(vec![
-                label_span(" SPEC TOK   "),
-                llm_metric_cell(&draft, metric_width, CYAN, false),
-                llm_metric_cell(&accepted, metric_width, ORK_GREEN, false),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                label_span(" SPEC       "),
-                value_span("OFF", MUTED),
-            ]));
-        }
+        lines.push(llm_spec_row(llm, metric_width, spec_total_acceptance));
     }
 
     if inner.height >= 12 {
@@ -1691,6 +1672,41 @@ fn compact_rate(value: f64) -> String {
     } else {
         format!("{value:.1}")
     }
+}
+
+fn llm_spec_row(
+    llm: &LlmStats,
+    metric_width: usize,
+    spec_total_acceptance: Option<f64>,
+) -> Line<'static> {
+    if !llm.spec_enabled {
+        return Line::from(vec![label_span(" SPEC       "), value_span("OFF", MUTED)]);
+    }
+    if llm.spec_drafts_total == 0.0
+        && llm.spec_draft_tokens == 0.0
+        && llm.spec_accepted_tokens == 0.0
+    {
+        // Counters exist only in llama-server >= b10700; an enabled run that
+        // reports all zeros means the server predates them, not a broken read.
+        return Line::from(vec![
+            label_span(" SPEC TOK   "),
+            llm_metric_cell("no data (server < b10700)", metric_width, MUTED, false),
+            llm_metric_cell("—", metric_width, MUTED, false),
+        ]);
+    }
+    let draft = format!("{} draft", grouped_f64(llm.spec_draft_tokens));
+    let accepted = match spec_total_acceptance {
+        Some(rate) => format!(
+            "{} accepted · {rate:.1}%",
+            grouped_f64(llm.spec_accepted_tokens)
+        ),
+        None => format!("{} accepted", grouped_f64(llm.spec_accepted_tokens)),
+    };
+    Line::from(vec![
+        label_span(" SPEC TOK   "),
+        llm_metric_cell(&draft, metric_width, CYAN, false),
+        llm_metric_cell(&accepted, metric_width, ORK_GREEN, false),
+    ])
 }
 
 fn llm_metric_cell(text: &str, width: usize, color: Color, bold: bool) -> Span<'static> {
@@ -4945,6 +4961,43 @@ mod tests {
         let (phase, color) = llm_phase(&stats);
         assert_eq!(phase, "IDLE");
         assert_eq!(color, MUTED);
+    }
+
+    #[test]
+    fn spec_row_hints_when_enabled_but_counters_unavailable() {
+        let llm = LlmStats {
+            spec_enabled: true,
+            ..LlmStats::default()
+        };
+        let row = llm_spec_row(&llm, 24, None);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("no data (server < b10700)"), "row: {text:?}");
+        assert!(text.contains("SPEC"));
+    }
+
+    #[test]
+    fn spec_row_shows_values_when_any_counter_reported() {
+        let llm = LlmStats {
+            spec_enabled: true,
+            spec_drafts_total: 3.0,
+            spec_draft_tokens: 12.0,
+            spec_accepted_tokens: 9.0,
+            ..LlmStats::default()
+        };
+        let row = llm_spec_row(&llm, 24, Some(75.0));
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("12 draft"), "row: {text:?}");
+        assert!(text.contains("9 accepted · 75.0%"), "row: {text:?}");
+        assert!(!text.contains("b10700"));
+    }
+
+    #[test]
+    fn spec_row_off_when_disabled() {
+        let llm = LlmStats::default();
+        let row = llm_spec_row(&llm, 24, None);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("OFF"), "row: {text:?}");
+        assert!(!text.contains("b10700"));
     }
 
     #[test]
