@@ -1753,6 +1753,18 @@ fn system_panel_height(system: &SystemStats) -> u16 {
     13
 }
 
+/// Whether the SYSTEM panel renders the full view (fixed telemetry rows + the
+/// per-core section: the P/E minibar on hybrid boxes, the per-core heatmap
+/// otherwise) rather than the 4-line compact fallback. The width floor is what
+/// the minibar columns need; the height floor is the minimum full-view content
+/// (7 fixed rows + the minibar header + one core row). It must stay at or
+/// below the smallest full-view allocation so short hybrid boxes — e.g. a
+/// 4P+4E Core Ultra with `inner.height` 12 — still get the P/E minibar instead
+/// of silently collapsing to the compact view.
+fn system_full_view(width: u16, height: u16) -> bool {
+    width >= 35 && height >= 9
+}
+
 fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     let block = Block::default()
         .title(system_panel_title(&system.cpu_topology, area.width))
@@ -1771,7 +1783,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     );
     let bar_width = inner.width.saturating_sub(16).max(8) as usize;
 
-    if inner.width < 35 || inner.height < 15 {
+    if !system_full_view(inner.width, inner.height) {
         let mut lines = vec![
             meter_line(
                 "CPU",
@@ -5038,5 +5050,91 @@ mod tests {
         assert!(enc_dec_idle(&gpu(Some(0.5), None)));
         assert!(!enc_dec_idle(&gpu(Some(1.0), None)));
         assert!(!enc_dec_idle(&gpu(None, Some(5.0))));
+    }
+
+    fn hybrid_system(perf: usize, eff: usize) -> SystemStats {
+        let mut core_kinds = Vec::new();
+        let mut physical_core_groups = Vec::new();
+        for i in 0..perf {
+            core_kinds.push(CpuCoreKind::Performance);
+            physical_core_groups.push(CpuPhysicalCore {
+                kind: CpuCoreKind::Performance,
+                logical_cpus: vec![i],
+            });
+        }
+        for i in 0..eff {
+            core_kinds.push(CpuCoreKind::Efficiency);
+            physical_core_groups.push(CpuPhysicalCore {
+                kind: CpuCoreKind::Efficiency,
+                logical_cpus: vec![perf + i],
+            });
+        }
+        SystemStats {
+            cpu_topology: CpuTopology {
+                core_kinds,
+                physical_core_groups,
+                ..CpuTopology::default()
+            },
+            ..SystemStats::default()
+        }
+    }
+
+    #[test]
+    fn small_hybrid_box_keeps_the_full_view_with_the_minibar() {
+        // Regression: a 4P+4E Core Ultra (the 288V) allocated
+        // `system_panel_height` = 14 → inner 12, which the old hard-coded
+        // `inner.height < 15` gate rejected, collapsing the panel to the
+        // 4-line compact view and hiding the P/E minibar entirely. The 8P+8E
+        // box (12900K) survived because inner 16 >= 15.
+        let small = hybrid_system(4, 4);
+        assert_eq!(system_panel_height(&small), 14);
+        assert!(
+            system_full_view(35, 14 - 2),
+            "4P+4E inner height 12 must be the full view"
+        );
+
+        let wide = hybrid_system(8, 8);
+        assert_eq!(system_panel_height(&wide), 18);
+        assert!(
+            system_full_view(35, 18 - 2),
+            "8P+8E inner height 16 must stay the full view"
+        );
+
+        // Homogeneous boxes (panel 13 → inner 11) render the full view with
+        // the per-core heatmap too.
+        let homo = SystemStats::default();
+        assert_eq!(system_panel_height(&homo), 13);
+        assert!(system_full_view(35, 13 - 2));
+
+        // Below the full-view floors the compact fallback wins: the minibar
+        // needs the 35-column floor, and 8 rows cannot hold the fixed rows
+        // plus a core row.
+        assert!(!system_full_view(34, 20));
+        assert!(!system_full_view(60, 8));
+    }
+
+    #[test]
+    fn rendered_system_panel_shows_the_pe_minibar_on_a_small_hybrid_box() {
+        // End-to-end regression for the 288V report: paint the real SYSTEM
+        // panel at the size the layout allocates for a 4P+4E box (panel
+        // height 14, inner 12) and assert the P/E minibar renders — it used
+        // to fall through to the compact 4-line view.
+        let system = hybrid_system(4, 4);
+        let area = Rect::new(0, 0, 70, system_panel_height(&system));
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_system(frame, area, &system))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("P-CORES") && text.contains("E-CORES"),
+            "P/E minibar header must render, got:\n{text}",
+        );
     }
 }
