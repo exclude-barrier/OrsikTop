@@ -106,6 +106,7 @@ pub fn run(
                 &snapshot.system,
                 &snapshot.llm,
                 &snapshot.gpu,
+                &snapshot.gpu_map,
                 &mut ui_state,
                 &server,
                 refresh_ms,
