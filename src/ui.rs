@@ -15,7 +15,7 @@ use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        GpuSelector, GpuStats, LlmStats, ProcessIdentity, ProcessStats, SystemStats,
+        GpuMapping, GpuSelector, GpuStats, LlmStats, ProcessIdentity, ProcessStats, SystemStats,
         MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
@@ -811,6 +811,7 @@ pub fn draw(
     system: &SystemStats,
     llm: &LlmStats,
     gpu: &GpuStats,
+    gpu_map: &GpuMapping,
     state: &mut UiState,
     server: &str,
     refresh_ms: u64,
@@ -858,8 +859,8 @@ pub fn draw(
     };
 
     draw_header(frame, rows[0], llm, state, server, refresh_ms, server_auto);
-    draw_gpu(frame, rows[1], gpu);
-    draw_llm_and_system(frame, rows[2], system, llm, state);
+    draw_gpu(frame, rows[1], gpu, gpu_map);
+    draw_llm_and_system(frame, rows[2], system, llm, state, gpu_map);
 
     if show_history {
         draw_bottom(frame, rows[3], state, &system.processes);
@@ -974,14 +975,41 @@ fn enc_dec_idle(gpu: &GpuStats) -> bool {
     enc_idle && dec_idle
 }
 
-fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats) {
+/// True when the shown GPU is one the inference server is attributed to.
+///
+/// Identity is `DeviceId::key()` (BDF, then UUID). `None`/`Unknown`
+/// mappings and GPUs without a stable key never match — no fake "LLM".
+fn gpu_in_mapping(gpu: &GpuStats, map: &GpuMapping) -> bool {
+    let key = gpu.device.key();
+    if key.is_empty() {
+        return false;
+    }
+    match map {
+        GpuMapping::Single(m) => m.key() == key,
+        GpuMapping::Multi(ms) => ms.iter().any(|m| m.key() == key),
+        GpuMapping::None | GpuMapping::Unknown => false,
+    }
+}
+
+fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &GpuMapping) {
     let idle = enc_dec_idle(gpu);
-    let title = if gpu.available {
+    let base_title = if gpu.available {
         format!(" GPU{} · {} ", gpu.index, gpu.name)
     } else if gpu.error.is_empty() {
         format!(" GPU{} · unavailable ", gpu.index)
     } else {
         format!(" GPU · {} ", gpu.error)
+    };
+    let title: Line<'static> = if gpu_in_mapping(gpu, gpu_map) {
+        Line::from(vec![
+            Span::raw(base_title),
+            Span::styled(
+                "LLM",
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(Span::raw(base_title))
     };
 
     let block = Block::default()
@@ -1189,17 +1217,18 @@ fn draw_llm_and_system(
     system: &SystemStats,
     llm: &LlmStats,
     state: &UiState,
+    gpu_map: &GpuMapping,
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
-    draw_llm(frame, cols[0], llm, state);
+    draw_llm(frame, cols[0], llm, state, gpu_map);
     draw_system(frame, cols[1], system);
 }
 
-fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
+fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_map: &GpuMapping) {
     let block = Block::default()
         .title(" LLM INFERENCE ")
         .borders(Borders::ALL)
@@ -1351,6 +1380,18 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState) {
             Span::raw("  "),
             value_span(&mtp, mtp_color),
         ];
+    }
+    let gpu_hint = match gpu_map {
+        GpuMapping::Single(m) => Some(m),
+        GpuMapping::Multi(ms) => ms.first(),
+        GpuMapping::None | GpuMapping::Unknown => None,
+    };
+    if inner.width >= 103 {
+        if let Some(m) = gpu_hint {
+            state_line.push(llm_sep());
+            state_line.push(label_span("GPU "));
+            state_line.push(value_span(&fit_cell(m.key(), 16), CYAN));
+        }
     }
 
     let total_line = vec![
@@ -4182,6 +4223,7 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{DeviceId, GpuEvidence, GpuVendor, MappedGpu};
 
     #[test]
     fn same_named_processes_are_grouped_with_aggregate_metrics() {
@@ -5188,6 +5230,96 @@ mod tests {
         assert!(
             text.contains("P-CORES") && text.contains("E-CORES"),
             "P/E minibar header must render, got:\n{text}",
+        );
+    }
+
+    #[test]
+    fn gpu_in_mapping_matches_only_the_mapped_device() {
+        let gpu = GpuStats {
+            device: DeviceId::new(Some("0000:01:00.0".into()), None),
+            ..Default::default()
+        };
+
+        let mapped = MappedGpu {
+            device: gpu.device.clone(),
+            name: "card0".to_string(),
+            vendor: GpuVendor::Nvidia,
+            evidence: GpuEvidence::NvmlCompute,
+        };
+        let other = MappedGpu {
+            device: DeviceId::new(Some("0000:02:00.0".into()), None),
+            ..mapped.clone()
+        };
+
+        assert!(gpu_in_mapping(&gpu, &GpuMapping::Single(mapped.clone())));
+        assert!(gpu_in_mapping(
+            &gpu,
+            &GpuMapping::Multi(vec![other.clone(), mapped])
+        ));
+        assert!(!gpu_in_mapping(&gpu, &GpuMapping::Single(other)));
+        assert!(!gpu_in_mapping(&gpu, &GpuMapping::None));
+        assert!(!gpu_in_mapping(&gpu, &GpuMapping::Unknown));
+
+        // A GPU without a stable key never matches — even against a mapping
+        // entry that is itself unkeyed.
+        let unkeyed = GpuStats::default();
+        let unkeyed_map = MappedGpu {
+            device: DeviceId::default(),
+            name: "card1".to_string(),
+            vendor: GpuVendor::Amd,
+            evidence: GpuEvidence::RenderNodeFd,
+        };
+        assert!(!gpu_in_mapping(&unkeyed, &GpuMapping::Single(unkeyed_map)));
+    }
+
+    #[test]
+    fn gpu_panel_title_shows_the_llm_chip_when_mapped() {
+        let gpu = GpuStats {
+            available: true,
+            name: "RTX 4090".to_string(),
+            device: DeviceId::new(Some("0000:01:00.0".into()), None),
+            ..Default::default()
+        };
+        let mapped = MappedGpu {
+            device: gpu.device.clone(),
+            name: "card0".to_string(),
+            vendor: GpuVendor::Nvidia,
+            evidence: GpuEvidence::NvmlCompute,
+        };
+        let area = Rect::new(0, 0, 40, 7);
+
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_gpu(frame, area, &gpu, &GpuMapping::Single(mapped)))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("LLM"),
+            "mapped GPU title must carry the LLM chip, got:\n{text}",
+        );
+
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_gpu(frame, area, &gpu, &GpuMapping::None))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !text.contains("LLM"),
+            "unmapped GPU title must not carry the LLM chip, got:\n{text}",
         );
     }
 }

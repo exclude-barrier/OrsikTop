@@ -25,8 +25,7 @@ pub struct GpuStats {
     /// NVML (or vendor) enumeration index of the sampled device, for display.
     pub index: u32,
     /// Stable device identity (PCI BDF and/or vendor UUID), when known.
-    /// Rendered in the heterogeneous-hardware UX pass (S23).
-    #[allow(dead_code)]
+    /// Drives the LLM chip in the GPU panel title (S23).
     pub device: DeviceId,
     /// Vendor model name.
     pub name: String,
