@@ -2,6 +2,20 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [0.2.3] - 2026-09-16
+
+### Fixed
+
+- A bare-number GPU selection (`gpu=0`, `--gpu 0`, `--gpu-index 0`) no longer
+  reports `no GPU matches the selection` on machines **without** an NVIDIA
+  GPU. Since 0.2.1 the number meant the n-th *NVIDIA* device (the legacy
+  NVML ordinal); on an NVIDIA-less box (e.g. an Intel APU laptop) that matched
+  nothing and a legacy `gpu=0` config broke. The NVIDIA-ordinal
+  interpretation is now used only when an NVIDIA GPU is present; otherwise it
+  falls back to the n-th device overall (the pre-0.2.1 behavior). Boxes with
+  an NVIDIA GPU are unaffected: `gpu=0` still selects the first NVIDIA device
+  even when an iGPU is BDF-sorted first.
+
 ## [0.2.2] - 2026-09-16
 
 ### Changed

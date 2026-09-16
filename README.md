@@ -157,7 +157,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.2.2 x86_64-unknown-linux-gnu
+downloading orsiktop 0.2.3 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -185,7 +185,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.2.2
+orsiktop 0.2.3
 ```
 
 You can then start OrsikTop with `orsiktop`.
@@ -388,7 +388,7 @@ Available one-off overrides for a single run:
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
 | `--server` | `ORSIKTOP_SERVER` | llama.cpp endpoint; disables auto discovery for that run |
-| `--gpu` | `ORSIKTOP_GPU` | GPU by PCI BDF (any vendor), vendor UUID (NVIDIA) or a bare number (n-th NVIDIA GPU, NVML ordinal) |
+| `--gpu` | `ORSIKTOP_GPU` | GPU by PCI BDF (any vendor), vendor UUID (NVIDIA) or a bare number (n-th NVIDIA GPU; on NVIDIA-less machines the n-th device overall) |
 | `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy n-th NVIDIA GPU index (prefer `--gpu`) |
 
 Examples:
