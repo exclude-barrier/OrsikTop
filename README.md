@@ -9,7 +9,7 @@
 [![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-supported-5C6BC0)](https://github.com/ggml-org/llama.cpp)
 
-OrsikTop is a Rust TUI that shows **local LLM inference, NVIDIA GPU telemetry, Linux system load and processes** in one terminal dashboard.
+OrsikTop is a Rust TUI that shows **local LLM inference, GPU telemetry (NVIDIA, AMD, Intel), Linux system load and processes** in one terminal dashboard.
 
 It is designed for people running local models with `llama.cpp` who want the important inference and system metrics visible without a browser, daemon, database or account.
 
@@ -19,7 +19,7 @@ It is designed for people running local models with `llama.cpp` who want the imp
 
 ## Quick start
 
-You need Linux on `x86_64`, an NVIDIA GPU with a working NVIDIA driver, a recent `llama.cpp`, and `curl` for the installer. Rust is **not** required.
+You need Linux on `x86_64`, a GPU with a working driver (NVIDIA, AMD, or Intel), a recent `llama.cpp`, and `curl` for the installer. Rust is **not** required.
 
 **1. Install OrsikTop:**
 
@@ -72,23 +72,29 @@ OrsikTop reads llama.cpp telemetry and displays:
 
 `/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
 
-### NVIDIA GPU
+### GPU
 
-GPU telemetry is read directly through NVML. OrsikTop does **not** spawn `nvidia-smi` on every refresh.
+GPU telemetry is read through a vendor-neutral provider layer: NVIDIA via NVML
+(no `nvidia-smi` subprocesses on every refresh), AMD via the amdgpu kernel
+sysfs and hwmon, Intel via the i915/xe sysfs and hwmon. OrsikTop discovers
+GPUs from Linux DRM/sysfs and picks the backend from the device's vendor.
+
+Depending on the vendor and driver, the available metrics include:
 
 - GPU utilization
-- VRAM used / total
+- VRAM used / total (discrete GPUs)
 - memory-controller utilization
 - graphics and memory clocks
 - temperature
 - power draw and enforced power limit
-- P-state
+- P-state and throttle reasons
 - fan speed
 - encoder / decoder utilization
 - PCIe RX / TX throughput
 - 60-second GPU and VRAM history
 
-Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes.
+Metrics the driver does not expose are shown as unavailable (`—`) instead of
+false zeroes.
 
 ### Linux system
 
@@ -102,7 +108,9 @@ Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes
 
 ### Processes
 
-- process list with CPU, memory and thread counts
+- process list with CPU, memory, thread counts and resident GPU memory
+- per-process GPU usage from DRM fdinfo (per-engine utilization, resident
+  memory) when the driver exposes it
 - sorting by PID, program, CPU, memory or threads
 - processes with the same program name grouped together
 - right-click groups to expand / collapse them
@@ -113,16 +121,19 @@ Unsupported NVML fields are shown as unavailable (`—`) instead of false zeroes
 
 ## Supported stack
 
-OrsikTop currently focuses on a deliberately narrow setup:
+OrsikTop targets a deliberately focused setup:
 
 - Linux
 - `x86_64` prebuilt releases
-- NVIDIA GPUs through NVML
+- NVIDIA GPUs through NVML, AMD GPUs/APUs through the amdgpu kernel
+  interface, Intel GPUs/APUs through i915/xe and hwmon
 - `llama.cpp` (`llama-server` or `llama serve`)
 - local or manually configured llama.cpp endpoints
 - terminal-first, low-overhead monitoring
 
-Broader GPU vendors, operating systems and inference backends are not the current focus. The GPU layer already sits behind a vendor-neutral provider interface (NVIDIA NVML is the first backend).
+The GPU layer runs behind a vendor-neutral provider interface: discovery
+comes from Linux DRM/sysfs, and each device is sampled by the backend that
+matches its vendor.
 
 ## Installation
 
@@ -146,7 +157,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.1.4 x86_64-unknown-linux-gnu
+downloading orsiktop 0.2.0 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -174,7 +185,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.1.4
+orsiktop 0.2.0
 ```
 
 You can then start OrsikTop with `orsiktop`.
@@ -368,6 +379,7 @@ Subcommands:
 | Command | Effect |
 | --- | --- |
 | `orsiktop update` | Updates a standalone installation to the latest release |
+| `orsiktop diag` | Prints a no-secrets diagnostics summary for bug reports |
 | `orsiktop uninstall` | Removes the standalone binaries, keeps the config |
 | `orsiktop uninstall --purge` | Removes the binaries and the config directory |
 
@@ -376,9 +388,8 @@ Available one-off overrides for a single run:
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
 | `--server` | `ORSIKTOP_SERVER` | llama.cpp endpoint; disables auto discovery for that run |
-| `--interval-ms`, `-i` | `ORSIKTOP_INTERVAL_MS` | main telemetry refresh interval |
-| `--gpu` | `ORSIKTOP_GPU` | NVIDIA GPU by PCI BDF, vendor UUID or legacy index |
-| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy NVIDIA GPU index (prefer `--gpu`) |
+| `--gpu` | `ORSIKTOP_GPU` | GPU by PCI BDF (any vendor) or vendor UUID (NVIDIA) |
+| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy positional index (prefer `--gpu`) |
 
 Examples:
 
@@ -432,15 +443,20 @@ orsiktop --server http://HOST:PORT
 
 ### GPU data is unavailable
 
-OrsikTop loads NVIDIA NVML dynamically through `nvml-wrapper`. A normal NVIDIA Linux driver installation provides NVML.
+OrsikTop discovers GPUs from Linux DRM/sysfs and reads each device's native
+interface: NVIDIA through NVML (loaded dynamically via `nvml-wrapper`, no
+`nvidia-smi` subprocesses), AMD and Intel through their kernel sysfs and
+hwmon. A normal vendor driver installation provides these interfaces.
 
-Check that your NVIDIA driver is working:
+Check that your driver is working:
 
 ```bash
-nvidia-smi
+nvidia-smi            # NVIDIA
+cat /sys/class/drm/card*/device/vendor   # any vendor (0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel)
 ```
 
-OrsikTop does not bundle NVIDIA drivers or NVML libraries.
+Metrics the driver does not expose are shown as `—` (unavailable) rather than
+false zeroes. OrsikTop does not bundle GPU drivers or vendor libraries.
 
 ## Release integrity
 
@@ -463,17 +479,25 @@ cargo build --release --locked
 
 ```text
 src/
-├── main.rs      terminal setup, CLI and updater entry point
-├── config.rs    persistent runtime settings
-├── domain.rs    normalized, vendor-neutral telemetry models
-├── app.rs       event loop and telemetry workers
-├── llama.rs     llama.cpp /metrics, /slots and /props
-├── discovery.rs vendor-neutral GPU discovery (Linux DRM/sysfs)
-├── providers/   GpuProvider interface and vendor backends
-│   └── nvidia.rs  NVIDIA NVML backend
-├── gpu.rs       GPU provider factory and PCIe link math
-├── cpu.rs       CPU topology / Linux CPU helpers
-└── ui.rs        ratatui rendering, controls and histories
+├── main.rs         terminal setup, CLI, subcommands and updater entry point
+├── config.rs       persistent runtime settings
+├── domain.rs       normalized, vendor-neutral telemetry models
+├── app.rs          event loop and telemetry workers
+├── llama.rs        llama.cpp /metrics, /slots, /props and server discovery
+├── discovery.rs    vendor-neutral GPU discovery (Linux DRM/sysfs)
+├── discovery_llm.rs  llama.cpp server discovery (processes + config)
+├── gpu_map.rs      llama.cpp server → GPU(s) mapping
+├── drm.rs          per-process GPU usage from DRM fdinfo
+├── providers/      GpuProvider interface and vendor backends
+│   ├── nvidia.rs    NVIDIA NVML backend
+│   ├── amd.rs       AMD amdgpu sysfs + hwmon backend
+│   └── intel.rs     Intel i915/xe sysfs + hwmon backend
+├── gpu.rs          GPU provider factory and PCIe link math
+├── cpu.rs          CPU topology (hybrid P/E/LP classification)
+├── cpu_sensors.rs  CPU frequency, temperature and RAPL power
+├── diagnostics.rs  `orsiktop diag` bug-report summary
+├── system.rs       filesystem abstraction (real + fixture)
+└── ui.rs           ratatui rendering, controls and histories
 ```
 
 GPU/system sampling and llama.cpp HTTP polling run independently. A slow `/metrics` or `/slots` response therefore does not block keyboard/mouse input or fast GPU updates.
@@ -492,7 +516,7 @@ Features are added when they improve monitoring rather than simply making the TU
 
 ## Status
 
-OrsikTop is still early software. The current implementation is intentionally focused on **llama.cpp + NVIDIA + Linux** before adding broader backend or platform support. The GPU layer already runs behind a vendor-neutral provider interface, so AMD and Intel backends can be added without changing the UI or the sampling loop.
+OrsikTop is still early software. The GPU layer runs behind a vendor-neutral provider interface (NVIDIA, AMD and Intel backends), and the remaining focus is hardening (NVIDIA MIG, hardware support matrix, UX for heterogeneous hardware) rather than new vendor support.
 
 Bug reports and focused feature requests are welcome through GitHub Issues.
 
