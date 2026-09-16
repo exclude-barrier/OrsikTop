@@ -8,17 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::DeviceId;
+use crate::domain::{DeviceId, GpuVendor};
 use crate::system::Sys;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GpuVendor {
-    Nvidia,
-    Amd,
-    Intel,
-    Other,
-    Unknown,
-}
 
 /// A GPU discovered through DRM sysfs, before any vendor telemetry.
 #[derive(Clone, Debug, PartialEq, Eq)]

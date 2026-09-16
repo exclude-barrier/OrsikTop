@@ -1,14 +1,29 @@
 use std::{
     fs,
     path::Path,
+    thread,
     time::{Duration, Instant},
 };
 
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, StatusCode};
 use serde_json::Value;
 
 const PROPS_REFRESH: Duration = Duration::from_secs(30);
 const SPEC_ACCEPTANCE_HOLD: Duration = Duration::from_secs(3);
+/// How often the local llama-server process is re-scanned for its
+/// spec-decoding config (CLI args + two env vars). The scan reads every
+/// `/proc/<pid>/cmdline`, so it is amortized over a window instead of
+/// running on every 250 ms sample. The config of a running server process
+/// is static for its lifetime, so a 30 s window only costs a re-scan when
+/// the server restarts (a new PID) and picks up the new config promptly.
+const SPEC_REFRESH: Duration = Duration::from_secs(30);
+/// Connect timeout for a single llama.cpp request. Kept well below the total
+/// request timeout so a dead or unrouted endpoint fails fast instead of
+/// stalling the poll cycle; the connect phase of a local server takes
+/// milliseconds.
+const LLM_CONNECT_TIMEOUT_MS: u64 = 750;
+/// Total (connect + response) timeout for a single llama.cpp request.
+const LLM_REQUEST_TIMEOUT_MS: u64 = 1200;
 
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
@@ -95,12 +110,24 @@ pub struct LlamaMonitor {
     props: CachedProps,
     last_spec_acceptance_pct: Option<f64>,
     last_spec_acceptance_at: Option<Instant>,
+    /// Set when a /props fetch failed so the next sample retries it. A
+    /// failure must not extend the 30 s refresh window; otherwise the first
+    /// failed refresh would delay the model/context data for a full window.
+    props_dirty: bool,
+    /// Cached result of the local llama-server process scan (spec-decoding
+    /// config from CLI args + env vars). `Some(config)` is a successful scan;
+    /// `None` is a successful scan that found no local server. The scan is
+    /// amortized over `SPEC_REFRESH` (tracked by `local_spec_scanned_at`)
+    /// instead of running on every 250 ms sample.
+    local_spec: Option<LocalSpeculativeConfig>,
+    local_spec_scanned_at: Option<Instant>,
 }
 
 impl LlamaMonitor {
     pub fn new(server: &str) -> Result<Self, reqwest::Error> {
         let client = Client::builder()
-            .timeout(Duration::from_millis(1200))
+            .connect_timeout(Duration::from_millis(LLM_CONNECT_TIMEOUT_MS))
+            .timeout(Duration::from_millis(LLM_REQUEST_TIMEOUT_MS))
             .build()?;
 
         Ok(Self {
@@ -111,14 +138,40 @@ impl LlamaMonitor {
             props: CachedProps::default(),
             last_spec_acceptance_pct: None,
             last_spec_acceptance_at: None,
+            props_dirty: true,
+            local_spec: None,
+            local_spec_scanned_at: None,
         })
     }
 
     pub fn sample(&mut self) -> LlmStats {
         let mut stats = LlmStats::default();
 
-        if self.props_needs_refresh() {
-            self.refresh_props();
+        // /props, /metrics and /slots are independent endpoints, so fetch them
+        // concurrently: the poll cycle is bounded by the slowest single request
+        // instead of the sum of the three. /props is amortized to the 30 s
+        // refresh window; when it is due it runs alongside the other two.
+        let fetch_props = self.props_needs_refresh();
+        let (props_result, metrics_result, slots_result) = thread::scope(|scope| {
+            let client = &self.client;
+            let base = &self.base;
+            let props_handle = if fetch_props {
+                Some(scope.spawn(move || fetch_json(client, format!("{base}/props"))))
+            } else {
+                None
+            };
+            let metrics_handle = scope.spawn(move || fetch_raw(client, format!("{base}/metrics")));
+            let slots_handle = scope.spawn(move || fetch_json(client, format!("{base}/slots")));
+
+            (
+                props_handle.map(|handle| handle.join().unwrap()),
+                metrics_handle.join().unwrap(),
+                slots_handle.join().unwrap(),
+            )
+        });
+
+        if let Some(props_result) = props_result {
+            self.apply_props_result(props_result);
         }
         stats.model = self.props.model.clone();
         stats.context_size = self.props.context_size;
@@ -127,7 +180,7 @@ impl LlamaMonitor {
         stats.spec_is_mtp = self.props.spec_is_mtp;
         stats.spec_n_max = self.props.spec_n_max;
 
-        if let Some(local_spec) = local_speculative_process_config(&self.base) {
+        if let Some(local_spec) = self.local_spec_config() {
             stats.spec_enabled |= local_spec.enabled;
             stats.spec_is_mtp |= local_spec.is_mtp;
             if stats.spec_n_max.is_none() {
@@ -135,23 +188,21 @@ impl LlamaMonitor {
             }
         }
 
-        let metrics_text = match self.client.get(format!("{}/metrics", self.base)).send() {
-            Ok(response) if response.status().is_success() => match response.text() {
-                Ok(text) => text,
-                Err(err) => {
-                    stats.error = format!("metrics response error: {err}");
-                    return stats;
-                }
-            },
-            Ok(response) => {
-                stats.error = if response.status().as_u16() == 501 {
+        let metrics_text = match metrics_result {
+            MetricsOutcome::Ok(text) => text,
+            MetricsOutcome::Http(status) => {
+                stats.error = if status == StatusCode::NOT_IMPLEMENTED {
                     "/metrics disabled; start llama.cpp with --metrics".to_string()
                 } else {
-                    format!("/metrics returned HTTP {}", response.status())
+                    format!("/metrics returned HTTP {status}")
                 };
                 return stats;
             }
-            Err(err) => {
+            MetricsOutcome::Body(err) => {
+                stats.error = format!("metrics response error: {err}");
+                return stats;
+            }
+            MetricsOutcome::Unreachable(err) => {
                 stats.error = format!("cannot reach llama.cpp: {err}");
                 return stats;
             }
@@ -243,7 +294,7 @@ impl LlamaMonitor {
         }
 
         let metric_live = self.update_metric_counters(&mut stats);
-        match self.apply_slots(&mut stats) {
+        match self.apply_slots_outcome(&mut stats, slots_result) {
             Some(slots) => self.update_live_slot_throughput(&mut stats, slots),
             None => {
                 stats.prompt_tps = metric_live.0;
@@ -260,24 +311,45 @@ impl LlamaMonitor {
     }
 
     fn props_needs_refresh(&self) -> bool {
-        self.props
-            .last_refresh
-            .map(|at| at.elapsed() >= PROPS_REFRESH)
-            .unwrap_or(true)
+        self.props_dirty
+            || self
+                .props
+                .last_refresh
+                .map(|at| at.elapsed() >= PROPS_REFRESH)
+                .unwrap_or(true)
     }
 
-    fn refresh_props(&mut self) {
-        self.props.last_refresh = Some(Instant::now());
-
-        let Ok(response) = self.client.get(format!("{}/props", self.base)).send() else {
-            return;
-        };
-        if !response.status().is_success() {
-            return;
+    /// Returns the cached local-server spec config, re-scanning `/proc` only
+    /// when the `SPEC_REFRESH` window has elapsed (or never scanned). For
+    /// non-loopback endpoints the scan is skipped entirely (returns `None`),
+    /// matching `local_speculative_process_config`. The result — including
+    /// "no local server found" — is cached for the window, so a dead local
+    /// server does not cost a `/proc` walk on every 250 ms sample.
+    fn local_spec_config(&mut self) -> Option<LocalSpeculativeConfig> {
+        let due = self
+            .local_spec_scanned_at
+            .map(|at| at.elapsed() >= SPEC_REFRESH)
+            .unwrap_or(true);
+        if due {
+            self.local_spec = local_speculative_process_config(&self.base);
+            self.local_spec_scanned_at = Some(Instant::now());
         }
-        let Ok(props) = response.json::<Value>() else {
-            return;
+        self.local_spec
+    }
+
+    fn apply_props_result(&mut self, outcome: JsonOutcome) {
+        let props = match outcome {
+            JsonOutcome::Ok(props) => props,
+            // A failed /props refresh must not extend the 30 s window: the
+            // next sample retries while the cached props keep being shown.
+            JsonOutcome::Http(..) | JsonOutcome::Unreachable(..) | JsonOutcome::Invalid(..) => {
+                self.props_dirty = true;
+                return;
+            }
         };
+
+        self.props_dirty = false;
+        self.props.last_refresh = Some(Instant::now());
 
         self.props.context_size = json_u64_path(&props, &["default_generation_settings", "n_ctx"])
             .or_else(|| json_u64_path(&props, &["n_ctx"]))
@@ -372,23 +444,22 @@ impl LlamaMonitor {
         self.previous_slots.slots = slots;
     }
 
-    fn apply_slots(&self, stats: &mut LlmStats) -> Option<Vec<SlotCounter>> {
-        let response = match self.client.get(format!("{}/slots", self.base)).send() {
-            Ok(response) => response,
-            Err(err) => {
+    fn apply_slots_outcome(
+        &self,
+        stats: &mut LlmStats,
+        outcome: JsonOutcome,
+    ) -> Option<Vec<SlotCounter>> {
+        let value = match outcome {
+            JsonOutcome::Ok(value) => value,
+            JsonOutcome::Unreachable(err) => {
                 stats.slots_error = format!("cannot reach /slots: {err}");
                 return None;
             }
-        };
-
-        if !response.status().is_success() {
-            stats.slots_error = format!("/slots returned HTTP {}", response.status());
-            return None;
-        }
-
-        let value = match response.json::<Value>() {
-            Ok(value) => value,
-            Err(err) => {
+            JsonOutcome::Http(status) => {
+                stats.slots_error = format!("/slots returned HTTP {status}");
+                return None;
+            }
+            JsonOutcome::Invalid(err) => {
                 stats.slots_error = format!("invalid /slots response: {err}");
                 return None;
             }
@@ -401,6 +472,58 @@ impl LlamaMonitor {
                 None
             }
         }
+    }
+}
+
+/// The outcome of a /metrics fetch: the raw body on success, the non-success
+/// status, or the transport/body error that made the endpoint unreachable or
+/// unreadable.
+enum MetricsOutcome {
+    Ok(String),
+    Http(StatusCode),
+    Body(String),
+    Unreachable(String),
+}
+
+/// The outcome of a JSON endpoint fetch (/props, /slots): the parsed value on
+/// success, the non-success status, a body-read/parse error, or the transport
+/// error that made the endpoint unreachable.
+enum JsonOutcome {
+    Ok(Value),
+    Http(StatusCode),
+    Invalid(String),
+    Unreachable(String),
+}
+
+/// Fetches a raw text endpoint (currently only /metrics).
+fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
+    let response = match client.get(url).send() {
+        Ok(response) => response,
+        Err(err) => return MetricsOutcome::Unreachable(err.to_string()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return MetricsOutcome::Http(status);
+    }
+    match response.text() {
+        Ok(body) => MetricsOutcome::Ok(body),
+        Err(err) => MetricsOutcome::Body(err.to_string()),
+    }
+}
+
+/// Fetches a JSON endpoint (/props, /slots).
+fn fetch_json(client: &Client, url: String) -> JsonOutcome {
+    let response = match client.get(url).send() {
+        Ok(response) => response,
+        Err(err) => return JsonOutcome::Unreachable(err.to_string()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return JsonOutcome::Http(status);
+    }
+    match response.json::<Value>() {
+        Ok(value) => JsonOutcome::Ok(value),
+        Err(err) => JsonOutcome::Invalid(err.to_string()),
     }
 }
 
@@ -770,6 +893,80 @@ fn model_display_name(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn props_failure_retries_next_sample() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+
+        // A failed /props fetch must not extend the 30 s refresh window, so
+        // the next sample retries while the cached props keep being shown.
+        assert!(monitor.props_needs_refresh());
+        monitor.apply_props_result(JsonOutcome::Unreachable("connect error".into()));
+        assert!(monitor.props_dirty);
+        assert!(monitor.props_needs_refresh());
+
+        // A successful fetch clears the dirty flag and populates the cache.
+        let props = json!({
+            "model_name": "/models/Qwen3-4B-Q4_K_M.gguf",
+            "total_slots": 2,
+            "default_generation_settings": { "n_ctx": 4096 }
+        });
+        monitor.apply_props_result(JsonOutcome::Ok(props));
+        assert!(!monitor.props_dirty);
+        assert_eq!(monitor.props.model, "Qwen3-4B-Q4_K_M");
+        assert_eq!(monitor.props.context_size, 4096);
+        assert_eq!(monitor.props.total_slots, 2);
+    }
+
+    #[test]
+    fn local_spec_config_is_cached_within_the_refresh_window() {
+        // A non-loopback endpoint never triggers the /proc scan: the result
+        // is None and the window starts on the first call. A second call
+        // within the window returns the cached None without rescanning
+        // (the timestamp is unchanged, proving no new scan ran).
+        let mut monitor = LlamaMonitor::new("http://10.0.0.7:9090").unwrap();
+        assert!(monitor.local_spec_config().is_none());
+        let first = monitor.local_spec_scanned_at.expect("scan timestamp set");
+        assert!(monitor.local_spec_config().is_none());
+        assert_eq!(
+            monitor.local_spec_scanned_at,
+            Some(first),
+            "cached value, no rescan"
+        );
+    }
+
+    #[test]
+    fn slots_outcome_maps_to_error_or_counters() {
+        let monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+
+        // A failed /slots fetch degrades gracefully: it sets slots_error and
+        // does not touch the previous-slot counters or mark the slot set
+        // unavailable.
+        let mut stats = LlmStats::default();
+        let slots =
+            monitor.apply_slots_outcome(&mut stats, JsonOutcome::Http(StatusCode::NOT_FOUND));
+        assert!(slots.is_none());
+        assert!(!stats.slots_available);
+        assert_eq!(stats.slots_error, "/slots returned HTTP 404 Not Found");
+
+        let mut stats = LlmStats::default();
+        let slots = monitor.apply_slots_outcome(
+            &mut stats,
+            JsonOutcome::Unreachable("connection refused".into()),
+        );
+        assert!(slots.is_none());
+        assert!(!stats.slots_available);
+        assert_eq!(stats.slots_error, "cannot reach /slots: connection refused");
+
+        // A valid /slots payload populates the counters and clears any error.
+        let value = json!([{ "id": 0, "task_id": 1, "state": "busy" }]);
+        let mut stats = LlmStats::default();
+        let slots = monitor.apply_slots_outcome(&mut stats, JsonOutcome::Ok(value));
+        assert!(slots.is_some());
+        assert!(stats.slots_available);
+        assert_eq!(stats.slot_count, 1);
+        assert!(stats.slots_error.is_empty());
+    }
 
     #[test]
     fn parses_current_llama_metrics_fixture() {

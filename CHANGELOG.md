@@ -4,6 +4,74 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- AMD GPU/APU telemetry backend (`src/providers/amd.rs`) reading the amdgpu
+  sysfs and its hwmon: utilization, memory bandwidth, VRAM total/used, package
+  temperature, power draw, GPU/memory clocks, and fan.
+- Intel GPU/APU telemetry backend (`src/providers/intel.rs`) reading the i915 and
+  xe kernel sysfs plus the Intel hwmon: graphics clock (MHz) and throttle reason
+  from the GT sysfs, package temperature and the PL1 power limit from the hwmon.
+  `new_gpu_provider` now dispatches NVIDIA → NVML, AMD → amdgpu sysfs, Intel →
+  i915/xe sysfs, choosing the backend from the *discovered device's* vendor.
+- Process-level GPU telemetry via DRM fdinfo (`src/drm.rs`): for every process
+  holding a DRM render node, per-engine utilization (i915/amdgpu busy-nanoseconds
+  over wall time; xe busy/total cycles) and resident GPU memory, one entry per
+  PCI BDF. The wide process table gains a `GPU` resident-memory column (`—` when
+  the process has no DRM fd); compact mode is unchanged.
+- Intel low-power E-core (LP-E) classification: the kernel's `cpu_lowpower`
+  perf-PMU mask (mutually disjoint from `cpu_core`/`cpu_atom`) now yields a
+  distinct `LowPower` core kind, counted in the new `low_power_cores`
+  topology field. The CPU heatmap marks LP cores with an `L` suffix and the
+  panel title appends `+{n}L` when LP cores are present; P/E-only boxes are
+  unchanged.
+- CPU sensor telemetry (`src/cpu_sensors.rs`): the SYSTEM panel now reports CPU
+  frequency, temperature, and package power. Frequency is the cpufreq
+  `scaling_cur_freq` weighted average across policies (falling back to
+  `/proc/cpuinfo` `cpu MHz`); temperature is the CPU hwmon package/Tctl reading
+  (per-core fallback); power is the RAPL `intel-rapl` package zone read twice a
+  short window apart. Sensor discovery runs once and is cached; samples only
+  re-read the dynamic counters. An unavailable metric (no cpufreq, no CPU
+  hwmon, or a root-only `energy_uj` counter) reports an explicit `None` and
+  renders as `—`, never a fake zero. `SystemStats` gains `cpu_power_w`.
+- `orsiktop diag` subcommand: a human-readable, no-secrets diagnostics dump for
+  bug reports. It prints CPU topology (vendor/model/logical/physical, P/E/LP-E
+  classes, hybrid state, per-core kinds), DRM GPU discovery (card, BDF,
+  vendor/device IDs, PCI class, driver, render node, outputs), the one-shot
+  `Auto` provider capability matrix (which normalized metrics the chosen backend
+  can expose vs. report `None`), CPU sensor discovery, and llama.cpp
+  endpoint/server discovery plus the computed server→GPU mapping. Missing data is
+  an explicit `—`/`not computed`/`unknown` state, never a fake zero; process
+  evidence is PID-only (command lines are never printed), and the only network
+  contact is one bounded read-only probe of the resolved llama endpoint.
+
+### Changed
+
+- GPU utilization, memory-bandwidth utilization, and VRAM used/total in
+  `GpuStats` are now explicit `Option`s. A vendor whose driver does not expose a
+  given metric (e.g. Intel has no GPU-busy counter, no VRAM figures, no
+  instantaneous power, or no fan-speed maximum in sysfs) reports `None` — an
+  honest "unavailable" — instead of a fake `0.0`. The UI renders these as `—`.
+- Adaptive sampling: CPU temperature and RAPL power now update on a separate
+  1 s cadence and are reused on the 250 ms system cycles, instead of
+  resampling (and, for power, blocking ~50 ms for the RAPL two-read window)
+  every 250 ms. CPU frequency, usage, load and memory keep the fast cadence;
+  GPU, process-table, and llama.cpp polling cadences are unchanged. A fast UI
+  refresh no longer forces the slow sensor sources to run at that rate.
+- Owned worker shutdown: the two telemetry workers (system/GPU and
+  llama.cpp) are now joined after `stop` is set, with a bounded (5 s) wait,
+  so the process exits with both workers verified-stopped instead of detached.
+  The render loop and exit path never block on a worker longer than that
+  bound.
+- `orsiktop update` no longer blocks forever if the `orsiktop-update` helper
+  hangs: the updater now runs under a bounded 10 minute deadline (polling
+  `try_wait`), and a hung process is terminated and reported instead of
+  wedging the command.
+- The local llama-server spec-decoding probe (CLI args + the two
+  spec-decoding env vars, loopback endpoints only) is cached per
+  `LlamaMonitor` and re-scanned at most every 30 s, instead of re-walking
+  `/proc` on every 250 ms LLM sample.
+
 ## [0.1.4] - 2026-09-15
 
 ### Changed

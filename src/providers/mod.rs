@@ -5,6 +5,8 @@
 //! ever see [`GpuProvider`] + [`GpuStats`]; they never reference a vendor API.
 //! Missing metrics stay `None` (explicit "unavailable"), never fake zeroes.
 
+pub mod amd;
+pub mod intel;
 pub mod nvidia;
 
 use crate::domain::DeviceId;
@@ -12,8 +14,10 @@ use crate::domain::DeviceId;
 /// Normalized per-sample GPU telemetry, vendor-agnostic.
 ///
 /// `None` fields mean the provider/driver does not expose that metric.
-/// `utilization`/`memory_*` default to 0.0 (an idle GPU really is at 0%);
-/// everything else is optional because many devices lack the sensor.
+/// `utilization` and the `memory_*` fields are `Option`: NVIDIA and AMD expose
+/// them, but neither Intel driver (i915, xe) surfaces a GPU busy counter or VRAM
+/// total/used through sysfs, so those report `None` — explicitly "unavailable",
+/// never a fake zero.
 #[derive(Clone, Debug, Default)]
 pub struct GpuStats {
     /// True when a device was sampled this cycle (even if some metrics are missing).
@@ -26,14 +30,14 @@ pub struct GpuStats {
     pub device: DeviceId,
     /// Vendor model name.
     pub name: String,
-    /// GPU core utilization, 0..=100.
-    pub utilization: f64,
-    /// Memory bandwidth utilization, 0..=100.
-    pub memory_utilization: f64,
-    /// Used VRAM in MiB.
-    pub memory_used_mib: f64,
-    /// Total VRAM in MiB.
-    pub memory_total_mib: f64,
+    /// GPU core utilization, 0..=100, when the driver exposes a busy counter.
+    pub utilization: Option<f64>,
+    /// Memory bandwidth utilization, 0..=100, when exposed.
+    pub memory_utilization: Option<f64>,
+    /// Used VRAM in MiB, when exposed.
+    pub memory_used_mib: Option<f64>,
+    /// Total VRAM in MiB, when exposed.
+    pub memory_total_mib: Option<f64>,
     /// GPU temperature in °C.
     pub temperature_c: Option<f64>,
     /// Instantaneous power draw in W.

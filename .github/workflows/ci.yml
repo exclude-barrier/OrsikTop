@@ -42,4 +42,8 @@ jobs:
           denyWarnings: true
 
       - name: CLI smoke test
-        run: cargo run --locked -- --help
+        run: |
+          cargo run --locked -- --help
+          # `diag` reads the real /sys, /proc and runs one bounded llama probe;
+          # on a headless runner (no GPU, no server) it must still exit 0.
+          cargo run --locked -- diag
