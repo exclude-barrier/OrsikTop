@@ -2,6 +2,24 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Intel GPU/APU panels now show a short, real device name for a known
+  device ID instead of the bare `card0` sysfs name (e.g. `Intel Arc (Core
+  Ultra 200V iGPU)`). The kernel exposes no product name for these devices, so
+  the map is intentionally small; unknown device IDs keep the previous `cardN`
+  name — nothing regresses and no name is invented.
+
+### Note
+
+- On an Intel APU (e.g. Core Ultra iGPU) the xe driver exposes only the
+  graphics clock and throttle reason; utilization, VRAM, temperature, power,
+  fan, and PCIe have no value source and are shown as `—` (unavailable), never
+  as a fake zero. This is driver behavior, not a detection failure — the GPU
+  is detected and its available metrics are shown.
+
 ## [0.2.1] - 2026-09-16
 
 ### Fixed
