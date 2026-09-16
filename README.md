@@ -388,8 +388,8 @@ Available one-off overrides for a single run:
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
 | `--server` | `ORSIKTOP_SERVER` | llama.cpp endpoint; disables auto discovery for that run |
-| `--gpu` | `ORSIKTOP_GPU` | GPU by PCI BDF (any vendor) or vendor UUID (NVIDIA) |
-| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy positional index (prefer `--gpu`) |
+| `--gpu` | `ORSIKTOP_GPU` | GPU by PCI BDF (any vendor), vendor UUID (NVIDIA) or a bare number (n-th NVIDIA GPU, NVML ordinal) |
+| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy n-th NVIDIA GPU index (prefer `--gpu`) |
 
 Examples:
 
