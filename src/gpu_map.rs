@@ -25,7 +25,7 @@ use std::path::Path;
 use nvml_wrapper::Nvml;
 
 use crate::discovery::DiscoveredGpu;
-use crate::domain::{DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu};
+use crate::domain::{normalize_pci_bdf, DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu};
 use crate::system::Sys;
 
 /// Parse the PCI BDF embedded in a DRM **by-path** name
@@ -149,7 +149,11 @@ pub fn nvml_compute_gpus(nvml: Option<&Nvml>, pid: u32) -> Vec<String> {
         };
         if procs.iter().any(|p| p.pid == pid) {
             // Prefer the PCI BDF (comparable with the DRM path), else UUID.
-            if let Some(bdf) = device.pci_info().ok().map(|pci| pci.bus_id) {
+            if let Some(bdf) = device
+                .pci_info()
+                .ok()
+                .map(|pci| normalize_pci_bdf(&pci.bus_id))
+            {
                 keys.push(bdf);
             } else if let Ok(uuid) = device.uuid() {
                 keys.push(uuid);
@@ -435,6 +439,23 @@ mod tests {
         };
         assert_eq!(device.key(), "0000:41:00.0");
         assert_eq!(device.evidence, GpuEvidence::NvmlCompute);
+    }
+
+    #[test]
+    fn nvml_eight_digit_bdf_unifies_with_discovered_device() {
+        let gpus = gpu_list(&["0000:41:00.0"]);
+        // NVML reports the 8-digit domain form; ingress normalization
+        // (nvml_compute_gpus) yields the canonical key before combining.
+        let nvml = vec![normalize_pci_bdf("00000000:41:00.0")];
+        let mapping = map_server_gpus(true, vec![], nvml, &gpus);
+        let GpuMapping::Single(device) = mapping else {
+            panic!("expected Single, got {mapping:?}");
+        };
+        assert_eq!(device.key(), "0000:41:00.0");
+        assert_eq!(device.evidence, GpuEvidence::NvmlCompute);
+        // Name and vendor resolve from the discovered device.
+        assert_eq!(device.name, "card0");
+        assert_eq!(device.vendor, GpuVendor::Amd);
     }
 
     #[test]
