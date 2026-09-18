@@ -10,8 +10,8 @@
 //!   resident memory) is implemented in [`crate::drm`] (S8).
 //! * **NVIDIA NVML compute processes** — NVML reports the process as a running
 //!   compute client of a specific device
-//!   (`nvmlDeviceGetComputeRunningProcesses`), authoritative for NVIDIA and
-//!   also capturing MIG placements.
+//!   (`nvmlDeviceGetComputeRunningProcesses`), authoritative for NVIDIA,
+//!   including per-instance MIG placements.
 //!
 //! The result is a [`GpuMapping`] with explicit states (one / multiple /
 //! unknown) so a missing or ambiguous device is never faked.
@@ -26,6 +26,7 @@ use nvml_wrapper::Nvml;
 
 use crate::discovery::DiscoveredGpu;
 use crate::domain::{normalize_pci_bdf, DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu};
+use crate::providers::nvidia::MigChild;
 use crate::system::Sys;
 
 /// Parse the PCI BDF embedded in a DRM **by-path** name
@@ -51,20 +52,6 @@ fn bdf_from_by_path_name(name: &str) -> Option<&str> {
         return None;
     }
     Some(bdf)
-}
-
-/// True when `key` is a PCI BDF of the form `dddd:bb:dd.f`.
-fn is_bdf(key: &str) -> bool {
-    let bytes = key.as_bytes();
-    bytes.len() == 12
-        && (0..4).all(|i| bytes[i].is_ascii_hexdigit())
-        && bytes[4] == b':'
-        && (5..7).all(|i| bytes[i].is_ascii_hexdigit())
-        && bytes[7] == b':'
-        && (8..10).all(|i| bytes[i].is_ascii_hexdigit())
-        && bytes[10] == b'.'
-        && bytes[11].is_ascii_digit()
-        && bytes[11] <= b'7'
 }
 
 /// PCI BDFs of the discovered GPUs that the process has an open DRM render
@@ -123,15 +110,33 @@ pub fn process_render_gpus<S: Sys>(sys: &S, pid: u32, gpus: &[DiscoveredGpu]) ->
     result
 }
 
-/// Stable keys (PCI BDF, else vendor UUID) of the NVML devices on which `pid`
-/// is a running compute process.
+/// Stable identities of the NVML devices on which `pid` is a running
+/// compute process — one per NVML placement of the process.
 ///
 /// Enumerates every NVML device once and asks each whether `pid` appears in
 /// its `running_compute_processes()`. A CUDA process is reported on exactly
 /// the device(s) it has allocated, so this is authoritative for NVIDIA.
-/// Returns an empty vec when NVML is unavailable (non-NVIDIA host, no driver)
-/// or on any per-device error — the caller treats that as "no NVML evidence".
-pub fn nvml_compute_gpus(nvml: Option<&Nvml>, pid: u32) -> Vec<String> {
+///
+/// MIG: NVML reports a GPU/compute instance id per placement. When the
+/// placement carries instance ids and a MIG child's identity carries the
+/// same ids, the placement is attributed to that child; every other
+/// placement (MIG disabled, no instance evidence, or no matching child) is
+/// attributed to the physical parent. One placement yields exactly one
+/// identity, so a process is never mapped to both a MIG child and its
+/// parent.
+///
+/// `mig_children` is the MIG topology captured once at startup
+/// ([`crate::providers::nvidia::discover_mig_children`]); the per-scan path
+/// never re-probes it, so no static NVML call rides the refresh cadence.
+///
+/// Returns an empty vec when NVML is unavailable (non-NVIDIA host, no
+/// driver) or on any per-device error — the caller treats that as "no NVML
+/// evidence".
+pub fn nvml_compute_gpus(
+    nvml: Option<&Nvml>,
+    pid: u32,
+    mig_children: &[MigChild],
+) -> Vec<DeviceId> {
     let Some(nvml) = nvml else {
         return Vec::new();
     };
@@ -147,20 +152,63 @@ pub fn nvml_compute_gpus(nvml: Option<&Nvml>, pid: u32) -> Vec<String> {
         let Some(procs) = device.running_compute_processes().ok() else {
             continue;
         };
-        if procs.iter().any(|p| p.pid == pid) {
-            // Prefer the PCI BDF (comparable with the DRM path), else UUID.
-            if let Some(bdf) = device
+        let entries: Vec<(Option<u32>, Option<u32>)> = procs
+            .iter()
+            .filter(|p| p.pid == pid)
+            .map(|p| (p.gpu_instance_id, p.compute_instance_id))
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        let parent = DeviceId::new(
+            device
                 .pci_info()
                 .ok()
                 .map(|pci| normalize_pci_bdf(&pci.bus_id))
-            {
-                keys.push(bdf);
-            } else if let Ok(uuid) = device.uuid() {
-                keys.push(uuid);
-            }
+                .filter(|id| !id.is_empty()),
+            device.uuid().ok().filter(|u| !u.is_empty()),
+        );
+        if parent.key().is_empty() {
+            continue;
         }
+        let children: Vec<(String, Option<(u32, u32)>)> =
+            if entries.iter().any(|(gi, ci)| gi.is_some() || ci.is_some()) {
+                mig_children
+                    .iter()
+                    .filter(|c| c.parent_index == index)
+                    .map(|c| (c.key.clone(), c.instance()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        keys.extend(attribute_process_keys(&parent, &children, &entries));
     }
     keys
+}
+
+/// Attribute each NVML placement of one process on one physical device to a
+/// stable identity. A placement whose MIG instance ids match a child's
+/// identity yields that child's identity; any other placement yields the
+/// parent's identity.
+fn attribute_process_keys(
+    parent: &DeviceId,
+    children: &[(String, Option<(u32, u32)>)],
+    entries: &[(Option<u32>, Option<u32>)],
+) -> Vec<DeviceId> {
+    entries
+        .iter()
+        .map(|entry| match *entry {
+            (Some(gi), Some(ci)) => {
+                let instance = Some((gi, ci));
+                children
+                    .iter()
+                    .find(|(_, child_instance)| *child_instance == instance)
+                    .map(|(key, _)| DeviceId::new(None, Some(key.clone())))
+                    .unwrap_or_else(|| parent.clone())
+            }
+            _ => parent.clone(),
+        })
+        .collect()
 }
 
 /// Combine render-node and NVML evidence into a [`GpuMapping`].
@@ -171,7 +219,7 @@ pub fn nvml_compute_gpus(nvml: Option<&Nvml>, pid: u32) -> Vec<String> {
 /// as its own entry (never merged with another unkeyed device).
 pub fn combine_gpus(
     render: Vec<DeviceId>,
-    nvml: Vec<String>,
+    nvml: Vec<DeviceId>,
     gpus: &[DiscoveredGpu],
 ) -> GpuMapping {
     // (stable key, mapped device). Render nodes first so their evidence
@@ -211,13 +259,12 @@ pub fn combine_gpus(
         insert(&mut merged, key, device.clone(), GpuEvidence::RenderNodeFd);
     }
 
-    for key in &nvml {
-        let device = if is_bdf(key) {
-            DeviceId::new(Some(key.clone()), None)
-        } else {
-            DeviceId::new(None, Some(key.clone()))
-        };
-        insert(&mut merged, key.clone(), device, GpuEvidence::NvmlCompute);
+    for device in &nvml {
+        let key = device.key().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        insert(&mut merged, key, device.clone(), GpuEvidence::NvmlCompute);
     }
 
     merged.sort_by(|a, b| a.0.cmp(&b.0));
@@ -239,7 +286,7 @@ pub fn combine_gpus(
 pub fn map_server_gpus(
     server_running: bool,
     render: Vec<DeviceId>,
-    nvml: Vec<String>,
+    nvml: Vec<DeviceId>,
     gpus: &[DiscoveredGpu],
 ) -> GpuMapping {
     if !server_running {
@@ -433,7 +480,12 @@ mod tests {
     fn nvml_evidence_alone_maps_single_gpu() {
         let gpus = gpu_list(&["0000:41:00.0"]);
         // No render fd evidence, but NVML reports the pid on that BDF.
-        let mapping = map_server_gpus(true, vec![], vec!["0000:41:00.0".into()], &gpus);
+        let mapping = map_server_gpus(
+            true,
+            vec![],
+            vec![DeviceId::new(Some("0000:41:00.0".into()), None)],
+            &gpus,
+        );
         let GpuMapping::Single(device) = mapping else {
             panic!("expected Single, got {mapping:?}");
         };
@@ -446,7 +498,10 @@ mod tests {
         let gpus = gpu_list(&["0000:41:00.0"]);
         // NVML reports the 8-digit domain form; ingress normalization
         // (nvml_compute_gpus) yields the canonical key before combining.
-        let nvml = vec![normalize_pci_bdf("00000000:41:00.0")];
+        let nvml = vec![DeviceId::new(
+            Some(normalize_pci_bdf("00000000:41:00.0")),
+            None,
+        )];
         let mapping = map_server_gpus(true, vec![], nvml, &gpus);
         let GpuMapping::Single(device) = mapping else {
             panic!("expected Single, got {mapping:?}");
@@ -462,7 +517,12 @@ mod tests {
     fn nvml_uuid_evidence_maps_single_gpu() {
         let gpus = Vec::new();
         // NVML-only device (not DRM-discovered) keyed by UUID.
-        let mapping = map_server_gpus(true, vec![], vec!["GPU-abc123".into()], &gpus);
+        let mapping = map_server_gpus(
+            true,
+            vec![],
+            vec![DeviceId::new(None, Some("GPU-abc123".into()))],
+            &gpus,
+        );
         let GpuMapping::Single(device) = mapping else {
             panic!("expected Single, got {mapping:?}");
         };
@@ -475,7 +535,7 @@ mod tests {
     fn render_and_nvml_agree_on_same_device() {
         let gpus = gpu_list(&["0000:01:00.0"]);
         let render = vec![DeviceId::new(Some("0000:01:00.0".into()), None)];
-        let nvml = vec!["0000:01:00.0".to_string()];
+        let nvml = vec![DeviceId::new(Some("0000:01:00.0".into()), None)];
         let mapping = map_server_gpus(true, render, nvml, &gpus);
         // Deduped to a single device; render evidence wins.
         let GpuMapping::Single(device) = mapping else {
@@ -488,7 +548,10 @@ mod tests {
     #[test]
     fn nvml_multi_device_yields_multi() {
         let gpus = gpu_list(&["0000:41:00.0", "0000:42:00.0"]);
-        let nvml = vec!["0000:41:00.0".into(), "0000:42:00.0".into()];
+        let nvml = vec![
+            DeviceId::new(Some("0000:41:00.0".into()), None),
+            DeviceId::new(Some("0000:42:00.0".into()), None),
+        ];
         let mapping = map_server_gpus(true, vec![], nvml, &gpus);
         let GpuMapping::Multi(devices) = mapping else {
             panic!("expected Multi, got {mapping:?}");
@@ -500,7 +563,7 @@ mod tests {
     fn combine_dedupes_by_stable_key() {
         let gpus = gpu_list(&["0000:01:00.0"]);
         let render = vec![DeviceId::new(Some("0000:01:00.0".into()), None)];
-        let nvml = vec!["0000:01:00.0".to_string()];
+        let nvml = vec![DeviceId::new(Some("0000:01:00.0".into()), None)];
         let combined = combine_gpus(render, nvml, &gpus);
         assert_eq!(combined.len(), Some(1));
     }
@@ -522,5 +585,81 @@ mod tests {
         assert_eq!(bdf_from_by_path_name("pci-0000:01:00.8-render"), None);
         // No pci- prefix.
         assert_eq!(bdf_from_by_path_name("renderD128"), None);
+    }
+
+    #[test]
+    fn attribute_mig_child_when_instance_evidence_matches() {
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        let children = vec![("MIG-GPU-parent-1-0".to_string(), Some((1, 0)))];
+        let keys = attribute_process_keys(&parent, &children, &[(Some(1), Some(0))]);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key(), "MIG-GPU-parent-1-0");
+    }
+
+    #[test]
+    fn attribute_degrades_to_parent_when_no_child_matches() {
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        let children = vec![("MIG-GPU-parent-1-0".to_string(), Some((1, 0)))];
+        let keys = attribute_process_keys(&parent, &children, &[(Some(2), Some(0))]);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key(), "0000:41:00.0");
+    }
+
+    #[test]
+    fn attribute_non_mig_placement_uses_parent() {
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        let keys = attribute_process_keys(&parent, &[], &[(None, None)]);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key(), "0000:41:00.0");
+    }
+
+    #[test]
+    fn attribute_multiple_mig_placements_yield_each_child() {
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        let children = vec![
+            ("MIG-GPU-parent-1-0".to_string(), Some((1, 0))),
+            ("MIG-GPU-parent-2-0".to_string(), Some((2, 0))),
+        ];
+        let keys = attribute_process_keys(
+            &parent,
+            &children,
+            &[(Some(1), Some(0)), (Some(2), Some(0))],
+        );
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key(), "MIG-GPU-parent-1-0");
+        assert_eq!(keys[1].key(), "MIG-GPU-parent-2-0");
+    }
+
+    #[test]
+    fn mig_child_evidence_maps_to_single_child() {
+        let gpus = gpu_list(&["0000:41:00.0"]);
+        let nvml = vec![DeviceId::new(None, Some("MIG-GPU-parent-1-0".into()))];
+        let mapping = map_server_gpus(true, vec![], nvml, &gpus);
+        let GpuMapping::Single(device) = mapping else {
+            panic!("expected Single, got {mapping:?}");
+        };
+        assert_eq!(device.key(), "MIG-GPU-parent-1-0");
+        assert_eq!(device.evidence, GpuEvidence::NvmlCompute);
+        // MIG children are not DRM-discovered: name stays empty, vendor unknown.
+        assert_eq!(device.name, "");
+        assert_eq!(device.vendor, GpuVendor::Unknown);
+    }
+
+    #[test]
+    fn combine_mig_child_and_parent_are_distinct_devices() {
+        let gpus = gpu_list(&["0000:41:00.0"]);
+        // A process cannot occupy a MIG child and its parent at once; the
+        // combiner must still keep both identities distinct.
+        let nvml = vec![
+            DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into())),
+            DeviceId::new(None, Some("MIG-GPU-parent-1-0".into())),
+        ];
+        let mapping = map_server_gpus(true, vec![], nvml, &gpus);
+        let GpuMapping::Multi(devices) = mapping else {
+            panic!("expected Multi, got {mapping:?}");
+        };
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].key(), "0000:41:00.0");
+        assert_eq!(devices[1].key(), "MIG-GPU-parent-1-0");
     }
 }

@@ -103,6 +103,43 @@ impl DeviceId {
             .or(self.uuid.as_deref())
             .unwrap_or("")
     }
+
+    /// `(gpu_instance_id, compute_instance_id)` when this is a MIG child
+    /// whose UUID carries them (`MIG-GPU-<parent>-<gi>-<ci>`). Synthetic
+    /// fallback keys carry no instance ids, so this is `None` for them.
+    pub fn mig_instance(&self) -> Option<(u32, u32)> {
+        let value = self.uuid.as_deref()?;
+        if !is_mig_uuid(value) {
+            return None;
+        }
+        let parts: Vec<&str> = value.rsplit('-').take(2).collect();
+        let ci = parts[0].parse::<u32>().ok()?;
+        let gi = parts[1].parse::<u32>().ok()?;
+        Some((gi, ci))
+    }
+
+    /// The physical parent's GPU UUID when this is a MIG child. For a real
+    /// MIG UUID (`MIG-GPU-<parent>-<gi>-<ci>`) this strips the `MIG-`
+    /// prefix and the instance ids; for a synthetic fallback key
+    /// (`<parent-uuid>#mig-<slot>`) it strips the suffix.
+    pub fn mig_parent_uuid(&self) -> Option<String> {
+        let value = self.uuid.as_deref()?;
+        if let Some(stripped) = value.strip_prefix("MIG-") {
+            let parent = stripped
+                .rsplit('-')
+                .skip(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("-");
+            return (!parent.is_empty()).then_some(parent);
+        }
+        value
+            .rfind("#mig-")
+            .map(|pos| value[..pos].to_string())
+            .filter(|parent| !parent.is_empty())
+    }
 }
 
 /// Normalize a PCI BDF string to the canonical 4-digit domain form
@@ -130,6 +167,21 @@ pub(crate) fn normalize_pci_bdf(value: &str) -> String {
         }
     }
     value.to_string()
+}
+
+/// True when `value` is an NVIDIA MIG device UUID: `MIG-GPU-<parent>-<gi>-<ci>`
+/// — the `MIG-` prefix with a numeric compute-instance id and GPU-instance id
+/// tail. Physical GPU UUIDs (`GPU-...`) are never MIG.
+pub(crate) fn is_mig_uuid(value: &str) -> bool {
+    if !value.starts_with("MIG-") {
+        return false;
+    }
+    let parts: Vec<&str> = value.rsplit('-').take(2).collect();
+    parts.len() == 2
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+        && !parts[0].is_empty()
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && !parts[1].is_empty()
 }
 
 /// Vendor family of a discovered GPU, independent of the provider backend.
@@ -250,7 +302,7 @@ impl GpuSelector {
         if let Ok(index) = value.parse::<u32>() {
             return Self::Index(index);
         }
-        if value.starts_with("GPU-") || value.starts_with("gpu-") {
+        if value.starts_with("GPU-") || value.starts_with("gpu-") || is_mig_uuid(value) {
             return Self::Uuid(value.to_string());
         }
         Self::PciBusId(value.to_string())
@@ -530,6 +582,51 @@ mod tests {
 
         // The display key is the stable BDF.
         assert_eq!(mapped("0000:01:00.0").key(), "0000:01:00.0");
+    }
+
+    #[test]
+    fn mig_uuid_detection() {
+        assert!(is_mig_uuid(
+            "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2"
+        ));
+        assert!(!is_mig_uuid("GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789"));
+        assert!(!is_mig_uuid(
+            "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1"
+        ));
+        assert!(!is_mig_uuid("MIG-GPU-1a2b3c4d-x-2"));
+        assert!(!is_mig_uuid("MIG-"));
+    }
+
+    #[test]
+    fn mig_uuid_parses_instance_and_parent() {
+        let id = DeviceId::new(
+            None,
+            Some("MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2".into()),
+        );
+        assert_eq!(id.mig_instance(), Some((1, 2)));
+        assert_eq!(
+            id.mig_parent_uuid().as_deref(),
+            Some("GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789")
+        );
+        assert_eq!(id.key(), "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2");
+    }
+
+    #[test]
+    fn physical_uuid_is_never_mig() {
+        let id = DeviceId::new(
+            Some("0000:01:00.0".into()),
+            Some("GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789".into()),
+        );
+        assert_eq!(id.mig_instance(), None);
+        assert_eq!(id.mig_parent_uuid(), None);
+    }
+
+    #[test]
+    fn selector_parse_mig_uuid_is_uuid() {
+        assert_eq!(
+            GpuSelector::parse("MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2"),
+            GpuSelector::Uuid("MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2".to_string())
+        );
     }
 }
 

@@ -16,7 +16,103 @@ use nvml_wrapper::{
 };
 
 use super::{GpuProvider, GpuStats};
-use crate::domain::{normalize_pci_bdf, DeviceId, GpuSelector};
+use crate::domain::{is_mig_uuid, normalize_pci_bdf, DeviceId, GpuSelector};
+
+/// One MIG child device of a physical GPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MigChild {
+    /// NVML index of the physical parent.
+    pub parent_index: u32,
+    /// MIG device slot within the parent (`0..mig_device_count`).
+    pub slot: u32,
+    /// Stable key: the MIG UUID the driver reports for the child handle, or
+    /// the synthetic `<parent>#mig-<slot>` fallback.
+    pub key: String,
+}
+
+impl MigChild {
+    /// `(gpu_instance_id, compute_instance_id)` when the key is a real MIG
+    /// UUID; `None` for synthetic fallback keys, which carry no instance ids.
+    pub(crate) fn instance(&self) -> Option<(u32, u32)> {
+        DeviceId::new(None, Some(self.key.clone())).mig_instance()
+    }
+}
+
+/// Enumerate the MIG children of one physical device: MIG mode enabled,
+/// then each probed MIG device handle's UUID. Any NVML failure yields no
+/// children — never a panic. The topology is captured once at construction;
+/// an admin re-partition requires a provider restart.
+pub(crate) fn mig_children_of(
+    parent_index: u32,
+    device: &Device,
+    parent: &DeviceId,
+) -> Vec<MigChild> {
+    let enabled = matches!(device.mig_mode(), Ok(mode) if mode.current == 1);
+    if !enabled {
+        return Vec::new();
+    }
+    let count = match device.mig_device_count() {
+        Ok(count) => count,
+        Err(_) => return Vec::new(),
+    };
+    (0..count)
+        .filter_map(|slot| {
+            let child = device.mig_device_by_index(slot).ok()?;
+            Some(MigChild {
+                parent_index,
+                slot,
+                key: mig_child_key(child.uuid().ok().as_deref(), parent, slot),
+            })
+        })
+        .collect()
+}
+
+/// Stable key for a MIG child: the MIG UUID the driver reports for the
+/// child handle, else `<parent-uuid>#mig-<slot>` (parent BDF when the
+/// parent has no UUID). A driver UUID that is not MIG-shaped is treated as
+/// absent.
+fn mig_child_key(mig_uuid: Option<&str>, parent: &DeviceId, slot: u32) -> String {
+    match mig_uuid {
+        Some(uuid) if !uuid.is_empty() && is_mig_uuid(uuid) => uuid.to_string(),
+        _ => {
+            let parent_key = parent
+                .uuid
+                .as_deref()
+                .or(parent.pci_bdf.as_deref())
+                .unwrap_or("nvidia");
+            format!("{parent_key}#mig-{slot}")
+        }
+    }
+}
+
+/// Build the full MIG topology — every MIG child of every NVML device — in
+/// one pass. Called once at startup, never on the sampling path: the
+/// topology is static and an admin re-partition requires a restart. Any NVML
+/// failure yields fewer/no children, never a panic.
+pub(crate) fn discover_mig_children(nvml: &Nvml) -> Vec<MigChild> {
+    let Ok(count) = nvml.device_count() else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for index in 0..count {
+        let Ok(device) = nvml.device_by_index(index) else {
+            continue;
+        };
+        let parent = DeviceId::new(
+            device
+                .pci_info()
+                .ok()
+                .map(|pci| normalize_pci_bdf(&pci.bus_id))
+                .filter(|id| !id.is_empty()),
+            device.uuid().ok().filter(|u| !u.is_empty()),
+        );
+        if parent.key().is_empty() {
+            continue;
+        }
+        children.extend(mig_children_of(index, &device, &parent));
+    }
+    children
+}
 
 /// NVIDIA GPU telemetry provider backed by NVML.
 pub(crate) struct NvidiaGpuProvider {
@@ -27,6 +123,10 @@ pub(crate) struct NvidiaGpuProvider {
     /// Populated once at construction; the index→device mapping is stable for
     /// the life of the provider, so sampling does not re-enumerate NVML.
     devices: Vec<(u32, Option<String>, Option<String>)>,
+    /// MIG children of the physical devices, keyed by stable MIG identity.
+    /// Captured once at construction (see `mig_children_of`); a re-partition
+    /// requires a provider restart.
+    mig_children: Vec<MigChild>,
     /// Device name, fetched at most once. The vendor model name is immutable
     /// for the device's lifetime, so re-reading it on the sampling path (10 Hz
     /// at the default refresh) is pure waste.
@@ -87,12 +187,23 @@ fn due_to_refresh(fetched_at: Option<Instant>, now: Instant) -> bool {
     }
 }
 
+/// A resolved sample target: the NVML index to display (the physical
+/// parent's index when sampling a MIG child), the device handle to sample,
+/// the stable identity, and the MIG slot when the target is a child.
+struct ResolvedSample<'nvml> {
+    index: u32,
+    device: Device<'nvml>,
+    device_id: DeviceId,
+    mig_slot: Option<u32>,
+}
+
 impl NvidiaGpuProvider {
     pub(crate) fn new(selector: GpuSelector) -> Self {
         match Nvml::init() {
             Ok(nvml) => {
                 let count = nvml.device_count().unwrap_or(0);
                 let mut devices = Vec::with_capacity(count as usize);
+                let mut mig_children = Vec::new();
                 for index in 0..count {
                     if let Ok(device) = nvml.device_by_index(index) {
                         let uuid = device.uuid().ok();
@@ -100,6 +211,8 @@ impl NvidiaGpuProvider {
                             .pci_info()
                             .ok()
                             .map(|pci| normalize_pci_bdf(&pci.bus_id));
+                        let device_id = DeviceId::new(bus_id.clone(), uuid.clone());
+                        mig_children.extend(mig_children_of(index, &device, &device_id));
                         devices.push((index, uuid, bus_id));
                     }
                 }
@@ -108,6 +221,7 @@ impl NvidiaGpuProvider {
                     init_error: String::new(),
                     selector,
                     devices,
+                    mig_children,
                     name: None,
                     slow: SlowProperties::default(),
                 }
@@ -117,10 +231,65 @@ impl NvidiaGpuProvider {
                 init_error: format!("NVML unavailable: {err}"),
                 selector,
                 devices: Vec::new(),
+                mig_children: Vec::new(),
                 name: None,
                 slow: SlowProperties::default(),
             },
         }
+    }
+
+    /// Resolve the selection to a sample target. `None` when the selection
+    /// matches nothing; `Some(Err(..))` when the device handle cannot be
+    /// opened.
+    fn resolve_sample<'nvml>(
+        &self,
+        nvml: &'nvml Nvml,
+    ) -> Option<Result<ResolvedSample<'nvml>, String>> {
+        if let GpuSelector::Uuid(uuid) = &self.selector {
+            if let Some(child) = self.mig_children.iter().find(|c| &c.key == uuid) {
+                let parent = match nvml.device_by_index(child.parent_index) {
+                    Ok(parent) => parent,
+                    Err(err) => {
+                        return Some(Err(format!(
+                            "cannot access NVIDIA GPU {}: {err}",
+                            child.parent_index
+                        )))
+                    }
+                };
+                let device = match parent.mig_device_by_index(child.slot) {
+                    Ok(device) => device,
+                    Err(err) => {
+                        return Some(Err(format!(
+                            "cannot access MIG device {}/{}: {err}",
+                            child.parent_index, child.slot
+                        )))
+                    }
+                };
+                return Some(Ok(ResolvedSample {
+                    index: child.parent_index,
+                    device,
+                    device_id: DeviceId::new(None, Some(child.key.clone())),
+                    mig_slot: Some(child.slot),
+                }));
+            }
+        }
+        let index = self.selector.resolve(&self.devices)?;
+        let device = match nvml.device_by_index(index) {
+            Ok(device) => device,
+            Err(err) => return Some(Err(format!("cannot access NVIDIA GPU {index}: {err}"))),
+        };
+        let device_id = self
+            .devices
+            .iter()
+            .find(|(i, _, _)| *i == index)
+            .map(|(_, uuid, bus_id)| DeviceId::new(bus_id.clone(), uuid.clone()))
+            .unwrap_or_default();
+        Some(Ok(ResolvedSample {
+            index,
+            device,
+            device_id,
+            mig_slot: None,
+        }))
     }
 }
 
@@ -133,22 +302,22 @@ impl GpuProvider for NvidiaGpuProvider {
             };
         };
 
-        let index = match self.selector.resolve(&self.devices) {
-            Some(index) => index,
-            None => {
+        let ResolvedSample {
+            index,
+            device,
+            device_id,
+            mig_slot,
+        } = match self.resolve_sample(nvml) {
+            Some(Ok(resolved)) => resolved,
+            Some(Err(err)) => {
                 return GpuStats {
-                    error: "no NVIDIA GPU matches the selection".to_string(),
+                    error: err,
                     ..Default::default()
                 }
             }
-        };
-
-        let device = match nvml.device_by_index(index) {
-            Ok(device) => device,
-            Err(err) => {
+            None => {
                 return GpuStats {
-                    index,
-                    error: format!("cannot access NVIDIA GPU {index}: {err}"),
+                    error: "no NVIDIA GPU matches the selection".to_string(),
                     ..Default::default()
                 }
             }
@@ -166,12 +335,10 @@ impl GpuProvider for NvidiaGpuProvider {
                 Err(_) => "NVIDIA GPU".to_string(),
             }
         };
-        let device_id = self
-            .devices
-            .iter()
-            .find(|(i, _, _)| *i == index)
-            .map(|(_, uuid, bus_id)| DeviceId::new(bus_id.clone(), uuid.clone()))
-            .unwrap_or_default();
+        let name = match mig_slot {
+            Some(slot) => format!("{name} MIG {slot}"),
+            None => name,
+        };
 
         let utilization = device.utilization_rates().ok();
         let memory = device.memory_info().ok();
@@ -428,5 +595,35 @@ mod tests {
         sanitize(&mut stats);
         assert_eq!(stats.pcie_link_speed_gts, None);
         assert_eq!(stats.pcie_link_width, None);
+    }
+
+    #[test]
+    fn mig_child_key_prefers_driver_uuid() {
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        assert_eq!(
+            mig_child_key(Some("MIG-GPU-parent-1-0"), &parent, 0),
+            "MIG-GPU-parent-1-0"
+        );
+    }
+
+    #[test]
+    fn mig_child_key_falls_back_to_parent_uuid_then_bdf() {
+        let with_uuid = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        assert_eq!(mig_child_key(None, &with_uuid, 2), "GPU-parent#mig-2");
+        // A non-MIG driver UUID is treated as absent.
+        assert_eq!(
+            mig_child_key(Some("GPU-not-a-mig"), &with_uuid, 2),
+            "GPU-parent#mig-2"
+        );
+        let bdf_only = DeviceId::new(Some("0000:41:00.0".into()), None);
+        assert_eq!(mig_child_key(None, &bdf_only, 2), "0000:41:00.0#mig-2");
+    }
+
+    #[test]
+    fn mig_child_key_fallback_is_parseable() {
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        let key = DeviceId::new(None, Some(mig_child_key(None, &parent, 2)));
+        assert_eq!(key.mig_parent_uuid().as_deref(), Some("GPU-parent"));
+        assert_eq!(key.mig_instance(), None);
     }
 }
