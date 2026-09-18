@@ -6,6 +6,15 @@ All notable changes to OrsikTop will be documented here.
 
 ### Added
 
+- The llama.cpp→GPU mapping is now visible in the TUI. When the shown GPU
+  is one the inference server is attributed to, the GPU panel title gains
+  an `LLM` marker, and the LLM panel's state line gains a `GPU
+  <identity>` entry naming the mapped device by PCI BDF or vendor UUID.
+  A GPU without a stable identity, or an unresolved mapping, never shows
+  the marker — no fake attribution; on a multi-GPU mapping the LLM panel
+  names the first mapped device. Verified live on cf-desktop (RTX 4090,
+  S24): the marker and the identity line agree with `orsiktop diag`.
+
 - NVIDIA MIG awareness (S17). MIG-capable systems are now understood end to
   end: at construction the NVIDIA provider builds each physical device's MIG
   topology (`mig_mode` enabled → probe every MIG device slot); a MIG child is
@@ -28,6 +37,13 @@ All notable changes to OrsikTop will be documented here.
   only; an admin re-partition requires an OrsikTop restart.
 
 ### Fixed
+
+- On llama.cpp servers before b10700, which do not expose
+  speculative-decoding token counters, the LLM panel's SPEC row showed
+  `0 draft / 0 accepted` — indistinguishable from a spec run that
+  accepted nothing. An enabled spec run whose counters all read zero now
+  shows the explicit hint `no data (server < b10700)` instead of the
+  misleading zeros.
 
 - On a llama.cpp server with `--parallel` (multiple slots), the LLM panel's
   context pair (`CTX used / size`) could mix values from two different slots:
