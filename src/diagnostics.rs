@@ -22,6 +22,7 @@ use crate::{
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
     llama::LlamaMonitor,
+    providers::nvidia::discover_mig_children,
     system::RealSys,
 };
 
@@ -256,10 +257,11 @@ fn llama_section(
     // Server→GPU mapping decision, exactly like the TUI computes it (S16).
     let gpus = discover_gpus(sys);
     let nvml = Nvml::init().ok();
+    let mig_children = nvml.as_ref().map(discover_mig_children).unwrap_or_default();
     let mapping = match pid {
         Some(pid) => {
             let render = process_render_gpus(sys, pid, &gpus);
-            let nvml_keys = nvml_compute_gpus(nvml.as_ref(), pid);
+            let nvml_keys = nvml_compute_gpus(nvml.as_ref(), pid, &mig_children);
             map_server_gpus(true, render, nvml_keys, &gpus)
         }
         None => GpuMapping::None,

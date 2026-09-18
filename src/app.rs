@@ -30,6 +30,7 @@ use crate::{
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
     llama::{LlamaMonitor, LlmStats},
+    providers::nvidia::discover_mig_children,
     ui::{self, UiState},
 };
 use nvml_wrapper::Nvml;
@@ -371,6 +372,12 @@ fn spawn_fast_worker(
         // once; the mapping itself is recomputed on the process-refresh cadence.
         let mut server_pid: Option<u32> = None;
         let nvml_handle = Nvml::init().ok();
+        // MIG topology is static: captured once at startup and never re-probed
+        // on the process-refresh cadence (no static NVML polling in the loop).
+        let mig_children = nvml_handle
+            .as_ref()
+            .map(discover_mig_children)
+            .unwrap_or_default();
         let mut gpu_map: GpuMapping = GpuMapping::None;
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
@@ -416,7 +423,7 @@ fn spawn_fast_worker(
                         .iter()
                         .any(|p| p.pid == pid && p.start_time > 0);
                     let render = process_render_gpus(&RealSys, pid, &static_gpus);
-                    let nvml = nvml_compute_gpus(nvml_handle.as_ref(), pid);
+                    let nvml = nvml_compute_gpus(nvml_handle.as_ref(), pid, &mig_children);
                     gpu_map = map_server_gpus(server_running, render, nvml, &static_gpus);
                 } else {
                     // No local server process (configured/remote endpoint) →

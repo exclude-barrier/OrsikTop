@@ -15,8 +15,8 @@ use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        GpuMapping, GpuSelector, GpuStats, LlmStats, ProcessIdentity, ProcessStats, SystemStats,
-        MAX_REFRESH_MS, MIN_REFRESH_MS,
+        GpuMapping, GpuSelector, GpuStats, LlmStats, MappedGpu, ProcessIdentity, ProcessStats,
+        SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
 };
@@ -977,16 +977,31 @@ fn enc_dec_idle(gpu: &GpuStats) -> bool {
 
 /// True when the shown GPU is one the inference server is attributed to.
 ///
-/// Identity is `DeviceId::key()` (BDF, then UUID). `None`/`Unknown`
-/// mappings and GPUs without a stable key never match — no fake "LLM".
+/// Identity is `DeviceId::key()` (BDF, then UUID), extended by the MIG
+/// parent/child relationship: a server attributed to a MIG child belongs to
+/// its physical GPU panel, and a server attributed to the physical parent
+/// belongs to its MIG children's panels. `None`/`Unknown` mappings and GPUs
+/// without a stable key never match — no fake "LLM".
 fn gpu_in_mapping(gpu: &GpuStats, map: &GpuMapping) -> bool {
     let key = gpu.device.key();
     if key.is_empty() {
         return false;
     }
+    let matches = |mapped: &MappedGpu| {
+        if mapped.key() == key {
+            return true;
+        }
+        // MIG parent↔child relationship. Guarded with `is_some` on the
+        // derived parent so two BDF-only non-MIG identities (both `None`)
+        // never match.
+        let gpu_parent = gpu.device.mig_parent_uuid();
+        let mapped_parent = mapped.device.mig_parent_uuid();
+        (gpu_parent.is_some() && gpu_parent.as_deref() == mapped.device.uuid.as_deref())
+            || (mapped_parent.is_some() && mapped_parent.as_deref() == gpu.device.uuid.as_deref())
+    };
     match map {
-        GpuMapping::Single(m) => m.key() == key,
-        GpuMapping::Multi(ms) => ms.iter().any(|m| m.key() == key),
+        GpuMapping::Single(m) => matches(m),
+        GpuMapping::Multi(ms) => ms.iter().any(matches),
         GpuMapping::None | GpuMapping::Unknown => false,
     }
 }
@@ -5270,6 +5285,51 @@ mod tests {
             evidence: GpuEvidence::RenderNodeFd,
         };
         assert!(!gpu_in_mapping(&unkeyed, &GpuMapping::Single(unkeyed_map)));
+    }
+
+    #[test]
+    fn gpu_in_mapping_matches_mig_parent_and_child() {
+        let parent_uuid = "GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789";
+        let parent = GpuStats {
+            device: DeviceId::new(Some("0000:41:00.0".into()), Some(parent_uuid.into())),
+            ..Default::default()
+        };
+        let child = GpuStats {
+            device: DeviceId::new(None, Some(format!("MIG-{parent_uuid}-1-0"))),
+            ..Default::default()
+        };
+        let parent_mapped = MappedGpu {
+            device: parent.device.clone(),
+            name: String::new(),
+            vendor: GpuVendor::Nvidia,
+            evidence: GpuEvidence::NvmlCompute,
+        };
+        let child_mapped = MappedGpu {
+            device: child.device.clone(),
+            ..parent_mapped.clone()
+        };
+
+        // Server attributed to the physical parent: chip on the child panel.
+        assert!(gpu_in_mapping(
+            &child,
+            &GpuMapping::Single(parent_mapped.clone())
+        ));
+        // Server attributed to the child: chip on the parent panel.
+        assert!(gpu_in_mapping(
+            &parent,
+            &GpuMapping::Single(child_mapped.clone())
+        ));
+        // The same child matches directly as well.
+        assert!(gpu_in_mapping(
+            &child,
+            &GpuMapping::Single(child_mapped.clone())
+        ));
+        // A child of a different physical GPU never matches.
+        let foreign = GpuStats {
+            device: DeviceId::new(None, Some("MIG-GPU-other-1-0".into())),
+            ..Default::default()
+        };
+        assert!(!gpu_in_mapping(&foreign, &GpuMapping::Single(child_mapped)));
     }
 
     #[test]
