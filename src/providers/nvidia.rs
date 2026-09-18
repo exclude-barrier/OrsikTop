@@ -7,10 +7,12 @@
 //! Missing metrics stay `None`; a device with no matching selection or an
 //! NVML init failure is reported through `GpuStats.error`, never a fake zero.
 
+use std::time::{Duration, Instant};
+
 use nvml_wrapper::{
     bitmasks::device::ThrottleReasons,
     enum_wrappers::device::{Clock, PcieUtilCounter, TemperatureSensor},
-    Nvml,
+    Device, Nvml,
 };
 
 use super::{GpuProvider, GpuStats};
@@ -25,6 +27,64 @@ pub(crate) struct NvidiaGpuProvider {
     /// Populated once at construction; the index→device mapping is stable for
     /// the life of the provider, so sampling does not re-enumerate NVML.
     devices: Vec<(u32, Option<String>, Option<String>)>,
+    /// Device name, fetched at most once. The vendor model name is immutable
+    /// for the device's lifetime, so re-reading it on the sampling path (10 Hz
+    /// at the default refresh) is pure waste.
+    name: Option<String>,
+    /// Slowly-changing properties (power limit, PCIe link parameters),
+    /// refreshed at most once per second.
+    slow: SlowProperties,
+}
+
+/// Slowly-changing NVML properties, refreshed at most once per second.
+///
+/// The enforced power limit and PCIe link speed/width only change on user
+/// action or link retrain, so a 1 Hz refresh is indistinguishable from live
+/// for display purposes while keeping four driver round-trips off the 10 Hz
+/// sampling path. When every lookup fails the last good values are kept and
+/// the refresh is retried on the next sample.
+#[derive(Default)]
+struct SlowProperties {
+    power_limit_w: Option<f64>,
+    pcie_link_speed_gts: Option<f64>,
+    pcie_link_width: Option<u32>,
+    fetched_at: Option<Instant>,
+}
+
+impl SlowProperties {
+    const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+
+    fn refresh(&mut self, device: &Device) {
+        if !due_to_refresh(self.fetched_at, Instant::now()) {
+            return;
+        }
+        let power_limit_w = device
+            .enforced_power_limit()
+            .ok()
+            .map(|mw| mw as f64 / 1000.0);
+        let pcie_link_speed_gts = device
+            .pcie_link_speed()
+            .ok()
+            .map(|mt_per_s| mt_per_s as f64 / 1000.0);
+        let pcie_link_width = device.current_pcie_link_width().ok();
+        if power_limit_w.is_none() && pcie_link_speed_gts.is_none() && pcie_link_width.is_none() {
+            // All lookups failed: keep the last good values, retry next cycle.
+            return;
+        }
+        self.power_limit_w = power_limit_w;
+        self.pcie_link_speed_gts = pcie_link_speed_gts;
+        self.pcie_link_width = pcie_link_width;
+        self.fetched_at = Some(Instant::now());
+    }
+}
+
+/// True when slow properties are due for a refresh: never fetched, or the
+/// last successful fetch is at least one refresh interval old.
+fn due_to_refresh(fetched_at: Option<Instant>, now: Instant) -> bool {
+    match fetched_at {
+        None => true,
+        Some(fetched) => now.duration_since(fetched) >= SlowProperties::REFRESH_INTERVAL,
+    }
 }
 
 impl NvidiaGpuProvider {
@@ -48,6 +108,8 @@ impl NvidiaGpuProvider {
                     init_error: String::new(),
                     selector,
                     devices,
+                    name: None,
+                    slow: SlowProperties::default(),
                 }
             }
             Err(err) => Self {
@@ -55,6 +117,8 @@ impl NvidiaGpuProvider {
                 init_error: format!("NVML unavailable: {err}"),
                 selector,
                 devices: Vec::new(),
+                name: None,
+                slow: SlowProperties::default(),
             },
         }
     }
@@ -89,7 +153,19 @@ impl GpuProvider for NvidiaGpuProvider {
                 }
             }
         };
+        self.slow.refresh(&device);
 
+        let name = if let Some(cached) = &self.name {
+            cached.clone()
+        } else {
+            match device.name() {
+                Ok(name) => {
+                    self.name = Some(name.clone());
+                    name
+                }
+                Err(_) => "NVIDIA GPU".to_string(),
+            }
+        };
         let device_id = self
             .devices
             .iter()
@@ -106,7 +182,7 @@ impl GpuProvider for NvidiaGpuProvider {
             available: true,
             index,
             device: device_id,
-            name: device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string()),
+            name,
             utilization: utilization.as_ref().map(|v| v.gpu as f64),
             memory_utilization: utilization.as_ref().map(|v| v.memory as f64),
             memory_used_mib: memory.as_ref().map(|m| bytes_to_mib(m.used)),
@@ -116,10 +192,7 @@ impl GpuProvider for NvidiaGpuProvider {
                 .ok()
                 .map(|v| v as f64),
             power_w: device.power_usage().ok().map(|mw| mw as f64 / 1000.0),
-            power_limit_w: device
-                .enforced_power_limit()
-                .ok()
-                .map(|mw| mw as f64 / 1000.0),
+            power_limit_w: self.slow.power_limit_w,
             pstate: device
                 .performance_state()
                 .map(|state| normalize_pstate(&format!("{state:?}")))
@@ -144,11 +217,8 @@ impl GpuProvider for NvidiaGpuProvider {
                 .pcie_throughput(PcieUtilCounter::Send)
                 .ok()
                 .map(kb_per_second_to_mb),
-            pcie_link_speed_gts: device
-                .pcie_link_speed()
-                .ok()
-                .map(|mt_per_s| mt_per_s as f64 / 1000.0),
-            pcie_link_width: device.current_pcie_link_width().ok(),
+            pcie_link_speed_gts: self.slow.pcie_link_speed_gts,
+            pcie_link_width: self.slow.pcie_link_width,
             error: String::new(),
         };
 
@@ -271,6 +341,20 @@ mod tests {
     use super::*;
     use nvml_wrapper::bitmasks::device::ThrottleReasons;
 
+    #[test]
+    fn slow_properties_refresh_due_only_after_interval() {
+        let now = Instant::now();
+        assert!(due_to_refresh(None, now));
+        let fetched = now;
+        assert!(!due_to_refresh(
+            Some(fetched),
+            fetched + Duration::from_millis(999)
+        ));
+        assert!(due_to_refresh(
+            Some(fetched),
+            fetched + SlowProperties::REFRESH_INTERVAL
+        ));
+    }
     #[test]
     fn converts_nvml_pcie_kb_to_mb_per_second() {
         assert_eq!(kb_per_second_to_mb(1000), 1.0);
