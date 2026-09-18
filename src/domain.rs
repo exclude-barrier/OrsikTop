@@ -88,7 +88,10 @@ pub struct DeviceId {
 
 impl DeviceId {
     pub fn new(pci_bdf: Option<String>, uuid: Option<String>) -> Self {
-        Self { pci_bdf, uuid }
+        Self {
+            pci_bdf: pci_bdf.map(|value| normalize_pci_bdf(&value)),
+            uuid,
+        }
     }
 
     /// Primary stable key for maps and equality: BDF, then UUID, then
@@ -100,6 +103,33 @@ impl DeviceId {
             .or(self.uuid.as_deref())
             .unwrap_or("")
     }
+}
+
+/// Normalize a PCI BDF string to the canonical 4-digit domain form
+/// (`0000:01:00.0`). Some vendor APIs (NVML) report an 8-digit domain
+/// (`00000000:01:00.0`) for the same physical device; normalizing at the
+/// ingress point keeps identity matching consistent across providers and
+/// against `lspci` output. 12-character BDFs are already canonical and pass
+/// through unchanged, as do domains of `0x10000` or higher (not
+/// representable in 4 digits) and strings that are not BDFs.
+pub(crate) fn normalize_pci_bdf(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() == 16
+        && bytes[8] == b':'
+        && bytes[11] == b':'
+        && bytes[14] == b'.'
+        && (0..8).all(|i| bytes[i].is_ascii_hexdigit())
+        && (9..11).all(|i| bytes[i].is_ascii_hexdigit())
+        && (12..14).all(|i| bytes[i].is_ascii_hexdigit())
+        && bytes[15].is_ascii_hexdigit()
+    {
+        if let Ok(domain) = u32::from_str_radix(&value[..8], 16) {
+            if domain < 0x10000 {
+                return format!("{domain:04x}{}", &value[8..]);
+            }
+        }
+    }
+    value.to_string()
 }
 
 /// Vendor family of a discovered GPU, independent of the provider backend.
@@ -274,7 +304,7 @@ impl GpuSelector {
                 if value.is_empty() {
                     Self::Auto
                 } else {
-                    Self::PciBusId(value.to_string())
+                    Self::PciBusId(normalize_pci_bdf(value))
                 }
             }
             other => other.clone(),
@@ -424,6 +454,48 @@ mod tests {
             None
         );
         assert_eq!(GpuSelector::Auto.resolve(&[]), None);
+    }
+
+    #[test]
+    fn normalize_pci_bdf_canonicalizes_nvml_eight_digit_domain() {
+        // NVML reports the 8-digit domain; the canonical form is 4-digit.
+        assert_eq!(normalize_pci_bdf("00000000:01:00.0"), "0000:01:00.0");
+        assert_eq!(normalize_pci_bdf("00000000:41:00.1"), "0000:41:00.1");
+        // 12-character BDF is already canonical — identity.
+        assert_eq!(normalize_pci_bdf("0000:01:00.0"), "0000:01:00.0");
+        // Domain 0x10000 is the boundary: not representable in 4 digits.
+        assert_eq!(normalize_pci_bdf("00010000:01:00.0"), "00010000:01:00.0");
+        assert_eq!(normalize_pci_bdf("0000ffff:01:00.0"), "ffff:01:00.0");
+        // Malformed input passes through unchanged.
+        assert_eq!(normalize_pci_bdf("00000000:01:00"), "00000000:01:00");
+        assert_eq!(normalize_pci_bdf("000000000:01:00.0"), "000000000:01:00.0");
+        assert_eq!(normalize_pci_bdf("not-a-bdf"), "not-a-bdf");
+        assert_eq!(normalize_pci_bdf(""), "");
+    }
+
+    #[test]
+    fn device_id_normalizes_eight_digit_bdf_at_ingress() {
+        // The same physical GPU must carry one identity regardless of the
+        // BDF form its provider reported.
+        let nvml_form = DeviceId::new(Some("00000000:01:00.0".into()), None);
+        let sysfs_form = DeviceId::new(Some("0000:01:00.0".into()), None);
+        assert_eq!(nvml_form.key(), sysfs_form.key());
+        assert_eq!(nvml_form, sysfs_form);
+    }
+
+    #[test]
+    fn gpu_selector_sanitizes_eight_digit_pci_bus_id() {
+        // lspci form passes through unchanged.
+        assert_eq!(
+            GpuSelector::parse("0000:41:00.0").sanitized(),
+            GpuSelector::PciBusId("0000:41:00.0".to_string())
+        );
+        // NVML form is canonicalized so it resolves against the normalized
+        // device enumeration.
+        assert_eq!(
+            GpuSelector::parse("00000000:41:00.0").sanitized(),
+            GpuSelector::PciBusId("0000:41:00.0".to_string())
+        );
     }
 
     fn mapped(bdf: &str) -> MappedGpu {

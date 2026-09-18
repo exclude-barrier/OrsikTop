@@ -14,7 +14,7 @@ use nvml_wrapper::{
 };
 
 use super::{GpuProvider, GpuStats};
-use crate::domain::{DeviceId, GpuSelector};
+use crate::domain::{normalize_pci_bdf, DeviceId, GpuSelector};
 
 /// NVIDIA GPU telemetry provider backed by NVML.
 pub(crate) struct NvidiaGpuProvider {
@@ -36,7 +36,10 @@ impl NvidiaGpuProvider {
                 for index in 0..count {
                     if let Ok(device) = nvml.device_by_index(index) {
                         let uuid = device.uuid().ok();
-                        let bus_id = device.pci_info().ok().map(|pci| pci.bus_id);
+                        let bus_id = device
+                            .pci_info()
+                            .ok()
+                            .map(|pci| normalize_pci_bdf(&pci.bus_id));
                         devices.push((index, uuid, bus_id));
                     }
                 }
