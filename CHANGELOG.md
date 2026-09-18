@@ -31,6 +31,19 @@ All notable changes to OrsikTop will be documented here.
   an RTX 4090: discovery, the mapping key, and the identity line all agree on
   `0000:01:00.0`, and `--gpu 0000:01:00.0` selects the GPU.
 
+### Changed
+
+- The NVIDIA backend no longer re-reads the device name, the enforced power
+  limit, and the PCIe link speed/width on every sample. The device name is
+  fetched once — it is immutable for the device's lifetime — and the three
+  slow properties are refreshed at most once per second, keeping the last
+  good values when a refresh fails. This removes four NVML driver round-trips
+  from the default 10 Hz sampling path; measured on an RTX 4090 the process
+  syscall rate drops by ~30/s and the steady-state telemetry-thread CPU by
+  ~0.2 % of one core. Displayed values are unchanged in practice: power
+  limits and PCIe link parameters only change on user action or link retrain,
+  so a 1 s refresh is indistinguishable from live for them.
+
 ## [0.2.4] - 2026-09-16
 
 ### Fixed
