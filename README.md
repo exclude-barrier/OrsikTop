@@ -70,6 +70,8 @@ OrsikTop reads llama.cpp telemetry and displays:
 - connection state, uptime and smoothed polling latency
 - transient reconnect handling so short polling interruptions do not immediately show the server as offline
 
+With a `--parallel` server (multiple slots) the panel aggregates across slots: `SLOTS busy/total` counts active slots, and the live prefill / decode throughput lines sum the per-slot deltas of the active slots (a task change or counter reset counts as zero, never negative). The context pair (`used / size`) is always read from a single slot — the most-used busy slot, or the most-used slot overall when no slot is busy — because an idle slot keeps its last task's context, so mixing a maximum `used` with a maximum `n_ctx` across slots could pair values from two different slots.
+
 `/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
 
 ### GPU
