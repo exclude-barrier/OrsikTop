@@ -2,6 +2,35 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- On a llama.cpp server with `--parallel` (multiple slots), the LLM panel's
+  context pair (`CTX used / size`) could mix values from two different slots:
+  `used` was the maximum across all slots while `size` was the maximum
+  `n_ctx`, and once slot capacities differ those maxima come from different
+  slots. The pair is now always read from a single display slot — the
+  most-used busy slot, or the most-used slot overall when no slot is busy —
+  because an idle slot keeps its last task's context and its `used` value is
+  stale. Verified live against a `--parallel 2` server: idle frames show the
+  most-used slot's retained pair and busy frames show the busy slot's own
+  pair, each cross-checked against the server's `/slots` output at the same
+  moment.
+
+- On NVIDIA machines the GPU's PCI BDF arrived in two different forms: NVML
+  reports an 8-digit domain prefix (`00000000:01:00.0`) while the sysfs/DRM
+  discovery path reports the 4-digit form (`0000:01:00.0`). The two never
+  matched, so the llama.cpp→GPU mapping key did not unify with the
+  discovered device — the LLM panel's `GPU …` identity line rendered the
+  8-digit NVML form, the mapping's name/vendor fell back to unresolved, and
+  the lspci-form selection `--gpu 0000:01:00.0` did not resolve the device.
+  BDFs are now normalized to the canonical 4-digit form at every ingress
+  point (device identity, GPU selector, NVML device list, NVML compute-app
+  evidence), so one physical GPU carries one identity end to end. Verified on
+  an RTX 4090: discovery, the mapping key, and the identity line all agree on
+  `0000:01:00.0`, and `--gpu 0000:01:00.0` selects the GPU.
+
 ## [0.2.4] - 2026-09-16
 
 ### Fixed
