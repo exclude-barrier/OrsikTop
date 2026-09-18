@@ -4,6 +4,29 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- NVIDIA MIG awareness (S17). MIG-capable systems are now understood end to
+  end: at construction the NVIDIA provider builds each physical device's MIG
+  topology (`mig_mode` enabled → probe every MIG device slot); a MIG child is
+  a first-class identity keyed by its driver MIG UUID
+  (`MIG-GPU-<parent>-<gi>-<ci>`, with a synthetic `{parent}#mig-{slot}`
+  fallback when a driver exposes no MIG UUID), selectable via
+  `--gpu <MIG-uuid>`, and sampled through its own MIG device handle — child
+  panels are titled `… MIG <slot>`, and metrics the driver does not expose
+  per child (temperature, power, fan, clocks, PCIe) render `—` rather than
+  fake zeros. The llama.cpp→GPU mapping attributes a process's NVML
+  placements to the specific MIG child they run on
+  (`gpu_instance_id`/`compute_instance_id`), one placement yielding exactly
+  one identity, and the TUI's `LLM` chip matches a MIG child with its
+  physical parent panel and vice versa. Non-MIG systems are unaffected: a
+  device whose `mig_mode` reports unsupported (e.g. an RTX 4090) builds an
+  empty topology and takes the original sampling path. Fixture-tested; not
+  live-verified — no MIG hardware (A100/H100-class) is available, and the
+  `Device::uuid()`-on-a-MIG-child assumption is documented in
+  `docs/HARDWARE_SUPPORT.md`. The MIG topology is captured at construction
+  only; an admin re-partition requires an OrsikTop restart.
+
 ### Fixed
 
 - On a llama.cpp server with `--parallel` (multiple slots), the LLM panel's
