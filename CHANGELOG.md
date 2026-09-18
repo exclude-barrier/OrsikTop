@@ -2,6 +2,18 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [Unreleased]
+
+### Added
+
+- Multi-slot llama.cpp servers (`--parallel > 1`) now show which slot
+  supplies the displayed CTX value: the CTX row gains a compact `S<n>` tag
+  naming the selected slot by its own `/slots` `id` (e.g. `CTX … 68.4%
+  S1 78,800 / 115,200 tok`). The tag appears only with two
+  or more slots and a known slot identity — single-slot servers keep the
+  compact row, a slot without an `id` field prints no number, and on very
+  narrow terminals the tag is dropped before any context value is.
+
 ## [0.2.5] - 2026-09-18
 
 ### Added

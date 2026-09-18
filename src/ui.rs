@@ -1293,6 +1293,33 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         0.0
     };
     let context_bar = inner.width.saturating_sub(46).max(8) as usize;
+    // Multi-slot servers show which slot supplies the displayed CTX pair,
+    // using the slot's own /slots `id`. Hidden for a single slot
+    // (unambiguous) and when the selected slot reports no id (never a fake
+    // number). Below the width where the CTX bar stops being pinned (54 =
+    // 46 + 8) the tag is dropped before the context values so the row
+    // cannot overflow further.
+    let context_slot_tag = (llm.slot_count > 1)
+        .then_some(llm.context_slot_id)
+        .flatten()
+        .filter(|_| inner.width >= 54)
+        .map(|id| format!("S{id}"));
+    let mut context_suffix = Vec::new();
+    if let Some(tag) = &context_slot_tag {
+        context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
+    }
+    context_suffix.push(Span::styled(
+        if llm.context_size > 0 {
+            format!(
+                " {} / {} tok",
+                grouped_u64(context_used),
+                grouped_u64(llm.context_size)
+            )
+        } else {
+            " waiting for context".to_string()
+        },
+        Style::default().fg(MUTED),
+    ));
     let slots = if llm.slots_available {
         format!("{}/{}", llm.busy_slots, llm.slot_count)
     } else if llm.props_slot_count > 0 {
@@ -1471,18 +1498,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
             context_bar,
             context_color(context_pct),
             format!("{:>5.1}%", context_pct),
-            vec![Span::styled(
-                if llm.context_size > 0 {
-                    format!(
-                        " {} / {} tok",
-                        grouped_u64(context_used),
-                        grouped_u64(llm.context_size)
-                    )
-                } else {
-                    " waiting for context".to_string()
-                },
-                Style::default().fg(MUTED),
-            )],
+            context_suffix,
         ),
     ];
 
@@ -5380,6 +5396,107 @@ mod tests {
         assert!(
             !text.contains("LLM"),
             "unmapped GPU title must not carry the LLM chip, got:\n{text}",
+        );
+    }
+
+    fn render_llm_panel(llm: &LlmStats, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_llm(frame, area, llm, &UiState::default(), &GpuMapping::None))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn llm_panel_ctx_row_names_the_selected_slot_on_multi_slot_servers() {
+        let llm = LlmStats {
+            connected: true,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: 78800,
+            slots_available: true,
+            slot_count: 2,
+            busy_slots: 1,
+            context_slot_id: Some(1),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            text.contains("S1"),
+            "multi-slot panel must tag the selected slot, got:\n{text}"
+        );
+        assert!(
+            text.contains("78,800 / 115,200 tok"),
+            "context pair must stay readable next to the tag, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn llm_panel_single_slot_omits_the_redundant_slot_tag() {
+        let llm = LlmStats {
+            connected: true,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: 28851,
+            slots_available: true,
+            slot_count: 1,
+            context_slot_id: Some(0),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            !text.contains("S0"),
+            "single-slot panel must not show a redundant S0, got:\n{text}"
+        );
+        assert!(text.contains("28,851 / 115,200 tok"));
+    }
+
+    #[test]
+    fn llm_panel_without_slot_id_never_prints_a_fake_slot() {
+        let llm = LlmStats {
+            connected: true,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: 5000,
+            slots_available: true,
+            slot_count: 2,
+            busy_slots: 1,
+            context_slot_id: None,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            !text.contains("S0") && !text.contains("S1"),
+            "unknown slot identity must not be guessed, got:\n{text}"
+        );
+        assert!(text.contains("5,000 / 115,200 tok"));
+    }
+
+    #[test]
+    fn narrow_llm_panel_drops_the_slot_tag_before_the_context_values() {
+        let llm = LlmStats {
+            connected: true,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: 28851,
+            slots_available: true,
+            slot_count: 2,
+            busy_slots: 1,
+            context_slot_id: Some(0),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 40, 12);
+        assert!(
+            !text.contains("S0"),
+            "below the bar-pin width the tag must be dropped, got:\n{text}"
         );
     }
 }
