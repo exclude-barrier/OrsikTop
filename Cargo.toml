@@ -1,6 +1,6 @@
 [package]
 name = "orsiktop"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Fast terminal monitoring for local LLM Orks"
 license = "Apache-2.0"

@@ -2,7 +2,7 @@
 
 All notable changes to OrsikTop will be documented here.
 
-## [Unreleased]
+## [0.2.5] - 2026-09-18
 
 ### Added
 
