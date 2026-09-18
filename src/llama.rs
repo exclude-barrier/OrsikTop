@@ -536,8 +536,12 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     stats.slots_error.clear();
     stats.slot_count = slots.len() as u64;
 
-    let mut max_context_size = stats.context_size;
-    let mut max_context_used = 0u64;
+    // The context pair (used, size) is always read from a single slot: the
+    // most-used busy slot, or the most-used slot overall when no slot is
+    // busy. Taking max(used) and max(n_ctx) independently would mix values
+    // from different slots once slot capacities differ.
+    let mut best_busy: Option<(u64, u64)> = None;
+    let mut best_any: Option<(u64, u64)> = None;
     let mut busy = 0u64;
     let mut request_prompt_tokens = 0u64;
     let mut request_generated_tokens = 0u64;
@@ -545,7 +549,6 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
 
     for (index, slot) in slots.iter().enumerate() {
         let n_ctx = slot.get("n_ctx").and_then(Value::as_u64).unwrap_or(0);
-        max_context_size = max_context_size.max(n_ctx);
 
         let is_processing = slot
             .get("is_processing")
@@ -586,7 +589,12 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
         } else {
             prompt_processed.saturating_add(decoded)
         };
-        max_context_used = max_context_used.max(used);
+        if is_processing && best_busy.is_none_or(|best| used > best.0) {
+            best_busy = Some((used, n_ctx));
+        }
+        if best_any.is_none_or(|best| used > best.0) {
+            best_any = Some((used, n_ctx));
+        }
 
         counters.push(SlotCounter {
             slot_id: slot
@@ -602,8 +610,15 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     stats.busy_slots = busy;
     stats.request_prompt_tokens = request_prompt_tokens;
     stats.request_generated_tokens = request_generated_tokens;
-    stats.context_size = max_context_size;
-    stats.context_used = max_context_used;
+    let (context_used, context_size) = best_busy.or(best_any).unwrap_or((0, stats.context_size));
+    stats.context_used = context_used;
+    // A slot without n_ctx reports 0; keep the /props-seeded (or previous)
+    // size instead of shrinking the pair to 0.
+    stats.context_size = if context_size > 0 {
+        context_size
+    } else {
+        stats.context_size
+    };
     Ok(counters)
 }
 
@@ -1154,6 +1169,287 @@ mod tests {
 
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.context_used, 4250);
+    }
+
+    #[test]
+    fn context_pair_stays_with_most_used_busy_slot_when_capacities_differ() {
+        // The pair must come from one slot: the busy slot's own used AND the
+        // busy slot's own n_ctx — never max(used) from one slot mixed with
+        // max(n_ctx) from another.
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "id_task": 1, "n_ctx": 100000, "is_processing": true, "n_prompt_tokens": 5000 },
+            { "id": 1, "id_task": 2, "n_ctx": 200000, "is_processing": false, "n_prompt_tokens": 9000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.busy_slots, 1);
+        assert_eq!(stats.context_used, 5000);
+        assert_eq!(stats.context_size, 100000);
+    }
+
+    #[test]
+    fn context_pair_falls_back_to_most_used_slot_when_all_idle() {
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 100000, "is_processing": false, "n_prompt_tokens": 5000 },
+            { "id": 1, "n_ctx": 200000, "is_processing": false, "n_prompt_tokens": 9000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.busy_slots, 0);
+        assert_eq!(stats.context_used, 9000);
+        assert_eq!(stats.context_size, 200000);
+    }
+
+    #[test]
+    fn both_busy_slots_select_the_most_used_pair() {
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 100000, "is_processing": true, "n_prompt_tokens": 2000 },
+            { "id": 1, "n_ctx": 150000, "is_processing": true, "n_prompt_tokens": 4000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.busy_slots, 2);
+        assert_eq!(stats.context_used, 4000);
+        assert_eq!(stats.context_size, 150000);
+        assert_eq!(stats.request_prompt_tokens, 6000);
+    }
+
+    #[test]
+    fn idle_slot_near_capacity_reports_its_own_pair() {
+        // Real observed case: n_ctx_slot = 70144, n_tokens = 70143, and a
+        // request of 70210 tokens was rejected as exceeding the slot context.
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 70144, "is_processing": false, "n_prompt_tokens": 70143 },
+            { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, 70143);
+        assert_eq!(stats.context_size, 70144);
+    }
+
+    #[test]
+    fn slot_reuse_tracks_new_task_slot_over_stale_retained_context() {
+        // Slot reuse: a busy slot runs a new small-prompt task while a second
+        // slot still holds its previous task's retained context. The pair
+        // follows the active slot, not the stale occupancy.
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "id_task": 99, "n_ctx": 115200, "is_processing": true, "n_prompt_tokens": 1022 },
+            { "id": 1, "id_task": 42, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 37943 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, 1022);
+        assert_eq!(stats.context_size, 115200);
+    }
+
+    #[test]
+    fn empty_slots_array_keeps_props_context_size() {
+        let mut stats = LlmStats {
+            context_size: 4096,
+            ..Default::default()
+        };
+        apply_slots_json(&mut stats, &json!([])).unwrap();
+        assert_eq!(stats.slot_count, 0);
+        assert_eq!(stats.context_used, 0);
+        assert_eq!(stats.context_size, 4096);
+    }
+
+    #[test]
+    fn slot_missing_n_ctx_keeps_props_context_size() {
+        let mut stats = LlmStats {
+            context_size: 4096,
+            ..Default::default()
+        };
+        let slots = json!([{ "id": 0, "n_prompt_tokens": 512, "is_processing": true }]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, 512);
+        assert_eq!(stats.context_size, 4096);
+    }
+
+    #[test]
+    fn slot_delta_tps_sums_active_slots_into_server_aggregate() {
+        let previous = vec![
+            SlotCounter {
+                slot_id: 0,
+                task_id: Some(1),
+                prompt_processed: 1000,
+                decoded: 100,
+            },
+            SlotCounter {
+                slot_id: 1,
+                task_id: Some(2),
+                prompt_processed: 2000,
+                decoded: 200,
+            },
+        ];
+        let current = vec![
+            SlotCounter {
+                slot_id: 0,
+                task_id: Some(1),
+                prompt_processed: 1100,
+                decoded: 150,
+            },
+            SlotCounter {
+                slot_id: 1,
+                task_id: Some(2),
+                prompt_processed: 2200,
+                decoded: 300,
+            },
+        ];
+
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0);
+        assert_eq!(prompt_tps, 150.0);
+        assert_eq!(generation_tps, 75.0);
+    }
+
+    #[test]
+    fn slot_delta_tps_ignores_disappeared_slot_and_restarted_task() {
+        let previous = vec![
+            SlotCounter {
+                slot_id: 0,
+                task_id: Some(1),
+                prompt_processed: 1000,
+                decoded: 500,
+            },
+            SlotCounter {
+                slot_id: 1,
+                task_id: Some(2),
+                prompt_processed: 2000,
+                decoded: 300,
+            },
+        ];
+        // Slot 0 disappeared; slot 1's task finished and a new task started
+        // on the same slot — neither may leak a stale delta.
+        let current = vec![SlotCounter {
+            slot_id: 1,
+            task_id: Some(3),
+            prompt_processed: 50,
+            decoded: 5,
+        }];
+
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn slot_delta_tps_clamps_counter_decrease_to_zero() {
+        let previous = vec![SlotCounter {
+            slot_id: 0,
+            task_id: Some(1),
+            prompt_processed: 1000,
+            decoded: 900,
+        }];
+        let current = vec![SlotCounter {
+            slot_id: 0,
+            task_id: Some(1),
+            prompt_processed: 900,
+            decoded: 100,
+        }];
+
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn spec_acceptance_computes_from_deltas_and_holds_after_quiet() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+
+        let mut stats = LlmStats {
+            spec_draft_tokens: 200.0,
+            spec_accepted_tokens: 140.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+
+        // Second sample: 100 new draft tokens, 60 accepted -> 60%.
+        let mut stats = LlmStats {
+            spec_draft_tokens: 300.0,
+            spec_accepted_tokens: 200.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+        assert_eq!(stats.spec_acceptance_pct, Some(60.0));
+
+        // Third sample with no new draft tokens: the last value is held for
+        // SPEC_ACCEPTANCE_HOLD instead of dropping to None.
+        let mut stats = LlmStats {
+            spec_draft_tokens: 300.0,
+            spec_accepted_tokens: 200.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+        assert_eq!(stats.spec_acceptance_pct, Some(60.0));
+    }
+
+    #[test]
+    fn spec_acceptance_expires_after_the_hold_window() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+
+        let mut stats = LlmStats {
+            spec_draft_tokens: 100.0,
+            spec_accepted_tokens: 50.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+        let mut stats = LlmStats {
+            spec_draft_tokens: 200.0,
+            spec_accepted_tokens: 100.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+        assert_eq!(stats.spec_acceptance_pct, Some(50.0));
+
+        let mut stats = LlmStats {
+            spec_draft_tokens: 200.0,
+            spec_accepted_tokens: 100.0,
+            ..Default::default()
+        };
+        let expired = Instant::now() - (SPEC_ACCEPTANCE_HOLD + Duration::from_secs(1));
+        monitor.last_spec_acceptance_at = Some(expired);
+        monitor.update_metric_counters(&mut stats);
+        assert_eq!(stats.spec_acceptance_pct, None);
+    }
+
+    #[test]
+    fn spec_acceptance_clamps_to_hundred_percent() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+
+        let mut stats = LlmStats {
+            spec_draft_tokens: 100.0,
+            spec_accepted_tokens: 100.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+
+        // Accepted delta larger than the draft delta must clamp, not exceed.
+        let mut stats = LlmStats {
+            spec_draft_tokens: 200.0,
+            spec_accepted_tokens: 250.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+        assert_eq!(stats.spec_acceptance_pct, Some(100.0));
+    }
+
+    #[test]
+    fn spec_counter_reset_does_not_create_fake_acceptance() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+
+        let mut stats = LlmStats {
+            spec_draft_tokens: 1000.0,
+            spec_accepted_tokens: 900.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+
+        // Server restart: counters reset below the previous values. No draft
+        // progress and no fresh hold -> no acceptance value, no NaN.
+        let mut stats = LlmStats {
+            spec_draft_tokens: 10.0,
+            spec_accepted_tokens: 5.0,
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+        assert_eq!(stats.spec_acceptance_pct, None);
     }
 
     #[test]
