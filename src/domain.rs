@@ -6,7 +6,7 @@
 //! import from this module only.
 
 pub use crate::drm::DrmProcessGpu;
-pub use crate::llama::LlmStats;
+pub use crate::llama::{LlmSlotInfo, LlmStats};
 pub use crate::providers::GpuStats;
 
 /// Minimum UI/worker refresh interval.

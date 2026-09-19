@@ -42,6 +42,13 @@ pub struct LlmStats {
     pub slot_count: u64,
     pub props_slot_count: u64,
     pub busy_slots: u64,
+    /// Context occupancy of every slot that reports its own `/slots` `id`,
+    /// from the very same /slots response that supplies the selected CTX
+    /// pair. Ordered by slot ID (never array position); slots without an
+    /// `id` field are omitted rather than guessed. `context_used` /
+    /// `context_size` stay `None` when the slot reports no usable value —
+    /// never a fake zero. Empty when /slots is unavailable.
+    pub slot_overview: Vec<LlmSlotInfo>,
     pub slots_error: String,
     pub prompt_total: f64,
     pub prompt_cached_total: Option<f64>,
@@ -64,6 +71,17 @@ pub struct LlmStats {
     pub spec_n_max: Option<u64>,
     pub spec_acceptance_pct: Option<f64>,
     pub error: String,
+}
+
+/// One visible slot in the per-slot context overview: the slot's own
+/// `/slots` `id`, its busy state, and its context usage / capacity. Missing
+/// values stay `None` instead of becoming fabricated zeros.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LlmSlotInfo {
+    pub id: u64,
+    pub busy: bool,
+    pub context_used: Option<u64>,
+    pub context_size: Option<u64>,
 }
 
 #[derive(Default)]
@@ -552,6 +570,7 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     let mut request_prompt_tokens = 0u64;
     let mut request_generated_tokens = 0u64;
     let mut counters = Vec::with_capacity(slots.len());
+    let mut overview = Vec::with_capacity(slots.len());
 
     for (index, slot) in slots.iter().enumerate() {
         let n_ctx = slot.get("n_ctx").and_then(Value::as_u64).unwrap_or(0);
@@ -576,28 +595,35 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             stats.spec_n_max = Some(stats.spec_n_max.map_or(n_max, |current| current.max(n_max)));
         }
 
-        let prompt_tokens = slot
-            .get("n_prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let prompt_tokens = slot.get("n_prompt_tokens").and_then(Value::as_u64);
         let prompt_processed = slot
             .get("n_prompt_tokens_processed")
             .and_then(Value::as_u64)
-            .unwrap_or(prompt_tokens);
-        let decoded = slot_decoded_tokens(slot);
+            .or(prompt_tokens);
+        let decoded = slot_decoded_tokens_opt(slot);
 
         if is_processing {
-            request_prompt_tokens = request_prompt_tokens.saturating_add(prompt_processed);
-            request_generated_tokens = request_generated_tokens.saturating_add(decoded);
+            request_prompt_tokens =
+                request_prompt_tokens.saturating_add(prompt_processed.unwrap_or(0));
+            request_generated_tokens =
+                request_generated_tokens.saturating_add(decoded.unwrap_or(0));
         }
 
         // Current llama.cpp exposes n_prompt_tokens as the slot's current prompt/context
-        // token count. Older responses may only expose processed prompt + decoded tokens.
-        let used = if prompt_tokens > 0 {
-            prompt_tokens
-        } else {
-            prompt_processed.saturating_add(decoded)
+        // token count. Older responses may only expose processed prompt + decoded
+        // tokens. A present-but-zero n_prompt_tokens still falls back to the
+        // retained occupancy (validated CTX selection semantics). When the slot
+        // reports none of them, the occupancy stays unknown (None) so the
+        // per-slot overview does not print a fake zero.
+        let used_opt = match prompt_tokens {
+            Some(value) if value > 0 => Some(value),
+            _ => match (prompt_processed, decoded) {
+                (Some(processed), decoded) => Some(processed.saturating_add(decoded.unwrap_or(0))),
+                (None, Some(decoded)) => Some(decoded),
+                (None, None) => None,
+            },
         };
+        let used = used_opt.unwrap_or(0);
         if is_processing && best_busy.is_none_or(|best| used > best.0) {
             best_busy = Some((used, n_ctx, slot_id));
         }
@@ -608,10 +634,20 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
         counters.push(SlotCounter {
             slot_id: slot_id.unwrap_or(index as u64),
             task_id: slot.get("id_task").and_then(Value::as_i64),
-            prompt_processed,
-            decoded,
+            prompt_processed: prompt_processed.unwrap_or(0),
+            decoded: decoded.unwrap_or(0),
         });
+        if let Some(id) = slot_id {
+            overview.push(LlmSlotInfo {
+                id,
+                busy: is_processing,
+                context_used: used_opt,
+                context_size: (n_ctx > 0).then_some(n_ctx),
+            });
+        }
     }
+
+    overview.sort_by_key(|slot| slot.id);
 
     stats.busy_slots = busy;
     stats.request_prompt_tokens = request_prompt_tokens;
@@ -622,6 +658,7 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             .unwrap_or((0, stats.context_size, None));
     stats.context_used = context_used;
     stats.context_slot_id = context_slot_id;
+    stats.slot_overview = overview;
     // A slot without n_ctx reports 0; keep the /props-seeded (or previous)
     // size instead of shrinking the pair to 0.
     stats.context_size = if context_size > 0 {
@@ -809,15 +846,14 @@ fn task_ids_match(previous: Option<i64>, current: Option<i64>) -> bool {
     }
 }
 
-fn slot_decoded_tokens(slot: &Value) -> u64 {
+fn slot_decoded_tokens_opt(slot: &Value) -> Option<u64> {
     match slot.get("next_token") {
         Some(Value::Array(items)) => items
             .first()
             .and_then(|item| item.get("n_decoded"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        Some(Value::Object(map)) => map.get("n_decoded").and_then(Value::as_u64).unwrap_or(0),
-        _ => 0,
+            .and_then(Value::as_u64),
+        Some(Value::Object(map)) => map.get("n_decoded").and_then(Value::as_u64),
+        _ => None,
     }
 }
 
@@ -1328,6 +1364,148 @@ mod tests {
         assert_eq!(stats.context_used, 512);
         assert_eq!(stats.context_size, 4096);
         assert_eq!(stats.context_slot_id, Some(0));
+    }
+
+    #[test]
+    fn slot_overview_reports_each_slot_with_own_id_state_and_usage() {
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 115200, "is_processing": true, "n_prompt_tokens": 58745 },
+            { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 34200 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(
+            stats.slot_overview,
+            vec![
+                LlmSlotInfo {
+                    id: 0,
+                    busy: true,
+                    context_used: Some(58745),
+                    context_size: Some(115200),
+                },
+                LlmSlotInfo {
+                    id: 1,
+                    busy: false,
+                    context_used: Some(34200),
+                    context_size: Some(115200),
+                }
+            ]
+        );
+        // The main CTX pair must not be the sum of the slots.
+        assert_eq!(stats.context_used, 58745);
+        assert_eq!(stats.context_size, 115200);
+        assert_eq!(stats.context_slot_id, Some(0));
+    }
+
+    #[test]
+    fn slot_overview_marks_busy_state_of_all_slots() {
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 100000, "is_processing": true, "n_prompt_tokens": 2000 },
+            { "id": 1, "n_ctx": 150000, "is_processing": true, "n_prompt_tokens": 4000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert!(stats.slot_overview.iter().all(|slot| slot.busy));
+
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 100000, "is_processing": false, "n_prompt_tokens": 2000 },
+            { "id": 1, "n_ctx": 150000, "is_processing": false, "n_prompt_tokens": 4000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert!(stats.slot_overview.iter().all(|slot| !slot.busy));
+    }
+
+    #[test]
+    fn slot_overview_orders_by_slot_id_not_array_position() {
+        // Scrambled array order + non-contiguous IDs: the overview must be
+        // deterministic and follow the slot's own `id`, never its position.
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 7, "n_ctx": 200000, "is_processing": true, "n_prompt_tokens": 14000 },
+            { "id": 2, "n_ctx": 150000, "is_processing": false, "n_prompt_tokens": 28000 },
+            { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 31000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        let ids: Vec<u64> = stats.slot_overview.iter().map(|slot| slot.id).collect();
+        assert_eq!(ids, vec![1, 2, 7]);
+        assert_eq!(
+            stats.slot_overview[0].context_used,
+            Some(31000),
+            "values must travel with their slot id"
+        );
+    }
+
+    #[test]
+    fn slot_overview_keeps_differing_capacities_per_slot() {
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 115200, "is_processing": true, "n_prompt_tokens": 58745 },
+            { "id": 3, "n_ctx": 70144, "is_processing": false, "n_prompt_tokens": 34200 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.slot_overview[0].context_size, Some(115200));
+        assert_eq!(stats.slot_overview[1].context_size, Some(70144));
+        // The main pair still comes from a single slot.
+        assert_eq!(stats.context_used, 58745);
+        assert_eq!(stats.context_size, 115200);
+        assert_eq!(stats.context_slot_id, Some(0));
+    }
+
+    #[test]
+    fn slot_overview_keeps_missing_values_unknown_and_drops_unidentified_slots() {
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 0 },
+            { "id": 1, "is_processing": false },
+            { "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 5000 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        // The slot without an `id` must not be guessed from its position.
+        assert_eq!(
+            stats
+                .slot_overview
+                .iter()
+                .map(|slot| slot.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            stats.slot_overview[0].context_used,
+            Some(0),
+            "a real zero is a zero"
+        );
+        let unknown = &stats.slot_overview[1];
+        assert_eq!(
+            unknown.context_used, None,
+            "absent data must not become a fake zero"
+        );
+        assert_eq!(unknown.context_size, None);
+    }
+
+    #[test]
+    fn present_zero_prompt_tokens_falls_back_to_retained_occupancy() {
+        // Validated CTX selection semantics: n_prompt_tokens present-but-zero
+        // falls back to the retained processed occupancy. The overview must
+        // inherit the exact same value the main CTX row shows.
+        let mut stats = LlmStats::default();
+        let slots = json!([
+            { "id": 0, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 0, "n_prompt_tokens_processed": 37943 },
+            { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
+        ]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, 37943);
+        assert_eq!(stats.context_slot_id, Some(0));
+        assert_eq!(stats.slot_overview[0].context_used, Some(37943));
+        assert_eq!(stats.slot_overview[1].context_used, Some(100));
+    }
+
+    #[test]
+    fn slot_overview_is_empty_when_slots_endpoint_is_unavailable() {
+        let stats = LlmStats::default();
+        // No apply_slots_json call at all: /slots failed -> default is empty.
+        assert!(!stats.slots_available);
+        assert!(stats.slot_overview.is_empty());
     }
 
     #[test]

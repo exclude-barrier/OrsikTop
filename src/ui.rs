@@ -15,8 +15,8 @@ use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        GpuMapping, GpuSelector, GpuStats, LlmStats, MappedGpu, ProcessIdentity, ProcessStats,
-        SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+        GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu, ProcessIdentity,
+        ProcessStats, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
 };
@@ -1502,6 +1502,17 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         ),
     ];
 
+    // Compact per-slot context overview, directly below the CTX row it
+    // supplements. Multi-slot servers only; on narrow widths the whole row is
+    // dropped before any core metric is.
+    if llm.slots_available && llm.slot_count > 1 {
+        if let Some(overview) =
+            llm_slot_overview_line(&llm.slot_overview, llm.context_slot_id, inner.width)
+        {
+            lines.push(overview);
+        }
+    }
+
     // The LLM pane is usually taller than its core metric set because it shares a row
     // with the system pane. Use that spare vertical space for useful cumulative detail.
     if inner.height >= 10 {
@@ -1827,6 +1838,118 @@ fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     } else {
         ("IDLE", MUTED)
     }
+}
+
+/// Compact token count for the per-slot overview: `58745` -> `58.7k`,
+/// small values stay plain (`999`).
+fn compact_tokens(value: u64) -> String {
+    if value < 1000 {
+        value.to_string()
+    } else {
+        format!("{:.1}k", value as f64 / 1000.0)
+    }
+}
+
+/// One entry per slot for the per-slot context overview. The slot's own
+/// `/slots` id leads (`S7`), followed by its current occupancy. When every
+/// visible slot reports the same known capacity the entry stays compact
+/// (`S0 58.7k`); when capacities differ the entry shows
+/// `used/capacity` per slot (`S0 58.7/115.2k`) — a differing or unknown
+/// capacity is never hidden. A missing occupancy prints `—`, never a fake
+/// zero. The slot that supplies the main CTX row is marked with a trailing
+/// `*` (never by color alone); busy entries are highlighted, idle ones dimmed.
+fn slot_overview_entries(slots: &[LlmSlotInfo], selected: Option<u64>) -> Vec<(String, Color)> {
+    let unified_capacity = slots
+        .iter()
+        .map(|slot| slot.context_size)
+        .collect::<Option<Vec<_>>>()
+        .is_some_and(|capacities| capacities.iter().all(|cap| *cap == capacities[0]));
+
+    slots
+        .iter()
+        .map(|slot| {
+            let mut text = format!("S{}", slot.id);
+            match slot.context_used {
+                Some(used) => {
+                    let used = compact_tokens(used);
+                    text.push(' ');
+                    if unified_capacity && slot.context_size.is_some() {
+                        text.push_str(&used);
+                    } else {
+                        // Mixed/unknown capacities: `used` loses its own `k`
+                        // so the pair reads `58.7/115.2k` (one trailing unit).
+                        let used_number = used.trim_end_matches('k');
+                        let capacity = slot
+                            .context_size
+                            .map(compact_tokens)
+                            .unwrap_or_else(|| "—".to_string());
+                        text.push_str(&format!("{used_number}/{capacity}"));
+                    }
+                }
+                None => text.push_str(" —"),
+            }
+            if selected == Some(slot.id) {
+                text.push('*');
+            }
+            (text, if slot.busy { WHITE } else { MUTED })
+        })
+        .collect()
+}
+
+/// The width-aware `SLOTS` overview line for multi-slot servers: a padded
+/// label, one `S<n> value` entry per slot with 3-space gaps, and a `  +n`
+/// suffix when not every entry fits. Entries are dropped from the end
+/// (highest slot IDs first) deterministically. Returns `None` when even a
+/// single entry cannot fit — the row is omitted entirely rather than
+/// overflowing the panel.
+fn llm_slot_overview_line(
+    slots: &[LlmSlotInfo],
+    selected: Option<u64>,
+    width: u16,
+) -> Option<Line<'static>> {
+    let entries = slot_overview_entries(slots, selected);
+    if entries.is_empty() {
+        return None;
+    }
+
+    const LABEL_LEN: usize = 12; // " SLOTS      "
+    const ENTRY_GAP: usize = 3;
+    // `  +n` is two spaces + `+` + the digit count.
+    let suffix_len = |hidden: usize| {
+        if hidden > 0 {
+            3 + hidden.to_string().len()
+        } else {
+            0
+        }
+    };
+    // Mirrors the rendering below exactly: label, one 3-space gap between
+    // entries (none after the padded label), and the remainder suffix.
+    let fits = |kept: usize| {
+        let hidden = entries.len() - kept;
+        let text: usize = entries[..kept].iter().map(|(text, _)| text.len()).sum();
+        LABEL_LEN + text + ENTRY_GAP * (kept - 1) + suffix_len(hidden) <= width as usize
+    };
+
+    let mut kept = entries.len();
+    while kept > 0 && !fits(kept) {
+        kept -= 1;
+    }
+    if kept == 0 {
+        return None;
+    }
+    let hidden = entries.len() - kept;
+
+    let mut spans = vec![label_span(" SLOTS      ")];
+    for (index, (text, color)) in entries[..kept].iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(value_span(text, *color));
+    }
+    if hidden > 0 {
+        spans.push(value_span(&format!("  +{hidden}"), MUTED));
+    }
+    Some(Line::from(spans))
 }
 
 fn system_panel_height(system: &SystemStats) -> u16 {
@@ -5497,6 +5620,209 @@ mod tests {
         assert!(
             !text.contains("S0"),
             "below the bar-pin width the tag must be dropped, got:\n{text}"
+        );
+    }
+
+    fn overview_slots() -> Vec<LlmSlotInfo> {
+        vec![
+            LlmSlotInfo {
+                id: 0,
+                busy: true,
+                context_used: Some(58745),
+                context_size: Some(115200),
+            },
+            LlmSlotInfo {
+                id: 1,
+                busy: false,
+                context_used: Some(34200),
+                context_size: Some(115200),
+            },
+        ]
+    }
+
+    fn overview_llm(overview: Vec<LlmSlotInfo>, selected: Option<u64>) -> LlmStats {
+        LlmStats {
+            connected: true,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: 58745,
+            slots_available: true,
+            slot_count: overview.len() as u64,
+            busy_slots: overview.iter().filter(|slot| slot.busy).count() as u64,
+            context_slot_id: selected,
+            slot_overview: overview,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slot_overview_entries_format_ids_usage_and_selected_marker() {
+        let entries = slot_overview_entries(&overview_slots(), Some(0));
+        assert_eq!(entries[0].0, "S0 58.7k*");
+        assert_eq!(entries[0].1, WHITE, "busy slot is highlighted");
+        assert_eq!(entries[1].0, "S1 34.2k");
+        assert_eq!(entries[1].1, MUTED, "idle slot is dimmed");
+
+        // The marker follows context_slot_id, never a fixed position.
+        let entries = slot_overview_entries(&overview_slots(), Some(1));
+        assert_eq!(entries[0].0, "S0 58.7k");
+        assert_eq!(entries[1].0, "S1 34.2k*");
+
+        // An unknown selection marks nothing.
+        let entries = slot_overview_entries(&overview_slots(), None);
+        assert!(entries.iter().all(|(text, _)| !text.ends_with('*')));
+    }
+
+    #[test]
+    fn slot_overview_entries_show_per_slot_capacity_when_capacities_differ() {
+        let mut slots = vec![
+            LlmSlotInfo {
+                id: 0,
+                busy: true,
+                context_used: Some(58745),
+                context_size: Some(115200),
+            },
+            LlmSlotInfo {
+                id: 3,
+                busy: false,
+                context_used: Some(34200),
+                context_size: Some(70144),
+            },
+        ];
+        let entries = slot_overview_entries(&slots, Some(0));
+        assert_eq!(entries[0].0, "S0 58.7/115.2k*");
+        assert_eq!(entries[1].0, "S3 34.2/70.1k");
+
+        // A missing capacity is shown as unknown, not hidden or faked.
+        slots[1].context_size = None;
+        let entries = slot_overview_entries(&slots, Some(0));
+        assert_eq!(entries[1].0, "S3 34.2/—");
+    }
+
+    #[test]
+    fn slot_overview_entries_never_print_a_fake_zero_for_missing_usage() {
+        let slots = vec![
+            LlmSlotInfo {
+                id: 0,
+                busy: false,
+                context_used: None,
+                context_size: Some(115200),
+            },
+            LlmSlotInfo {
+                id: 7,
+                busy: false,
+                context_used: Some(999),
+                context_size: Some(115200),
+            },
+        ];
+        let entries = slot_overview_entries(&slots, Some(0));
+        assert_eq!(entries[0].0, "S0 —*");
+        assert_eq!(entries[1].0, "S7 999");
+    }
+
+    #[test]
+    fn slot_overview_line_truncates_many_slots_with_visible_remainder() {
+        let slots = (0..5)
+            .map(|id| LlmSlotInfo {
+                id,
+                busy: id % 2 == 0,
+                context_used: Some(10000 + id * 1000),
+                context_size: Some(115200),
+            })
+            .collect::<Vec<_>>();
+        // Entry widths: S0 10.0k* (9) + S1..S4 (8 each); 12 (label) + 3
+        // (gap) + 4 (suffix). Width 55 must drop entries from the end and
+        // name the remainder: 3 entries + `+2` = 47 cells fit, 4 entries
+        // + `+1` = 58 do not.
+        let line = llm_slot_overview_line(&slots, Some(0), 55).expect("row must fit");
+        let text: String = line.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("S0 10.0k*"), "got: {text}");
+        assert!(
+            text.contains("+2"),
+            "hidden entries must be named, got: {text}"
+        );
+        assert!(!text.contains("S4 "), "got: {text}");
+        // Deterministic: the same input always yields the same row.
+        let again = llm_slot_overview_line(&slots, Some(0), 55).unwrap();
+        let again_text: String = again.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, again_text);
+    }
+
+    #[test]
+    fn slot_overview_line_fits_exactly_at_the_width_boundary() {
+        // 4 entries (8 cells each) + `  +1` (4) = 12 + 32 + 9 + 4 = exactly
+        // 57 cells: the remainder marker must survive intact at the boundary
+        // and the row must fall back one entry below it.
+        let slots = (0..5)
+            .map(|id| LlmSlotInfo {
+                id,
+                busy: false,
+                context_used: Some(10000 + id * 1000),
+                context_size: Some(115200),
+            })
+            .collect::<Vec<_>>();
+        let line = llm_slot_overview_line(&slots, None, 57).expect("exact fit must pass");
+        let text: String = line.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("S3 13.0k"), "got: {text}");
+        assert!(text.ends_with("  +1"), "got: {text}");
+        assert!(!text.contains("S4 "), "got: {text}");
+        // One cell less: the suffixed 4-entry row (57) no longer fits, so
+        // the row falls back to 3 entries + `  +2` = exactly 46 cells.
+        let line = llm_slot_overview_line(&slots, None, 56).unwrap();
+        let text: String = line.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("S2 12.0k"), "got: {text}");
+        assert!(text.ends_with("  +2"), "got: {text}");
+        assert!(!text.contains("S3 "), "got: {text}");
+        // And 3 entries + `  +2` = 46 cells still fits at width 46.
+        let line = llm_slot_overview_line(&slots, None, 46).unwrap();
+        let text: String = line.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.ends_with("  +2"), "got: {text}");
+        assert!(!text.contains("S3 "), "got: {text}");
+    }
+
+    #[test]
+    fn slot_overview_line_omitted_when_nothing_fits() {
+        let line = llm_slot_overview_line(&overview_slots(), Some(0), 20);
+        assert!(
+            line.is_none(),
+            "a 20-cell pane cannot hold label + one entry"
+        );
+        assert!(llm_slot_overview_line(&[], Some(0), 120).is_none());
+    }
+
+    #[test]
+    fn llm_panel_multi_slot_shows_per_slot_overview_below_the_ctx_row() {
+        let llm = overview_llm(overview_slots(), Some(0));
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(text.contains("S0 58.7k*"), "got:\n{text}");
+        assert!(text.contains("S1 34.2k"), "got:\n{text}");
+        // The main CTX row stays authoritative and unchanged.
+        assert!(
+            text.contains("58,745 / 115,200 tok"),
+            "main CTX pair must stay readable, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn llm_panel_single_slot_never_shows_the_overview() {
+        let mut llm = overview_llm(overview_slots(), Some(0));
+        llm.slot_count = 1;
+        llm.slot_overview.truncate(1);
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            !text.contains("S0"),
+            "single-slot panels must not gain a redundant overview, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrow_llm_panel_omits_the_slot_overview_safely() {
+        let llm = overview_llm(overview_slots(), Some(0));
+        // Width 20 fits the CTX row but not even one overview entry.
+        let text = render_llm_panel(&llm, 20, 12);
+        assert!(
+            !text.contains("58.7k"),
+            "the overview must be dropped before corrupting the panel, got:\n{text}"
         );
     }
 }

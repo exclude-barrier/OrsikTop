@@ -14,6 +14,20 @@ All notable changes to OrsikTop will be documented here.
   compact row, a slot without an `id` field prints no number, and on very
   narrow terminals the tag is dropped before any context value is.
 
+- Multi-slot llama.cpp servers (`--parallel > 1`) now also show a compact
+  per-slot context overview directly below the CTX row, reusing the same
+  `/slots` poll (no extra request): `SLOTS S0 58.7k* S1 34.2k`. Each entry
+  names the slot by its own `/slots` id (real IDs, never array positions,
+  ordered by id), busy slots are highlighted and idle ones dimmed, and the
+  slot supplying the main CTX row is marked with a trailing `*`. When slot
+  capacities differ the entry switches to `used/capacity` form
+  (`S0 58.7/115.2k* S3 34.2/70.1k`) instead of hiding the difference; absent
+  values print `—` instead of a fake zero, and non-fitting entries are
+  truncated with a visible `+n` remainder. The main CTX row stays the
+  authoritative selected-slot display — the overview never sums slot
+  contexts — and on narrow terminals the whole row is dropped before any
+  core metric is. Single-slot servers are unaffected.
+
 ## [0.2.5] - 2026-09-18
 
 ### Added
