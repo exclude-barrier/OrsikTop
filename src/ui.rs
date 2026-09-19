@@ -185,10 +185,14 @@ impl UiState {
             (Some(used), Some(total)) if total > 0.0 => Some(percent(used, total)),
             _ => None,
         };
-        let ram = percent(
-            system.memory_used_bytes as f64,
-            system.memory_total_bytes as f64,
-        );
+        let ram = if system.memory_total_bytes > 0 {
+            Some(percent(
+                system.memory_used_bytes as f64,
+                system.memory_total_bytes as f64,
+            ))
+        } else {
+            None
+        };
 
         if let Some(utilization) = gpu.utilization {
             push_history_at(&mut self.gpu_history, utilization, now);
@@ -197,7 +201,9 @@ impl UiState {
             push_history_at(&mut self.vram_history, vram, now);
         }
         push_history_at(&mut self.cpu_history, system.cpu_usage, now);
-        push_history_at(&mut self.ram_history, ram, now);
+        if let Some(ram) = ram {
+            push_history_at(&mut self.ram_history, ram, now);
+        }
     }
 
     pub fn observe_llm_sample(&mut self, llm: &LlmStats) {
@@ -1988,11 +1994,46 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         return;
     }
 
-    let ram_pct = percent(
-        system.memory_used_bytes as f64,
-        system.memory_total_bytes as f64,
-    );
     let bar_width = inner.width.saturating_sub(16).max(8) as usize;
+
+    // Same validity semantics as VRAM/POWER: an unavailable or zero total
+    // means the RAM meter renders as unavailable ("—"), never a fabricated
+    // 0.0 % / 0.0 GiB.
+    let ram_pct = if system.memory_total_bytes > 0 {
+        Some(percent(
+            system.memory_used_bytes as f64,
+            system.memory_total_bytes as f64,
+        ))
+    } else {
+        None
+    };
+    let ram_meter = match ram_pct {
+        Some(pct) => meter_line(
+            "RAM",
+            pct,
+            bar_width,
+            CYAN,
+            format!("{:>4.1}%", pct),
+            vec![],
+        ),
+        None => unavailable_meter_line("RAM", bar_width, vec![]),
+    };
+    let ram_used_text = match ram_pct {
+        Some(_) => format!("{:.1} GiB", bytes_to_gib(system.memory_used_bytes)),
+        None => "—".to_string(),
+    };
+    let ram_total_text = match ram_pct {
+        Some(_) => format!("{:.1} GiB", bytes_to_gib(system.memory_total_bytes)),
+        None => "—".to_string(),
+    };
+    let ram_pair_text = match ram_pct {
+        Some(_) => format!(
+            "{:.1} / {:.1} GiB",
+            bytes_to_gib(system.memory_used_bytes),
+            bytes_to_gib(system.memory_total_bytes)
+        ),
+        None => "—".to_string(),
+    };
 
     if !system_full_view(inner.width, inner.height) {
         let mut lines = vec![
@@ -2004,27 +2045,14 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
                 format!("{:>4.1}%", clamp_percent(system.cpu_usage)),
                 vec![],
             ),
-            meter_line(
-                "RAM",
-                ram_pct,
-                bar_width,
-                CYAN,
-                format!("{:>4.1}%", ram_pct),
-                vec![],
-            ),
+            ram_meter.clone(),
             Line::from(vec![
                 label_span(" USED     "),
-                value_span(
-                    &format!("{:.1} GiB", bytes_to_gib(system.memory_used_bytes)),
-                    CYAN,
-                ),
+                value_span(&ram_used_text, CYAN),
             ]),
             Line::from(vec![
                 label_span(" TOTAL    "),
-                value_span(
-                    &format!("{:.1} GiB", bytes_to_gib(system.memory_total_bytes)),
-                    WHITE,
-                ),
+                value_span(&ram_total_text, WHITE),
             ]),
         ];
         lines.truncate(inner.height as usize);
@@ -2129,25 +2157,8 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     }
 
     lines.extend([
-        meter_line(
-            "RAM",
-            ram_pct,
-            bar_width,
-            CYAN,
-            format!("{:>4.1}%", ram_pct),
-            vec![],
-        ),
-        Line::from(vec![
-            label_span("      "),
-            value_span(
-                &format!(
-                    "{:.1} / {:.1} GiB",
-                    bytes_to_gib(system.memory_used_bytes),
-                    bytes_to_gib(system.memory_total_bytes)
-                ),
-                CYAN,
-            ),
-        ]),
+        ram_meter,
+        Line::from(vec![label_span("      "), value_span(&ram_pair_text, CYAN)]),
         Line::from(vec![
             label_span(" SWAP "),
             value_span(
@@ -5385,6 +5396,143 @@ mod tests {
             text.contains("P-CORES") && text.contains("E-CORES"),
             "P/E minibar header must render, got:\n{text}",
         );
+    }
+
+    fn render_system_rows(system: &SystemStats, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_system(frame, area, system))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let raw: String = (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect();
+                raw.trim_start_matches('│')
+                    .trim_end_matches('│')
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn system_panel_renders_ram_unavailable_when_total_is_zero() {
+        // Regression for review finding C3: with `memory_total_bytes == 0`
+        // the SYSTEM panel must render the RAM meter as unavailable ("—")
+        // like VRAM/POWER — never a fabricated 0.0 % / 0.0 GiB.
+        let system = SystemStats {
+            memory_used_bytes: 16 * 1024 * 1024 * 1024,
+            memory_total_bytes: 0,
+            ..Default::default()
+        };
+
+        // Full view (panel height 13, width 70).
+        let rows = render_system_rows(&system, 70, 13);
+        let ram_index = rows
+            .iter()
+            .position(|row| row.trim_start().starts_with("RAM"))
+            .expect("RAM meter row must render");
+        let ram_row = &rows[ram_index];
+        assert!(
+            ram_row.contains('—'),
+            "RAM meter must render unavailable, got: {ram_row:?}"
+        );
+        assert!(
+            !ram_row.contains("0.0%"),
+            "RAM meter must not fabricate a 0.0 % value, got: {ram_row:?}"
+        );
+        // The used/total GiB pair row directly below the meter is
+        // unavailable as well.
+        let pair_row = rows
+            .get(ram_index + 1)
+            .expect("used/total GiB pair row must render");
+        assert_eq!(
+            pair_row, "—",
+            "used/total GiB pair must be unavailable, got: {pair_row:?}"
+        );
+
+        // Compact fallback (below the full-view height floor) shares the
+        // same validity semantics.
+        let rows = render_system_rows(&system, 70, 8);
+        let ram_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("RAM"))
+            .expect("RAM meter row must render in compact view");
+        assert!(
+            ram_row.contains('—'),
+            "compact RAM meter must render unavailable, got: {ram_row:?}"
+        );
+        assert!(
+            !ram_row.contains("0.0%"),
+            "compact RAM meter must not fabricate a 0.0 % value, got: {ram_row:?}"
+        );
+        let used_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("USED"))
+            .expect("USED row must render in compact view");
+        assert!(
+            used_row.contains('—') && !used_row.contains("GiB"),
+            "compact USED row must be unavailable, got: {used_row:?}"
+        );
+        let total_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("TOTAL"))
+            .expect("TOTAL row must render in compact view");
+        assert!(
+            total_row.contains('—') && !total_row.contains("GiB"),
+            "compact TOTAL row must be unavailable, got: {total_row:?}"
+        );
+    }
+
+    #[test]
+    fn system_panel_renders_ram_meter_when_total_is_valid() {
+        // Existing behavior must be preserved: a valid total renders the
+        // real percentage and GiB pair.
+        let system = SystemStats {
+            memory_used_bytes: 16 * 1024 * 1024 * 1024,
+            memory_total_bytes: 64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let rows = render_system_rows(&system, 70, 13);
+        let ram_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("RAM"))
+            .expect("RAM meter row must render");
+        assert!(
+            ram_row.contains("25.0%"),
+            "RAM meter must show 25.0 %, got: {ram_row:?}"
+        );
+        assert!(
+            !ram_row.contains('—'),
+            "RAM meter must not render unavailable for a valid total, got: {ram_row:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("16.0 / 64.0 GiB")),
+            "full view must show the used/total GiB pair, got: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn ram_history_skips_samples_without_total() {
+        // The history sparkline must follow the same validity semantics:
+        // no total, no sample — never a fabricated zero.
+        let mut state = UiState::default();
+        let gpu = GpuStats::default();
+        let mut system = SystemStats::default();
+
+        state.push_sample(&gpu, &system);
+        assert!(state.ram_history.is_empty());
+
+        system.memory_used_bytes = 16 * 1024 * 1024 * 1024;
+        system.memory_total_bytes = 64 * 1024 * 1024 * 1024;
+        state.push_sample(&gpu, &system);
+        assert_eq!(state.ram_history.len(), 1);
+        assert!((state.ram_history[0].value - 25.0).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -28,6 +28,14 @@ All notable changes to OrsikTop will be documented here.
   contexts — and on narrow terminals the whole row is dropped before any
   core metric is. Single-slot servers are unaffected.
 
+### Fixed
+
+- RAM telemetry now renders unavailable (`—`) instead of a misleading
+  `0.0%` / `0.0 GiB` when the total memory reading is missing or zero, in
+  both the system panel meter and the RAM history sparkline — matching the
+  existing VRAM/POWER semantics (missing telemetry is never a fabricated
+  zero).
+
 ## [0.2.5] - 2026-09-18
 
 ### Added
