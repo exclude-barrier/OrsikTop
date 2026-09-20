@@ -18,9 +18,9 @@
 //! kernel exposes, not an invented dedicated-VRAM number. All filesystem access
 //! goes through [`Sys`] so the provider is fixture-testable.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::{GpuProvider, GpuStats};
+use super::{find_hwmon_for_bdf, pci_device_dir, GpuProvider, GpuStats};
 use crate::discovery::DiscoveredGpu;
 use crate::system::{RealSys, Sys};
 
@@ -47,7 +47,7 @@ impl AmdGpuProvider<RealSys> {
     /// Build a provider over the real filesystem for one discovered AMD GPU.
     pub(crate) fn new(gpu: DiscoveredGpu, index: u32) -> Self {
         let sys = RealSys;
-        let hwmon = find_hwmon_for_bdf(&sys, gpu.device_id.key());
+        let hwmon = find_hwmon_for_bdf(&sys, gpu.device_id.key(), &["amdgpu"]);
         Self {
             gpu,
             sys,
@@ -55,41 +55,6 @@ impl AmdGpuProvider<RealSys> {
             index,
         }
     }
-}
-
-fn pci_device_dir(bdf: &str) -> PathBuf {
-    Path::new("/sys/bus/pci/devices").join(bdf)
-}
-
-/// Find the `hwmonN` whose parent is the PCI device with `bdf`. The amdgpu
-/// hwmon is registered on the GPU's PCI device, so the hwmon `device` symlink
-/// resolves to that device and the BDF is one of its path components. `None`
-/// when no hwmon matches (then the thermal/clock/power/fan metrics degrade to
-/// `None`) — this is how kernel/driver differences are tolerated.
-fn find_hwmon_for_bdf<S: Sys>(sys: &S, bdf: &str) -> Option<String> {
-    let root = Path::new("/sys/class/hwmon");
-    let entries = sys.read_dir(root)?;
-    for entry in &entries {
-        if !entry.name.starts_with("hwmon") {
-            continue;
-        }
-        let device_link = root.join(&entry.name).join("device");
-        let Some(target) = sys.symlink_target(&device_link) else {
-            continue;
-        };
-        if path_component_is_bdf(&target, bdf) {
-            return Some(entry.name.clone());
-        }
-    }
-    None
-}
-
-/// True when any path component of `target` (searched from the end) equals `bdf`.
-fn path_component_is_bdf(target: &str, bdf: &str) -> bool {
-    Path::new(target)
-        .components()
-        .rev()
-        .any(|c| c.as_os_str().to_string_lossy() == bdf)
 }
 
 impl<S: Sys + Send> GpuProvider for AmdGpuProvider<S> {
@@ -273,7 +238,7 @@ mod tests {
     }
 
     fn provider(sys: FixtureSys, bdf: &str) -> AmdGpuProvider<FixtureSys> {
-        let hwmon = find_hwmon_for_bdf(&sys, bdf);
+        let hwmon = find_hwmon_for_bdf(&sys, bdf, &["amdgpu"]);
         AmdGpuProvider {
             gpu: amd_gpu(bdf, "card0"),
             sys,
@@ -371,14 +336,14 @@ mod tests {
         add_hwmon(&mut sys, "hwmon1", "0000:02:00.0");
 
         assert_eq!(
-            find_hwmon_for_bdf(&sys, "0000:01:00.0"),
+            find_hwmon_for_bdf(&sys, "0000:01:00.0", &["amdgpu"]),
             Some("hwmon0".to_string())
         );
         assert_eq!(
-            find_hwmon_for_bdf(&sys, "0000:02:00.0"),
+            find_hwmon_for_bdf(&sys, "0000:02:00.0", &["amdgpu"]),
             Some("hwmon1".to_string())
         );
-        assert_eq!(find_hwmon_for_bdf(&sys, "0000:09:99.9"), None);
+        assert_eq!(find_hwmon_for_bdf(&sys, "0000:09:99.9", &["amdgpu"]), None);
     }
 
     #[test]
