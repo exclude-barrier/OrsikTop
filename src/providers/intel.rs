@@ -73,7 +73,22 @@ impl IntelGpuProvider<RealSys> {
 /// Unknown device IDs fall back to the card name (the pre-existing behavior),
 /// so nothing regresses and no name is invented for an unrecognized device.
 fn display_name(gpu: &DiscoveredGpu) -> String {
-    const KNOWN: &[(u16, &str)] = &[(0x64a0, "Intel Arc (Core Ultra 200V iGPU)")];
+    /// Well-known Intel GPU device IDs (vendor 0x8086), from the vendor's
+    /// PCI ID database, for the generations that run local inference
+    /// (Iris Xe / Arc iGPUs and the most common Arc dGPUs).
+    const KNOWN: &[(u16, &str)] = &[
+        (0x64a0, "Intel Arc (Core Ultra 200V iGPU)"),
+        (0x7d45, "Intel Arc (Meteor Lake-P iGPU)"),
+        (0x7d55, "Intel Arc (Meteor Lake-P iGPU)"),
+        (0x9a49, "Intel Iris Xe (Tiger Lake iGPU)"),
+        (0x46a6, "Intel Iris Xe (Alder Lake iGPU)"),
+        (0x46a8, "Intel Iris Xe (Alder Lake iGPU)"),
+        (0x46aa, "Intel Iris Xe (Alder Lake iGPU)"),
+        (0x56a0, "Intel Arc A770"),
+        (0x56a1, "Intel Arc A750"),
+        (0xe20b, "Intel Arc B580"),
+        (0xe20c, "Intel Arc B570"),
+    ];
     KNOWN
         .iter()
         .find(|(id, _)| *id == gpu.pci_device_id)
@@ -391,7 +406,20 @@ mod tests {
         );
         let mut sys = FixtureSys::default();
         add_xe(&mut sys, "0000:00:02.0", Some(800), Some("none"));
-        assert_eq!(provider(sys, apu).sample().name, "card0");
+        assert_eq!(provider(sys, apu.clone()).sample().name, "card0");
+
+        // The other mapped iGPU/dGPU IDs (vendor 0x8086, from the PCI ID db).
+        let mut named = apu.clone();
+        for (id, expected) in [
+            (0x7d55, "Intel Arc (Meteor Lake-P iGPU)"),
+            (0x9a49, "Intel Iris Xe (Tiger Lake iGPU)"),
+            (0x46a6, "Intel Iris Xe (Alder Lake iGPU)"),
+            (0x56a0, "Intel Arc A770"),
+            (0xe20b, "Intel Arc B580"),
+        ] {
+            named.pci_device_id = id;
+            assert_eq!(display_name(&named), expected, "device id {id:#x}");
+        }
     }
 
     #[test]
@@ -435,6 +463,27 @@ mod tests {
         assert!(stats.available);
         assert_eq!(stats.graphics_clock_mhz, Some(1000.0));
         assert_eq!(stats.limit_reason, "none");
+    }
+
+    #[test]
+    fn i915_reads_clock_and_reasons_from_gt_gt0_fallback() {
+        // Regression: when the card root has no root-GT attributes, both the
+        // clock AND the throttle booleans must come from the same gt/gt0
+        // fallback directory — never a mix of card-root and gt/gt0 reads.
+        let mut sys = FixtureSys::default();
+        let dir = "/sys/class/drm/card0";
+        sys.dir_entry("/sys/class/drm", "card0", false, false);
+        sys.dir_entry(dir, "", false, false);
+        let gt = format!("{dir}/gt/gt0");
+        sys.file(format!("{gt}/rps_cur_freq_mhz").as_str(), "1200\n");
+        sys.file(format!("{gt}/throttle_reason_thermal").as_str(), "1\n");
+        let mut provider = provider(sys, intel_gpu("i915", "0000:00:02.0", "card0"));
+
+        let stats = provider.sample();
+
+        assert!(stats.available);
+        assert_eq!(stats.graphics_clock_mhz, Some(1200.0));
+        assert_eq!(stats.limit_reason, "thermal");
     }
 
     #[test]

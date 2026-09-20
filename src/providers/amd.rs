@@ -79,6 +79,7 @@ impl<S: Sys + Send> GpuProvider for AmdGpuProvider<S> {
         let vram_total = read_u64(&self.sys, &pci.join("mem_info_vram_total")).map(bytes_to_mib);
         let vram_used = read_u64(&self.sys, &pci.join("mem_info_vram_used")).map(bytes_to_mib);
         let name = read_text(&self.sys, &pci.join("product_name"))
+            .or_else(|| display_name(&self.gpu).map(str::to_string))
             .unwrap_or_else(|| self.gpu.card.clone());
 
         let mut stats = GpuStats {
@@ -143,6 +144,30 @@ fn read_i64<S: Sys>(sys: &S, path: &Path) -> Option<i64> {
 
 fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
+}
+
+/// A short, stable display name for well-known AMD GPU/APU device IDs, used
+/// only when the driver exposes no `product_name` (common on APUs). The names
+/// follow the vendor's PCI ID database; unknown device IDs fall back to the
+/// card name (the pre-existing behavior), so nothing regresses and no name is
+/// invented for an unrecognized device.
+fn display_name(gpu: &DiscoveredGpu) -> Option<&'static str> {
+    const KNOWN: &[(u16, &str)] = &[
+        (0x13c0, "AMD Radeon (Granite Ridge APU iGPU)"),
+        (0x1586, "AMD Radeon (Strix Halo APU iGPU)"),
+        (0x1681, "AMD Radeon 680M (Rembrandt APU iGPU)"),
+        (0x7481, "AMD Radeon (Navi 33 APU iGPU)"),
+        (0x7487, "AMD Radeon (Navi 33 APU iGPU)"),
+        (0x748b, "AMD Radeon (Navi 33 APU iGPU)"),
+        (0x73ff, "AMD Radeon RX 6600 series (Navi 23)"),
+        (0x73bf, "AMD Radeon RX 6800/6900 series (Navi 21)"),
+        (0x744c, "AMD Radeon RX 7900 series (Navi 31)"),
+        (0x747e, "AMD Radeon RX 7700/7800 series (Navi 32)"),
+    ];
+    KNOWN
+        .iter()
+        .find(|(id, _)| *id == gpu.pci_device_id)
+        .map(|(_, name)| *name)
 }
 
 /// Clamp utilization percentages to 0..=100 and drop non-finite optional
@@ -263,7 +288,9 @@ mod tests {
         let stats = provider.sample();
 
         assert!(stats.available);
-        assert_eq!(stats.name, "card0"); // no product_name → card name
+        // No product_name, and the fixture's device id (0x74a0) is not in the
+        // known map → the card name is the final fallback.
+        assert_eq!(stats.name, "card0");
         assert_eq!(stats.utilization, Some(42.0));
         assert_eq!(stats.memory_utilization, Some(17.0));
         assert_eq!(stats.memory_total_mib, Some(16384.0));
@@ -327,6 +354,69 @@ mod tests {
         let stats = provider.sample();
         assert!(!stats.available);
         assert!(stats.error.contains("not readable"));
+    }
+
+    #[test]
+    fn missing_product_name_falls_back_to_known_device_id_name() {
+        // APU shape: the amdgpu sysfs exposes no product_name on many APUs.
+        // A well-known APU device id must yield a real name, not the bare
+        // card name.
+        let mut sys = FixtureSys::default();
+        let dir = "/sys/bus/pci/devices/0000:01:00.0";
+        sys.dir_entry(dir, "", false, false);
+        sys.file(format!("{dir}/gpu_busy_percent").as_str(), "3\n");
+
+        let bdf = "0000:01:00.0";
+        let hwmon = find_hwmon_for_bdf(&sys, bdf, &["amdgpu"]);
+        let mut provider = AmdGpuProvider {
+            gpu: {
+                let mut gpu = amd_gpu(bdf, "card0");
+                gpu.pci_device_id = 0x1586; // Strix Halo APU
+                gpu
+            },
+            sys,
+            hwmon,
+            index: 0,
+        };
+
+        let stats = provider.sample();
+
+        assert!(stats.available);
+        assert_eq!(stats.name, "AMD Radeon (Strix Halo APU iGPU)");
+
+        // An unknown device id still falls back to the card name.
+        let mut sys = FixtureSys::default();
+        sys.dir_entry(dir, "", false, false);
+        sys.file(format!("{dir}/gpu_busy_percent").as_str(), "3\n");
+        let hwmon = find_hwmon_for_bdf(&sys, bdf, &["amdgpu"]);
+        let mut provider = AmdGpuProvider {
+            gpu: amd_gpu(bdf, "card0"), // pci_device_id 0x74a0 (not mapped)
+            sys,
+            hwmon,
+            index: 0,
+        };
+        assert_eq!(provider.sample().name, "card0");
+
+        // A real product_name always wins over the map.
+        let mut sys = FixtureSys::default();
+        sys.dir_entry(dir, "", false, false);
+        sys.file(format!("{dir}/gpu_busy_percent").as_str(), "3\n");
+        sys.file(
+            format!("{dir}/product_name").as_str(),
+            "Ryzen AI Max+ 395 Radeon 8060S\n",
+        );
+        let hwmon = find_hwmon_for_bdf(&sys, bdf, &["amdgpu"]);
+        let mut provider = AmdGpuProvider {
+            gpu: {
+                let mut gpu = amd_gpu(bdf, "card0");
+                gpu.pci_device_id = 0x1586;
+                gpu
+            },
+            sys,
+            hwmon,
+            index: 0,
+        };
+        assert_eq!(provider.sample().name, "Ryzen AI Max+ 395 Radeon 8060S");
     }
 
     #[test]
