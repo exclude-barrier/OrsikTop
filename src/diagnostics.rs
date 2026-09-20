@@ -140,7 +140,7 @@ fn gpu_section(out: &mut String, sys: &impl crate::system::Sys) {
             } else {
                 &gpu.driver
             },
-            opt(gpu.render_node.as_deref())
+            opt((!gpu.render_nodes.is_empty()).then(|| gpu.render_nodes.join(", ")))
         ));
         if !gpu.outputs.is_empty() {
             out.push_str(&format!("       outputs  : {}\n", gpu.outputs.join(", ")));

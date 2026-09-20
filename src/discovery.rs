@@ -23,8 +23,11 @@ pub struct DiscoveredGpu {
     pub pci_class_code: u32,
     /// Bound driver name (`nvidia`, `amdgpu`, `i915`, `xe`, …) or empty.
     pub driver: String,
-    /// Render node name (`renderD128`) when the card exposes one.
-    pub render_node: Option<String>,
+    /// All render node names (`renderD128`, …) the card exposes, in
+    /// directory order. Intel iGPUs and xe expose several nodes per device
+    /// (e.g. a display+render node and a compute-only node), so this is a
+    /// list; empty when the card exposes no render node.
+    pub render_nodes: Vec<String>,
     /// Connector names (`card0-DP-1`, …) attached to this card.
     pub outputs: Vec<String>,
 }
@@ -132,7 +135,7 @@ pub fn discover_gpus<S: Sys>(sys: &S) -> Vec<DiscoveredGpu> {
     let mut cards: Vec<String> = Vec::new();
     let mut outputs: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    let mut render_nodes: Vec<(String, String)> = Vec::new(); // (name, target)
+    let mut all_render_nodes: Vec<(String, String)> = Vec::new(); // (name, target)
 
     for entry in entries {
         if !entry.is_symlink {
@@ -145,7 +148,7 @@ pub fn discover_gpus<S: Sys>(sys: &S) -> Vec<DiscoveredGpu> {
             let card = entry.name.split('-').next().unwrap_or_default().to_string();
             outputs.entry(card).or_default().push(entry.name);
         } else if entry.name.starts_with("renderD") {
-            render_nodes.push((entry.name, target));
+            all_render_nodes.push((entry.name, target));
         } else if entry.name.starts_with("card") {
             cards.push(entry.name.clone());
         }
@@ -207,13 +210,14 @@ pub fn discover_gpus<S: Sys>(sys: &S) -> Vec<DiscoveredGpu> {
                 .unwrap_or(GpuVendor::Unknown),
         };
 
-        let render_node = render_nodes
+        let render_nodes: Vec<String> = all_render_nodes
             .iter()
-            .find(|(_, target)| {
+            .filter(|(_, target)| {
                 resolve_link(drm_root.as_path(), target)
                     .is_some_and(|path| path.starts_with(pci_dir))
             })
-            .map(|(name, _)| name.clone());
+            .map(|(name, _)| name.clone())
+            .collect();
 
         discovered.push(DiscoveredGpu {
             card: card.clone(),
@@ -223,7 +227,7 @@ pub fn discover_gpus<S: Sys>(sys: &S) -> Vec<DiscoveredGpu> {
             pci_device_id: pci_device.unwrap_or(0) as u16,
             pci_class_code: class.unwrap_or(0),
             driver,
-            render_node,
+            render_nodes,
             outputs: outputs.remove(&card).unwrap_or_default(),
         });
     }
@@ -300,7 +304,7 @@ mod tests {
         assert_eq!(gpu.pci_device_id, 0x2684);
         assert_eq!(gpu.pci_class_code, 0x030000);
         assert_eq!(gpu.driver, "nvidia");
-        assert_eq!(gpu.render_node.as_deref(), Some("renderD128"));
+        assert_eq!(gpu.render_nodes, vec!["renderD128".to_string()]);
         assert_eq!(gpu.outputs, vec!["card0-DP-1".to_string()]);
     }
 
@@ -386,7 +390,30 @@ mod tests {
         let gpus = discover_gpus(&sys);
         assert_eq!(gpus.len(), 1);
         assert!(gpus[0].outputs.is_empty());
-        assert_eq!(gpus[0].render_node.as_deref(), Some("renderD128"));
+        assert_eq!(gpus[0].render_nodes, vec!["renderD128".to_string()]);
+    }
+
+    #[test]
+    fn captures_all_render_nodes_of_a_card() {
+        // Intel iGPU shape: the driver exposes a display+render node
+        // (renderD128) and a compute-only node (renderD129) on the same PCI
+        // device. Both must be captured — a llama.cpp compute client typically
+        // opens the compute node, and process→device attribution relies on the
+        // full set.
+        let mut sys = FixtureSys::default();
+        add_card(&mut sys, "card0", "0000:00:02.0", "0x8086", "0x64a0", "xe");
+        sys.symlink(
+            "/sys/class/drm/renderD129",
+            "../../devices/pci0000:00/0000:00:02.0/drm/renderD129",
+        );
+        sys.dir_entry("/sys/class/drm", "renderD129", false, true);
+
+        let gpus = discover_gpus(&sys);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(
+            gpus[0].render_nodes,
+            vec!["renderD128".to_string(), "renderD129".to_string()]
+        );
     }
 
     #[test]
@@ -437,7 +464,7 @@ mod tests {
                 v = gpu.pci_vendor_id,
                 d = gpu.pci_device_id,
                 c = gpu.pci_class_code,
-                r = gpu.render_node,
+                r = gpu.render_nodes,
                 outputs = gpu.outputs
             );
         }

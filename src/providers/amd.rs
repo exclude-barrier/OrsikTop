@@ -223,7 +223,7 @@ mod tests {
             pci_device_id: 0x74a0,
             pci_class_code: 0x030000,
             driver: "amdgpu".to_string(),
-            render_node: None,
+            render_nodes: Vec::new(),
             outputs: Vec::new(),
         }
     }
