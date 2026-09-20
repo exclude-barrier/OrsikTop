@@ -33,25 +33,45 @@ use crate::system::Sys;
 /// (`pci-0000:01:00.0-render`, `pci-0000:01:00.0-card`). The by-path name is
 /// the stable, PCI-derived identity that `/proc/<pid>/fd` entries resolve to.
 /// Returns `None` for non-PCI by-path names (`platform-…`) or malformed input.
-fn bdf_from_by_path_name(name: &str) -> Option<&str> {
+/// An 8-digit PCI domain is accepted and canonicalized to the 4-digit form
+/// via [`normalize_pci_bdf`] (domains ≥ `0x10000` stay 8-digit, like NVML
+/// ingress).
+fn bdf_from_by_path_name(name: &str) -> Option<String> {
     let rest = name.strip_prefix("pci-")?;
     let bdf = rest.split('-').next()?;
-    let bytes = bdf.as_bytes();
-    if bytes.len() != 12 {
+    if !is_bdf_bytes(bdf.as_bytes()) {
         return None;
     }
-    if !(0..4).all(|i| bytes[i].is_ascii_hexdigit())
-        || bytes[4] != b':'
-        || !(5..7).all(|i| bytes[i].is_ascii_hexdigit())
-        || bytes[7] != b':'
-        || !(8..10).all(|i| bytes[i].is_ascii_hexdigit())
-        || bytes[10] != b'.'
-        || !bytes[11].is_ascii_digit()
-        || bytes[11] > b'7'
-    {
-        return None;
+    Some(normalize_pci_bdf(bdf))
+}
+
+/// True when `bytes` is a PCI BDF: a 4- or 8-digit hex domain, 2-digit bus
+/// and slot, and a function digit 0–7.
+fn is_bdf_bytes(bytes: &[u8]) -> bool {
+    let is_hex = |b: u8| b.is_ascii_hexdigit();
+    match bytes.len() {
+        12 => {
+            (0..4).all(|i| is_hex(bytes[i]))
+                && bytes[4] == b':'
+                && (5..7).all(|i| is_hex(bytes[i]))
+                && bytes[7] == b':'
+                && (8..10).all(|i| is_hex(bytes[i]))
+                && bytes[10] == b'.'
+                && bytes[11].is_ascii_digit()
+                && bytes[11] <= b'7'
+        }
+        16 => {
+            (0..8).all(|i| is_hex(bytes[i]))
+                && bytes[8] == b':'
+                && (9..11).all(|i| is_hex(bytes[i]))
+                && bytes[11] == b':'
+                && (12..14).all(|i| is_hex(bytes[i]))
+                && bytes[14] == b'.'
+                && bytes[15].is_ascii_digit()
+                && bytes[15] <= b'7'
+        }
+        _ => false,
     }
-    Some(bdf)
 }
 
 /// PCI BDFs of the discovered GPUs that the process has an open DRM render
@@ -85,13 +105,14 @@ pub fn process_render_gpus<S: Sys>(sys: &S, pid: u32, gpus: &[DiscoveredGpu]) ->
 
         // Resolve the fd's device node to a stable BDF key.
         let key = if component.starts_with("renderD") {
-            // Stable render-node name → the discovered GPU that owns it.
+            // Stable render-node name → the discovered GPU that exposes one
+            // of its (possibly several) render nodes.
             gpus.iter()
-                .find(|g| g.render_node.as_deref() == Some(component.as_str()))
+                .find(|g| g.render_nodes.iter().any(|n| n.as_str() == component))
                 .map(|g| g.device_id.key().to_string())
         } else {
             // by-path name → BDF embedded in the name.
-            bdf_from_by_path_name(&component).map(str::to_string)
+            bdf_from_by_path_name(&component)
         };
 
         if let Some(key) = key {
@@ -344,7 +365,7 @@ mod tests {
                 pci_device_id: 0x74a0,
                 pci_class_code: 0x030000,
                 driver: "amdgpu".to_string(),
-                render_node: Some(format!("renderD{}", 128 + i)),
+                render_nodes: vec![format!("renderD{}", 128 + i)],
                 outputs: Vec::new(),
             })
             .collect()
@@ -388,6 +409,25 @@ mod tests {
         // fd target is the stable render-node device node itself.
         sys.dir_entry("/proc/4242/fd", "7", false, false);
         sys.symlink("/proc/4242/fd/7", "/dev/dri/renderD128");
+
+        let render = process_render_gpus(&sys, 4242, &gpus);
+        assert_eq!(
+            render,
+            vec![DeviceId::new(Some("0000:01:00.0".into()), None)]
+        );
+    }
+
+    #[test]
+    fn render_fd_on_secondary_render_node_maps_to_same_gpu() {
+        let mut sys = FixtureSys::default();
+        add_gpu(&mut sys, "card0", "0000:01:00.0", "renderD128");
+        let mut gpus = gpu_list(&["0000:01:00.0"]);
+        // The iGPU also exposes a compute-only render node (i915/xe shape).
+        gpus[0].render_nodes.push("renderD129".to_string());
+
+        // The process holds an open fd to the compute node, not renderD128.
+        sys.dir_entry("/proc/4242/fd", "7", false, false);
+        sys.symlink("/proc/4242/fd/7", "/dev/dri/renderD129");
 
         let render = process_render_gpus(&sys, 4242, &gpus);
         assert_eq!(
@@ -572,11 +612,11 @@ mod tests {
     fn bdf_parser_rejects_malformed_names() {
         assert_eq!(
             bdf_from_by_path_name("pci-0000:01:00.0-render"),
-            Some("0000:01:00.0")
+            Some("0000:01:00.0".to_string())
         );
         assert_eq!(
             bdf_from_by_path_name("pci-0000:01:00.0-card"),
-            Some("0000:01:00.0")
+            Some("0000:01:00.0".to_string())
         );
         // Non-PCI by-path name.
         assert_eq!(bdf_from_by_path_name("platform-fd500000.gpu"), None);
@@ -585,6 +625,22 @@ mod tests {
         assert_eq!(bdf_from_by_path_name("pci-0000:01:00.8-render"), None);
         // No pci- prefix.
         assert_eq!(bdf_from_by_path_name("renderD128"), None);
+    }
+
+    #[test]
+    fn bdf_parser_accepts_eight_digit_domains() {
+        // The default domain reported in 8-digit form canonicalizes to the
+        // 4-digit form used by discovery; domains ≥ 0x10000 stay 8-digit.
+        assert_eq!(
+            bdf_from_by_path_name("pci-00000000:01:00.0-render"),
+            Some("0000:01:00.0".to_string())
+        );
+        assert_eq!(
+            bdf_from_by_path_name("pci-00010000:41:00.0-render"),
+            Some("00010000:41:00.0".to_string())
+        );
+        // 8-digit form with a bad function digit is rejected.
+        assert_eq!(bdf_from_by_path_name("pci-00000000:01:00.8-render"), None);
     }
 
     #[test]

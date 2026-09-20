@@ -207,7 +207,7 @@ mod tests {
             pci_device_id: 0,
             pci_class_code: 0x030000,
             driver: String::new(),
-            render_node: None,
+            render_nodes: Vec::new(),
             outputs: Vec::new(),
         }
     }
