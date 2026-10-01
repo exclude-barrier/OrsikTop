@@ -383,7 +383,7 @@ Subcommands:
 | Command | Effect |
 | --- | --- |
 | `orsiktop update` | Updates a standalone installation to the latest release |
-| `orsiktop diag` | Prints a no-secrets diagnostics summary for bug reports |
+| `orsiktop diag` | Prints a no-secrets diagnostics summary for bug reports (honors `--server` and `--gpu`/`--gpu-index`) |
 | `orsiktop uninstall` | Removes the standalone binaries, keeps the config |
 | `orsiktop uninstall --purge` | Removes the binaries and the config directory |
 
