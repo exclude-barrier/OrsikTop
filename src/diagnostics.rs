@@ -17,12 +17,16 @@ use crate::{
     cpu::{detect_topology, CpuCoreKind},
     cpu_sensors::CpuSensors,
     discovery::discover_gpus,
-    discovery_llm::{collect_candidates, select_endpoint, ServerSource},
+    discovery_llm::{
+        collect_candidates, read_process_start_time, select_endpoint, selected_endpoint_server,
+        ServerSource,
+    },
     domain::{GpuEvidence, GpuMapping, GpuSelector},
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
     llama::LlamaMonitor,
     providers::nvidia::discover_mig_children,
+    redact::{redact_urls, safe_endpoint},
     system::RealSys,
 };
 
@@ -250,19 +254,26 @@ fn llama_section(
         "default"
     };
 
-    // PID of the local process behind the selected endpoint (PID-only
-    // evidence — command lines are never read or printed).
-    let pid = crate::discovery_llm::selected_endpoint_pid(&candidates, &endpoint);
+    // Identity (PID + start time) of the local process behind the selected
+    // endpoint (PID-only evidence — command lines are never read or printed).
+    let server = selected_endpoint_server(&candidates, &endpoint);
 
-    // Server→GPU mapping decision, exactly like the TUI computes it (S16).
+    // Server→GPU mapping decision, exactly like the TUI computes it (S16):
+    // only attributed while the PID still carries the start time read at
+    // discovery, so a reused PID is never mapped to the earlier server.
     let gpus = discover_gpus(sys);
     let nvml = Nvml::init().ok();
     let mig_children = nvml.as_ref().map(discover_mig_children).unwrap_or_default();
-    let mapping = match pid {
-        Some(pid) => {
-            let render = process_render_gpus(sys, pid, &gpus);
-            let nvml_keys = nvml_compute_gpus(nvml.as_ref(), pid, &mig_children);
-            map_server_gpus(true, render, nvml_keys, &gpus)
+    let mapping = match server {
+        Some(identity) => {
+            let current_start = read_process_start_time(sys, identity.pid);
+            if current_start != Some(identity.start_time) {
+                GpuMapping::Unknown
+            } else {
+                let render = process_render_gpus(sys, identity.pid, &gpus);
+                let nvml_keys = nvml_compute_gpus(nvml.as_ref(), identity.pid, &mig_children);
+                map_server_gpus(true, render, nvml_keys, &gpus)
+            }
         }
         None => GpuMapping::None,
     };
@@ -278,10 +289,14 @@ fn llama_section(
         };
         out.push_str(&format!(
             "  candidate[{}]: {source} {}\n",
-            i, candidate.endpoint
+            i,
+            safe_endpoint(&candidate.endpoint)
         ));
     }
-    out.push_str(&format!("  endpoint   : {endpoint} ({source_label})\n"));
+    out.push_str(&format!(
+        "  endpoint   : {} ({source_label})\n",
+        safe_endpoint(&endpoint)
+    ));
     out.push_str(&format!("  gpu map    : {}\n", describe_mapping(&mapping)));
 }
 
@@ -314,17 +329,21 @@ fn probe_llama<S: crate::system::Sys>(sys: &S, auto_discovery: bool, server: Opt
                     stats.prompt_tps, stats.generation_tps
                 );
             } else {
-                println!(
-                    "  status     : unreachable ({})",
-                    if stats.error.is_empty() {
-                        "no error detail"
-                    } else {
-                        &stats.error
-                    }
-                );
+                // reqwest embeds the request URL in its errors; redact any URL
+                // so a credential-bearing endpoint cannot leak through the
+                // error path.
+                let detail = if stats.error.is_empty() {
+                    "no error detail".to_string()
+                } else {
+                    redact_urls(&stats.error)
+                };
+                println!("  status     : unreachable ({detail})");
             }
         }
-        Err(err) => println!("  status     : client init failed ({err})"),
+        Err(err) => println!(
+            "  status     : client init failed ({})",
+            redact_urls(&err.to_string())
+        ),
     }
 }
 
@@ -451,6 +470,11 @@ mod tests {
         // open fd on the by-path render node.
         fixture.dir_entry("/proc", "4242", false, false);
         fixture.file("/proc/4242/cmdline", "llama-server\0--port\08080\0");
+        fixture.file(
+            "/proc/4242/stat",
+            "4242 (llama-server) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 5 5 0 20 0 1 0 555 \
+             12345 678 90",
+        );
         fixture.dir_entry("/proc/4242/fd", "7", false, false);
         fixture.symlink(
             "/proc/4242/fd/7",
@@ -530,5 +554,22 @@ mod tests {
         assert!(out.contains("classes    : P=2 E=2 LP=0"), "{out}");
         assert!(out.contains("hybrid     : yes (P/E minibar)"), "{out}");
         assert!(out.contains("core kinds : P,P,E,E"), "{out}");
+    }
+
+    #[test]
+    fn render_redacts_credentials_and_url_extras_in_diagnostics_output() {
+        let fixture = crate::system::FixtureSys::default();
+        let out = render(
+            &fixture,
+            4,
+            false,
+            Some("http://demo-user:demo-password@localhost:8080/v1?token=supersecret#fragsecret"),
+        );
+        for secret in ["demo-user", "demo-password", "supersecret", "fragsecret"] {
+            assert!(!out.contains(secret), "leaked {secret}:\n{out}");
+        }
+        // The connection-relevant part is still shown, sanitized.
+        assert!(out.contains("http://localhost:8080"), "{out}");
+        assert!(out.contains("(configured)"), "{out}");
     }
 }

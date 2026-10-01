@@ -2,7 +2,7 @@
 
 All notable changes to OrsikTop will be documented here.
 
-## [Unreleased]
+## [0.2.6] - 2026-10-01
 
 ### Added
 
@@ -28,13 +28,142 @@ All notable changes to OrsikTop will be documented here.
   contexts — and on narrow terminals the whole row is dropped before any
   core metric is. Single-slot servers are unaffected.
 
+- Intel and AMD devices are identified by name more reliably. When
+  `amdgpu` exposes no `product_name` (common on APUs), a well-known
+  device-ID map (Granite Ridge, Strix Halo, Rembrandt, Navi 33, RX
+  6600/6800/6900/7900/7700–7800 series) supplies a real name — a real
+  `product_name` always wins, and unknown IDs keep the `cardN` fallback.
+  The Intel map grows from 1 to 11 entries (Core Ultra 200V, Meteor
+  Lake-P, Tiger Lake, Alder Lake, Arc A770/A750, Battlemage B580/B570).
+  Intel names are live-verified on an Arc (Core Ultra 200V) iGPU; the AMD
+  map is fixture-tested only — no AMD hardware is available.
+
+- Processes are attributed to a GPU through all of its DRM render nodes.
+  A card now records every render node it exposes (`render_nodes`), not
+  just the first, so a client on a compute-only node (e.g. `renderD129`
+  on Intel iGPU/xe, which exposes a display+render node plus a
+  compute-only node) is attributed to the right card. The by-path PCI BDF
+  parser also accepts 8-digit PCI domains and canonicalizes them through
+  `normalize_pci_bdf` (4-digit default domain; ≥ `0x10000` stay 8-digit).
+  Multi-node attribution is fixture-tested; the available xe box exposes a
+  single render node, so it is not live-verified.
+
 ### Fixed
+
+- GPU power (`PWR`) now renders unavailable (`—`) instead of a fabricated
+  `0%` when the driver exposes no power telemetry (e.g. the Intel xe
+  iGPU). Previously the PWR meter was drawn unconditionally from
+  `power_w / power_limit_w` defaulting to `0.0`, so a box with no power
+  sensor showed an empty bar and `0%` — indistinguishable from a real 0 W
+  reading, while the GPU/VRAM rows correctly showed `—`. The PWR row now
+  follows the same `None => —` rule.
+
+- The shared AMD/Intel hwmon lookup is now driver-aware
+  (`find_hwmon_for_bdf()`). A hwmon whose `device` symlink contains the
+  target BDF is a candidate; a candidate whose `name` matches a known
+  driver then wins over one without, and a block exposing `temp1_input`
+  wins over one that does not (ties keep directory order, so selection is
+  deterministic). This changes which block is picked on systems where a
+  power-domain hwmon (e.g. `acpi_power`) sits before the real GPU block.
+  Fixture-tested; not yet live-verified on AMD/Intel hardware where both
+  block kinds are present.
 
 - RAM telemetry now renders unavailable (`—`) instead of a misleading
   `0.0%` / `0.0 GiB` when the total memory reading is missing or zero, in
   both the system panel meter and the RAM history sparkline — matching the
-  existing VRAM/POWER semantics (missing telemetry is never a fabricated
-  zero).
+  existing VRAM and (now) POWER semantics (missing telemetry is never a
+  fabricated zero).
+
+- Process thread counts are no longer frozen at first sight. `ProcessCache`
+  now caches only static metadata (program, executable path); the thread
+  count is re-read from `/proc/<pid>/status` on every process refresh (not
+  per UI frame) and stored as `Option`: an unreadable process renders `—`
+  instead of a fabricated `1`, and the next refresh retries. A group's
+  thread total stays `—` until every member is readable. Regression tests
+  drive the cache across scripted refreshes (changed count, failed read,
+  recovery, reused PID); an isolated run against the previous revision
+  confirms it fabricated `1` and never refreshed.
+
+- The monitor now treats endpoint, local server identity and auto/manual
+  origin as one resolved state and compares the three fields independently,
+  instead of updating identity/origin only when the URL changed. The local
+  server identity is the PID **plus** its `/proc/<pid>/stat` start time, and
+  the GPU mapping is only computed while the PID still carries that start
+  time: a PID reused by another process (or an unreadable one) invalidates
+  the mapping immediately, before the next resync. A llama.cpp restart on the
+  same port updates the server→GPU mapping without resetting the LLM session
+  or its history; an endpoint change resets it; an auto/manual flip relabels
+  the display. In auto-discovery mode the target is re-resolved on a bounded
+  5 s cadence (single `/proc` scan, never per UI frame); manual and remote
+  endpoints stay static and gain no local attribution. Worst-case staleness
+  after a restart or exit is therefore 5 s, while a reused PID is rejected
+  at once. State transitions and the reused-PID rejection are covered by
+  deterministic unit tests; an actual live llama.cpp restart was not
+  exercised.
+
+- `orsiktop diag` no longer prints URL credentials or other confidential URL
+  parts. A central `safe_endpoint()` keeps only scheme/host/port (with
+  `/…`, `?…`, `#…` markers for dropped path/query/fragment) and never echoes
+  an unparseable input; HTTP-probe error text is passed through
+  `redact_urls()`, so the error path cannot leak either. The sanitizer is
+  display-only — the endpoint used for the connection is unchanged. Fixture
+  tests cover userinfo, query, fragment, percent-encoding, IPv6 and invalid
+  input, plus an integration test on the rendered report; an isolated run
+  against the previous revision confirms it printed the configured
+  credentials verbatim.
+
+- Diagnostics error redaction no longer leaves URL tails behind. Free-text
+  URL scanning now consumes up to whitespace only, so characters that are
+  legal inside a URL (`,` `)` and the `]` of an IPv6 host) cannot truncate the
+  token and leak a query secret; a token that still does not parse is
+  replaced, never echoed. The transport error path additionally prefers
+  structured redaction: the reqwest error is rendered with `without_url()`
+  (category + status kept, request URL removed) and the result is redacted
+  again as a safety net. New tests cover the three reproduced IPv4/IPv6
+  comma/parenthesis cases and a real loopback reqwest error; the same tests
+  fail against the previous scanner (reproducing the exact leak).
+
+- Server-dependent async results are tagged with the session generation they
+  were produced for and applied only to the matching target, so a /metrics
+  reply for server A that lands after a switch to B (or a buffered reply from
+  before) can no longer be shown under B or enter B's history; A→B→A is
+  covered because generations are monotonic. The fast snapshot's GPU mapping
+  is gated the same way, while its system/CPU data still applies. A new
+  process on the same endpoint (a restart, not just a relabel) is signalled to
+  the LLM worker separately and drops the server-dependent caches (counter
+  baselines, cached /props) without starting a new UI session. Deterministic
+  tests exercise the held-A → B → release-A flow, the A→B→A case and the
+  stale-mapping rejection; they fail against the previous untagged flow.
+
+- The settings dialog preserves the endpoint it was opened with. Only host and
+  port are edited; scheme, path, userinfo, query and fragment are kept, and
+  an unchanged host/port returns the original string byte for byte, so
+  opening the dialog and saving (or editing only refresh/GPU) can no longer
+  downgrade `https` to `http` or silently drop a path. URLs without an
+  explicit port show the scheme default (443/80) and keep it implicit. Tests
+  go through `open_settings` → `settings_config` for HTTPS with and without a
+  port, IPv4, hostnames, IPv6 and a path; they fail against the previous
+  always-`http://host:port` rebuild.
+
+- A successful `/props` refresh now replaces the cached speculative state
+  instead of accumulating it: an explicit disable (`speculative: false`,
+  `n_max: 0`, empty `types`) clears a previously active MTP state and a
+  changed `n_max` (3 → 8) is adopted, while a response that says nothing about
+  speculation (or a failed fetch) keeps the cache. `default_generation_settings`
+  takes precedence over root fields per field. The local server process config
+  is only a fallback until `/props` has described speculation. Regression
+  tests cover the A→B disable, 3→8, no-info, failed-fetch and nested/root
+  priority cases; they fail against the previous `|=` accumulation.
+
+- Per-slot throughput no longer treats the array position as a slot identity.
+  A delta is only computed when every slot carries a unique `id` that also
+  exists in the previous sample and its task did not switch; missing,
+  duplicate or newly appeared ids, a first sample or a task change make the
+  slot-delta path abstain and fall back to the aggregated `/metrics`
+  counters, so reordering id-less slots no longer fabricates 900/90 tok/s.
+  Context/slot display is unchanged. Tests cover reordered id-less slots,
+  stable ids under reordering, duplicate ids and a new slot; they fail
+  against the previous index-as-id pairing.
 
 ## [0.2.5] - 2026-09-18
 

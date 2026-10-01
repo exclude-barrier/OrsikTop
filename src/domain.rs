@@ -27,7 +27,11 @@ pub struct ProcessStats {
     pub command: String,
     pub cpu_pct: f64,
     pub memory_bytes: u64,
-    pub threads: usize,
+    /// Thread count from `/proc/<pid>/status`, re-read every process refresh
+    /// because it is dynamic. `None` when the counter could not be read on
+    /// this cycle (unknown — never a fabricated substitute); the next refresh
+    /// retries.
+    pub threads: Option<usize>,
     /// Process start time in epoch seconds (from /proc/<pid>/stat).
     /// Together with `pid` it forms a robust [`ProcessIdentity`] that
     /// survives kernel PID reuse.
@@ -658,6 +662,12 @@ pub struct FastSnapshot {
     pub system: SystemStats,
     /// Which GPU(s) the inference server process uses, when determined.
     pub gpu_map: GpuMapping,
+    /// Session generation of the server identity the `gpu_map` was computed
+    /// for. The app applies `gpu_map` only when this matches its current
+    /// mapping generation, so a snapshot produced for a previous server cannot
+    /// overwrite the new state. `gpu`/`system` are applied regardless: they do
+    /// not belong to the server session.
+    pub mapping_generation: u64,
 }
 
 /// Latest coherent snapshot held by the app and rendered by the UI.

@@ -70,7 +70,7 @@ OrsikTop reads llama.cpp telemetry and displays:
 - connection state, uptime and smoothed polling latency
 - transient reconnect handling so short polling interruptions do not immediately show the server as offline
 
-With a `--parallel` server (multiple slots) the panel aggregates across slots: `SLOTS busy/total` counts active slots, and the live prefill / decode throughput lines sum the per-slot deltas of the active slots (a task change or counter reset counts as zero, never negative). The context pair (`used / size`) is always read from a single slot — the most-used busy slot, or the most-used slot overall when no slot is busy — because an idle slot keeps its last task's context, so mixing a maximum `used` with a maximum `n_ctx` across slots could pair values from two different slots.
+With a `--parallel` server (multiple slots) the panel aggregates across slots: `SLOTS busy/total` counts active slots, and the live prefill / decode throughput lines sum the per-slot deltas of slots with a verified identity — the server's own slot `id`, matched against the previous sample with the same task. Array position is never treated as identity: if any slot lacks a unique `id`, a slot appears or disappears, or the task changes, the per-slot path abstains and OrsikTop falls back to the aggregated `/metrics` counters instead of fabricating throughput (so reordering or replacing slots cannot create activity). The context pair (`used / size`) is always read from a single slot — the most-used busy slot, or the most-used slot overall when no slot is busy — because an idle slot keeps its last task's context, so mixing a maximum `used` with a maximum `n_ctx` across slots could pair values from two different slots.
 
 `/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
 
@@ -159,7 +159,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.2.5 x86_64-unknown-linux-gnu
+downloading orsiktop 0.2.6 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -187,7 +187,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.2.5
+orsiktop 0.2.6
 ```
 
 You can then start OrsikTop with `orsiktop`.
@@ -362,6 +362,8 @@ or, when `XDG_CONFIG_HOME` is not set:
 
 Saved settings include the LLM endpoint, GPU selection, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
 
+**LLM Host/IP** and **LLM Port** edit the endpoint in place. The scheme (including `https`), path, credentials and query of an existing endpoint are preserved, and saving without changing host or port keeps the stored endpoint exactly as it was — changing only the refresh interval or the GPU can never rewrite `https://…` to `http://…` or drop a path.
+
 ## CLI
 
 Show the built-in help:
@@ -498,6 +500,7 @@ src/
 ├── cpu.rs          CPU topology (hybrid P/E/LP classification)
 ├── cpu_sensors.rs  CPU frequency, temperature and RAPL power
 ├── diagnostics.rs  `orsiktop diag` bug-report summary
+├── redact.rs       no-secrets URL rendering shared by diagnostics and telemetry errors
 ├── system.rs       filesystem abstraction (real + fixture)
 └── ui.rs           ratatui rendering, controls and histories
 ```
