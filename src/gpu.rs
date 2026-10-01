@@ -12,6 +12,7 @@ use crate::domain::{GpuSelector, GpuVendor};
 use crate::providers::{
     amd::AmdGpuProvider, intel::IntelGpuProvider, nvidia::NvidiaGpuProvider, GpuProvider, GpuStats,
 };
+use crate::system::{RealSys, Sys};
 
 /// Build the active GPU provider for `selector`.
 ///
@@ -25,6 +26,19 @@ use crate::providers::{
 /// get an explicit "no backend" error — never a fake reading from another
 /// vendor's API.
 pub fn new_gpu_provider(selector: GpuSelector, gpus: &[DiscoveredGpu]) -> Box<dyn GpuProvider> {
+    new_gpu_provider_with(selector, gpus, RealSys)
+}
+
+/// [`new_gpu_provider`] with an injected filesystem.
+///
+/// The AMD/Intel backends read sysfs through `sys`, so tests can drive the
+/// dispatch (and the device-specific error paths) with a `FixtureSys` and a
+/// fabricated discovery list — fully independent of the host's real GPUs.
+pub(crate) fn new_gpu_provider_with<S: Sys + Send + 'static>(
+    selector: GpuSelector,
+    gpus: &[DiscoveredGpu],
+    sys: S,
+) -> Box<dyn GpuProvider> {
     if matches!(selector, GpuSelector::Uuid(_)) {
         return Box::new(NvidiaGpuProvider::new(selector));
     }
@@ -37,8 +51,8 @@ pub fn new_gpu_provider(selector: GpuSelector, gpus: &[DiscoveredGpu]) -> Box<dy
 
     match gpu.vendor {
         GpuVendor::Nvidia => Box::new(NvidiaGpuProvider::new(selector)),
-        GpuVendor::Amd => Box::new(AmdGpuProvider::new(gpu.clone(), index)),
-        GpuVendor::Intel => Box::new(IntelGpuProvider::new(gpu.clone(), index)),
+        GpuVendor::Amd => Box::new(AmdGpuProvider::new_with(sys, gpu.clone(), index)),
+        GpuVendor::Intel => Box::new(IntelGpuProvider::new_with(sys, gpu.clone(), index)),
         _ => Box::new(UnavailableGpuProvider {
             error: format!(
                 "no telemetry backend yet for GPU {} ({:?})",
@@ -318,8 +332,13 @@ mod tests {
 
     #[test]
     fn dispatch_reports_explicit_errors_for_unbacked_vendors() {
+        // Fully host-independent: an empty FixtureSys means the AMD/Intel
+        // backends can never find a real device, so the fabricated BDFs cannot
+        // accidentally resolve to this machine's own GPUs.
+        let empty = || crate::system::FixtureSys::default();
+
         // Nothing discovered → no match.
-        let mut provider = new_gpu_provider(GpuSelector::Auto, &[]);
+        let mut provider = new_gpu_provider_with(GpuSelector::Auto, &[], empty());
         let stats = provider.sample();
         assert!(!stats.available);
         assert_eq!(stats.error, "no GPU matches the selection");
@@ -327,26 +346,23 @@ mod tests {
         // A discovered device whose vendor has no backend yet (e.g. an
         // unrecognized display class).
         let gpus = vec![gpu(GpuVendor::Other, "0000:00:02.0")];
-        let mut provider = new_gpu_provider(GpuSelector::Auto, &gpus);
+        let mut provider = new_gpu_provider_with(GpuSelector::Auto, &gpus, empty());
         let stats = provider.sample();
         assert!(!stats.available);
         assert!(stats.error.contains("no telemetry backend yet"));
         assert!(stats.error.contains("0000:00:02.0"));
 
-        // An AMD device does NOT fall through to the error path: the AMD
-        // provider is built and its own (fixture-free) sysfs read reports the
-        // device as unavailable — a different, device-specific error.
+        // An AMD device does NOT fall through to the unbacked error: the AMD
+        // provider is built and reads the device's own (fixture) sysfs. With
+        // no device files present it reports the device-specific error.
         let gpus = vec![gpu(GpuVendor::Amd, "0000:01:00.0")];
-        let mut provider = new_gpu_provider(GpuSelector::Auto, &gpus);
+        let mut provider = new_gpu_provider_with(GpuSelector::Auto, &gpus, empty());
         let stats = provider.sample();
         assert!(!stats.available);
         assert!(stats.error.contains("0000:01:00.0"));
         assert!(!stats.error.contains("no telemetry backend yet"));
 
-        // An Intel device is likewise backed: the Intel provider is built and
-        // its own (fixture-free) sysfs read reports the device-specific error.
-        // A card that does not exist on the box, so the i915 sysfs path is
-        // deterministically unreadable regardless of the host's GPUs.
+        // An Intel device is likewise backed, with the same fixture isolation.
         let gpus = vec![DiscoveredGpu {
             card: "card999".to_string(),
             device_id: crate::domain::DeviceId::new(Some("0000:00:02.0".to_string()), None),
@@ -354,7 +370,7 @@ mod tests {
             driver: "i915".to_string(),
             ..gpu(GpuVendor::Intel, "0000:00:02.0")
         }];
-        let mut provider = new_gpu_provider(GpuSelector::Auto, &gpus);
+        let mut provider = new_gpu_provider_with(GpuSelector::Auto, &gpus, empty());
         let stats = provider.sample();
         assert!(!stats.available);
         assert!(stats.error.contains("0000:00:02.0"));

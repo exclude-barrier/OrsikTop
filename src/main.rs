@@ -107,28 +107,37 @@ impl Drop for TerminalGuard {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    if let Some(command) = args.command.as_ref() {
-        return match command {
-            Commands::Update => run_updater(),
-            Commands::Uninstall { purge } => run_uninstall(*purge),
-            Commands::Diag => diagnostics::run(),
-        };
-    }
-
+    // Load and override the runtime settings once, before dispatching, so the
+    // TUI and the settings-aware subcommands (`diag`) see exactly the same
+    // configuration. Previously the one-off CLI overrides were applied only to
+    // the TUI, so `orsiktop --server … diag` silently ignored the override.
     let mut settings = config::load();
-    if let Some(server) = args.server.filter(|value| !value.trim().is_empty()) {
-        settings.server = Some(server);
+    if let Some(server) = args
+        .server
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        settings.server = Some(server.clone());
         settings.auto_discovery = false;
     }
     if let Some(interval_ms) = args.interval_ms {
         settings.refresh_ms = interval_ms;
     }
-    if let Some(gpu) = args.gpu {
-        settings.gpu_selector = GpuSelector::parse(&gpu);
+    if let Some(gpu) = args.gpu.as_ref() {
+        settings.gpu_selector = GpuSelector::parse(gpu);
     } else if let Some(gpu_index) = args.gpu_index {
         settings.gpu_selector = GpuSelector::Index(gpu_index);
     }
     settings = settings.sanitized();
+
+    if let Some(command) = args.command.as_ref() {
+        return match command {
+            Commands::Update => run_updater(),
+            Commands::Uninstall { purge } => run_uninstall(*purge),
+            Commands::Diag => diagnostics::run(&settings),
+        };
+    }
+
     let resolved = resolve_monitor_target(&settings);
 
     enable_raw_mode()?;

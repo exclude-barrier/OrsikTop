@@ -36,8 +36,10 @@ const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
 /// Render the full diagnostics report to stdout (and run the bounded live
 /// llama probe).
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let settings = config::load();
+///
+/// `settings` is the same configuration the TUI runs with, so one-off CLI
+/// overrides (`--server`, `--gpu`, `--interval-ms`) apply to `diag` too.
+pub fn run(settings: &config::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
@@ -46,6 +48,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         logical,
         settings.auto_discovery,
         settings.server.as_deref(),
+        &settings.gpu_selector,
     );
     print!("{report}");
     probe_llama(
@@ -66,6 +69,7 @@ pub fn render<S: crate::system::Sys>(
     logical: usize,
     auto_discovery: bool,
     server: Option<&str>,
+    gpu_selector: &GpuSelector,
 ) -> String {
     let mut out = String::new();
 
@@ -73,7 +77,7 @@ pub fn render<S: crate::system::Sys>(
     out.push_str(&format!("  version    : {}\n", env!("CARGO_PKG_VERSION")));
 
     cpu_section(&mut out, sys, logical);
-    gpu_section(&mut out, sys);
+    gpu_section(&mut out, sys, gpu_selector);
     cpu_sensors_section(&mut out, sys);
     llama_section(&mut out, sys, auto_discovery, server);
 
@@ -119,7 +123,7 @@ fn kind_short(kind: &CpuCoreKind) -> &'static str {
     }
 }
 
-fn gpu_section(out: &mut String, sys: &impl crate::system::Sys) {
+fn gpu_section(out: &mut String, sys: &impl crate::system::Sys, gpu_selector: &GpuSelector) {
     let gpus = discover_gpus(sys);
     out.push_str("GPU discovery (DRM sysfs)\n");
     if gpus.is_empty() {
@@ -150,14 +154,18 @@ fn gpu_section(out: &mut String, sys: &impl crate::system::Sys) {
             out.push_str(&format!("       outputs  : {}\n", gpu.outputs.join(", ")));
         }
     }
-    provider_section(out, &gpus);
+    provider_section(out, &gpus, gpu_selector);
 }
 
 /// One-shot provider sample for the `Auto` selection: shows which backend
 /// the dispatch picks and which normalized metrics it exposes, without
 /// running the TUI.
-fn provider_section(out: &mut String, gpus: &[crate::discovery::DiscoveredGpu]) {
-    let selector = GpuSelector::Auto;
+fn provider_section(
+    out: &mut String,
+    gpus: &[crate::discovery::DiscoveredGpu],
+    gpu_selector: &GpuSelector,
+) {
+    let selector = gpu_selector.clone();
     let mut provider = new_gpu_provider(selector.clone(), gpus);
     let stats = provider.sample();
     out.push_str(&format!("GPU provider (selector = {selector:?})\n"));
@@ -434,7 +442,7 @@ mod tests {
     #[test]
     fn render_on_empty_sys_is_well_formed() {
         let fixture = crate::system::FixtureSys::default();
-        let out = render(&fixture, 4, true, None);
+        let out = render(&fixture, 4, true, None, &GpuSelector::Auto);
         // The report always carries the fixed section headers.
         assert!(
             out.contains("OrsikTop diagnostics\n"),
@@ -481,7 +489,7 @@ mod tests {
             "/dev/dri/by-path/pci-0000:01:00.0-render",
         );
 
-        let out = render(&fixture, 4, true, None);
+        let out = render(&fixture, 4, true, None, &GpuSelector::Auto);
         assert!(
             out.contains("candidate[0]: process (pid 4242)"),
             "missing candidate:\n{out}"
@@ -549,11 +557,29 @@ mod tests {
                 cpu.to_string(),
             );
         }
-        let out = render(&fixture, 4, true, None);
+        let out = render(&fixture, 4, true, None, &GpuSelector::Auto);
         assert!(out.contains("vendor     : Intel"), "missing vendor:\n{out}");
         assert!(out.contains("classes    : P=2 E=2 LP=0"), "{out}");
         assert!(out.contains("hybrid     : yes (P/E minibar)"), "{out}");
         assert!(out.contains("core kinds : P,P,E,E"), "{out}");
+    }
+
+    #[test]
+    fn render_reports_the_selected_gpu_selector() {
+        // `--gpu` reaches the report: the provider section must name the
+        // requested selector instead of always claiming `Auto`.
+        let fixture = crate::system::FixtureSys::default();
+        let out = render(
+            &fixture,
+            4,
+            false,
+            None,
+            &GpuSelector::PciBusId("0000:01:00.0".to_string()),
+        );
+        assert!(
+            out.contains("GPU provider (selector = PciBusId(\"0000:01:00.0\"))"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -564,6 +590,7 @@ mod tests {
             4,
             false,
             Some("http://demo-user:demo-password@localhost:8080/v1?token=supersecret#fragsecret"),
+            &GpuSelector::Auto,
         );
         for secret in ["demo-user", "demo-password", "supersecret", "fragsecret"] {
             assert!(!out.contains(secret), "leaked {secret}:\n{out}");

@@ -1562,4 +1562,276 @@ mod tests {
             "a genuine new server must map again: {fresh:?}"
         );
     }
+
+    // --- Real-worker integration test for delayed results -------------------
+    //
+    // Unlike the pure `accepts_llm_sample` tests above, these drive the actual
+    // `spawn_llm_worker` against isolated local mock HTTP servers: the worker
+    // performs real `/props` + `/metrics` + `/slots` requests through reqwest,
+    // the command channel is the production one, and the results pass through
+    // the production acceptance helper. Synchronization is explicit (channels
+    // and a condition variable); the timeouts only bound failure, they are
+    // never the success condition.
+
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Condvar, Mutex};
+
+    fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        text.lines()
+            .next()?
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_string)
+    }
+
+    fn mock_body(
+        path: &str,
+        model: &str,
+        n_ctx: u64,
+        prompt_tokens: u64,
+        predicted: u64,
+    ) -> (String, &'static str) {
+        if path.contains("/props") {
+            (
+                format!(
+                    "{{\"model_path\":\"{model}\",\"total_slots\":1,\"default_generation_settings\":{{\"n_ctx\":{n_ctx}}}}}"
+                ),
+                "application/json",
+            )
+        } else if path.contains("/slots") {
+            (
+                format!("[{{\"id\":0,\"n_ctx\":{n_ctx},\"is_processing\":false}}]"),
+                "application/json",
+            )
+        } else {
+            (
+                format!(
+                    "llamacpp:prompt_tokens_total {prompt_tokens}\nllamacpp:tokens_predicted_total {predicted}\n"
+                ),
+                "text/plain",
+            )
+        }
+    }
+
+    fn write_http(stream: &mut TcpStream, body: &str, content_type: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// A plain mock server that answers every request immediately.
+    fn spawn_plain_server(
+        model: &'static str,
+        n_ctx: u64,
+        prompt_tokens: u64,
+        predicted: u64,
+    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Some(path) = read_request_path(&mut stream) {
+                            let (body, content_type) =
+                                mock_body(&path, model, n_ctx, prompt_tokens, predicted);
+                            write_http(&mut stream, &body, content_type);
+                        }
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    /// A mock server that signals when the first non-`/props` request arrives
+    /// and then holds that response until `release` is flipped.
+    fn spawn_gated_server(
+        release: Arc<(Mutex<bool>, Condvar)>,
+        started: mpsc::Sender<()>,
+    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let mut signaled = false;
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(path) = read_request_path(&mut stream) else {
+                            continue;
+                        };
+                        if path.contains("/props") {
+                            let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
+                            write_http(&mut stream, &body, content_type);
+                            continue;
+                        }
+                        if !signaled {
+                            let _ = started.send(());
+                            signaled = true;
+                        }
+                        // Hold the response until the test releases it.
+                        let (lock, condvar) = &*release;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = condvar.wait(released).unwrap();
+                        }
+                        let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
+                        write_http(&mut stream, &body, content_type);
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    #[test]
+    fn real_worker_drops_delayed_results_across_an_endpoint_switch() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (a_addr, a_stop, a_handle) = spawn_gated_server(Arc::clone(&release), started_tx);
+        let (b_addr, b_stop, b_handle) = spawn_plain_server("model-B", 8192, 10_000, 20_000);
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(2_500));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+
+        let worker = spawn_llm_worker(
+            format!("http://{a_addr}"),
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        // 1-2: the real worker has an A request in flight, held by the mock.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must contact server A");
+
+        // 3: switch the monitored target to B.
+        cmd_tx
+            .send(LlmCommand::Switch {
+                generation: 1,
+                endpoint: format!("http://{b_addr}"),
+            })
+            .unwrap();
+
+        // 4: release A's delayed response.
+        {
+            let (lock, condvar) = &*release;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+
+        // 5-6: consume the real worker's published samples through the
+        // production acceptance path (current target = B, generation 1).
+        let current_generation = 1u64;
+        let mut snapshot = DashboardSnapshot::default();
+        let mut saw_delayed_a = false;
+        let mut accepted_b = false;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !(saw_delayed_a && accepted_b) {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                if sample.stats.model == "model-A" {
+                    saw_delayed_a = true;
+                    assert!(
+                        !accepts_llm_sample(current_generation, &sample),
+                        "delayed A result must be rejected under B"
+                    );
+                }
+                if accepts_llm_sample(current_generation, &sample)
+                    && sample.stats.model == "model-B"
+                {
+                    snapshot.llm = sample.stats.clone();
+                    accepted_b = true;
+                }
+            }
+        }
+        assert!(
+            saw_delayed_a,
+            "the real worker must publish the delayed A result"
+        );
+        assert!(accepted_b, "B must be accepted after the switch");
+        assert_eq!(snapshot.llm.model, "model-B");
+        assert_ne!(snapshot.llm.model, "model-A");
+
+        // A buffered result from the first A generation stays rejected.
+        let buffered_stale = LlmSample {
+            generation: 0,
+            stats: LlmStats {
+                model: "model-A".to_string(),
+                ..Default::default()
+            },
+        };
+        assert!(!accepts_llm_sample(current_generation, &buffered_stale));
+
+        // A → B → A: a fresh A generation is accepted, the first one is not.
+        let (a2_addr, a2_stop, a2_handle) = spawn_plain_server("model-A", 4096, 1000, 1500);
+        cmd_tx
+            .send(LlmCommand::Switch {
+                generation: 2,
+                endpoint: format!("http://{a2_addr}"),
+            })
+            .unwrap();
+        let mut accepted_a2 = false;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !accepted_a2 {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                if sample.generation == 0 {
+                    assert!(!accepts_llm_sample(2, &sample));
+                }
+                if accepts_llm_sample(2, &sample) {
+                    snapshot.llm = sample.stats.clone();
+                    accepted_a2 = true;
+                }
+            }
+        }
+        assert!(accepted_a2, "the new A generation must be accepted");
+        assert_eq!(snapshot.llm.model, "model-A");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        a_stop.store(true, Ordering::Relaxed);
+        b_stop.store(true, Ordering::Relaxed);
+        a2_stop.store(true, Ordering::Relaxed);
+        let _ = a_handle.join();
+        let _ = b_handle.join();
+        let _ = a2_handle.join();
+    }
 }

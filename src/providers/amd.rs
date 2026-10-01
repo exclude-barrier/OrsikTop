@@ -22,11 +22,11 @@ use std::path::Path;
 
 use super::{find_hwmon_for_bdf, pci_device_dir, GpuProvider, GpuStats};
 use crate::discovery::DiscoveredGpu;
-use crate::system::{RealSys, Sys};
+use crate::system::Sys;
 
 /// AMD GPU/APU telemetry provider backed by amdgpu sysfs + hwmon.
 ///
-/// `S` is the filesystem it samples; production uses [`RealSys`], fixture tests
+/// `S` is the filesystem it samples; production uses [`crate::system::RealSys`], fixture tests
 /// use an in-memory `Sys`. The hwmon device is resolved once at construction
 /// (the hwmon set is stable for the life of the process) so `sample` reads only
 /// value files.
@@ -43,10 +43,10 @@ pub(crate) struct AmdGpuProvider<S: Sys> {
     index: u32,
 }
 
-impl AmdGpuProvider<RealSys> {
-    /// Build a provider over the real filesystem for one discovered AMD GPU.
-    pub(crate) fn new(gpu: DiscoveredGpu, index: u32) -> Self {
-        let sys = RealSys;
+impl<S: Sys> AmdGpuProvider<S> {
+    /// Build a provider over an injected filesystem, so the dispatch and the
+    /// device-specific error paths are testable without real AMD hardware.
+    pub(crate) fn new_with(sys: S, gpu: DiscoveredGpu, index: u32) -> Self {
         let hwmon = find_hwmon_for_bdf(&sys, gpu.device_id.key(), &["amdgpu"]);
         Self {
             gpu,
