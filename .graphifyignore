@@ -1,0 +1,2 @@
+# om-graphify-bridge: keep the OM projection indexed (negates .gitignore rules)
+!.pi/project-memory/

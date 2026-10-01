@@ -33,6 +33,25 @@ pub struct LlamaServerCandidate {
     /// Consumed by diagnostics (S18).
     #[allow(dead_code)]
     pub command: Option<String>,
+    /// For process candidates: the process start time (`/proc/<pid>/stat`
+    /// field 22, clock ticks since boot). `None` when it could not be read.
+    /// Together with the PID it forms a [`LocalServerIdentity`] that a reused
+    /// PID cannot spoof.
+    pub start_time: Option<u64>,
+}
+
+/// Stable identity of a locally discovered llama.cpp server.
+///
+/// The kernel recycles PIDs, so a bare PID can name an entirely different
+/// process later. Pairing it with the process start time read at discovery
+/// time lets the GPU-mapping path reject a reused PID immediately, before the
+/// next server resync. `start_time` is raw `/proc/<pid>/stat` field 22 (clock
+/// ticks), so it is compared against a fresh read of the same field without
+/// any unit conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalServerIdentity {
+    pub pid: u32,
+    pub start_time: u64,
 }
 
 /// Scan `/proc` for running llama.cpp servers and return every distinct
@@ -60,6 +79,7 @@ pub fn discover_processes<S: Sys>(sys: &S) -> Vec<LlamaServerCandidate> {
             endpoint: endpoint_from_args(&args),
             source: ServerSource::Process { pid },
             command: Some(args.join(" ")),
+            start_time: read_process_start_time(sys, pid),
         });
     }
 
@@ -100,6 +120,7 @@ pub fn collect_candidates<S: Sys>(
                 endpoint: endpoint.to_string(),
                 source: ServerSource::Configured,
                 command: None,
+                start_time: None,
             });
         }
     }
@@ -131,24 +152,42 @@ pub fn select_endpoint(candidates: &[LlamaServerCandidate], default: &str) -> St
         .unwrap_or_else(|| default.to_string())
 }
 
-/// The local process PID behind `selected_endpoint`, when that endpoint was
-/// produced by a discovered `llama-server` / `llama serve` process.
-///
-/// Selection stays endpoint-based (matching [`select_endpoint`]) — the PID is
-/// only a means of attributing the process to a GPU (S16), never the
-/// selection criterion. Returns `None` when the endpoint is configured/remote
-/// or was not produced by a running local process.
-pub fn selected_endpoint_pid(
+/// The stable identity (PID + process start time) of the locally discovered
+/// server behind `selected_endpoint`, when one was found and its start time
+/// was readable. Returns `None` for configured/remote endpoints and when the
+/// identity cannot be established — callers must then not attribute a GPU.
+pub fn selected_endpoint_server(
     candidates: &[LlamaServerCandidate],
     selected_endpoint: &str,
-) -> Option<u32> {
+) -> Option<LocalServerIdentity> {
     candidates
         .iter()
         .find(|c| c.endpoint == selected_endpoint)
         .and_then(|c| match c.source {
-            ServerSource::Process { pid } => Some(pid),
+            ServerSource::Process { pid } => Some(LocalServerIdentity {
+                pid,
+                start_time: c.start_time?,
+            }),
             ServerSource::Configured => None,
         })
+}
+
+/// Read a process's start time (`/proc/<pid>/stat` field 22, clock ticks
+/// since boot). `None` when the file is missing/unreadable or malformed.
+pub fn read_process_start_time<S: Sys>(sys: &S, pid: u32) -> Option<u64> {
+    let stat = sys.read_to_string(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
+    parse_start_time(&stat)
+}
+
+/// Extract field 22 (`starttime`) from a `/proc/<pid>/stat` line.
+///
+/// The `comm` field (2) is wrapped in parentheses and may itself contain
+/// spaces and parentheses, so parsing always splits after the **last** `)`.
+/// The remaining whitespace-separated tokens begin at field 3 (`state`);
+/// `starttime` is therefore the token at offset 19.
+fn parse_start_time(stat: &str) -> Option<u64> {
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn parse_cmdline(raw: &str) -> Vec<String> {
@@ -259,6 +298,15 @@ mod tests {
         assert_eq!(endpoint_from_args(&args), "http://127.0.0.1:9090");
     }
 
+    /// A synthetic `/proc/<pid>/stat` line with `starttime` (field 22) set.
+    /// `comm` is wrapped in the first `(` and the last `)`.
+    fn stat_line(pid: u32, comm: &str, starttime: u64) -> String {
+        format!(
+            "{pid} ({comm}) S 1 {pid} {pid} 0 -1 4194560 100 0 0 0 5 5 5 0 20 0 1 0 \
+             {starttime} 12345 678 90"
+        )
+    }
+
     /// Two local servers arranged so that "lowest PID" and "lowest port"
     /// disagree: the lower PID (4000) runs the higher port (9090) and the
     /// higher PID (5000) runs the lower port (8081). A non-llama process (6000)
@@ -286,6 +334,8 @@ mod tests {
             "/proc/6000/cmdline",
             cmdline(&["/usr/bin/other", "--port", "1234"]),
         );
+        sys.file("/proc/4000/stat", stat_line(4000, "llama-server", 111_000));
+        sys.file("/proc/5000/stat", stat_line(5000, "llama-server", 222_000));
         sys
     }
 
@@ -399,5 +449,52 @@ mod tests {
         );
         // ...but the configured endpoint is still recorded for diagnostics.
         assert!(c.iter().any(|x| x.endpoint == "http://10.0.0.5:8080"));
+    }
+
+    #[test]
+    fn start_time_parsing_handles_tricky_command_names() {
+        // `comm` may contain spaces and parentheses; the parse must key off
+        // the last `)` and pick field 22.
+        let line = stat_line(4242, "llama server (v2)", 987_654);
+        assert_eq!(parse_start_time(&line), Some(987_654));
+
+        assert_eq!(parse_start_time("no parens at all"), None);
+        assert_eq!(parse_start_time("1 (x) S 1 2 3"), None);
+    }
+
+    #[test]
+    fn discovery_captures_start_time_for_process_candidates() {
+        let sys = proc_fixture();
+        let candidates = discover_processes(&sys);
+        let identity = selected_endpoint_server(&candidates, "http://127.0.0.1:8081").unwrap();
+        assert_eq!(identity.pid, 5000);
+        assert_eq!(identity.start_time, 222_000);
+
+        // A configured endpoint never yields a local identity.
+        let configured = collect_candidates(&sys, false, Some("http://10.0.0.5:8080"));
+        assert_eq!(
+            selected_endpoint_server(&configured, "http://10.0.0.5:8080"),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_is_absent_when_start_time_is_unreadable() {
+        let mut sys = FixtureSys::default();
+        sys.dir_entry("/proc", "7000", false, false);
+        sys.file(
+            "/proc/7000/cmdline",
+            cmdline(&["/usr/bin/llama-server", "--port", "8080"]),
+        );
+        // Deliberately no /proc/7000/stat.
+        let candidates = discover_processes(&sys);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].start_time, None);
+        // Without a readable start time there is no trustworthy identity, so
+        // the mapping path must not attribute this process.
+        assert_eq!(
+            selected_endpoint_server(&candidates, "http://127.0.0.1:8080"),
+            None
+        );
     }
 }

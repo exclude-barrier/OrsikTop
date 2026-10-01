@@ -22,6 +22,7 @@ use crate::{
     cpu::{detect_cpu_topology, CpuTopology},
     cpu_sensors::CpuSensors,
     discovery::discover_gpus,
+    discovery_llm::LocalServerIdentity,
     domain::{
         DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessIdentity, ProcessStats,
         SystemStats, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
@@ -40,18 +41,31 @@ const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 /// Power additionally blocks ~50 ms for the RAPL two-read window. Frequency
 /// stays on the fast cadence — it is cheap and changes quickly.
 const SLOW_SENSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
+/// How often auto-discovery re-resolves the local server's endpoint/PID while
+/// the TUI runs (only in auto-discovery mode). A llama.cpp restart or exit is
+/// reflected within at most this interval; the endpoint/PID are resolved with
+/// a single `/proc` scan, never per UI frame. Manual endpoints are static, so
+/// no scan happens for them.
+const SERVER_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     server: &str,
-    // Local PID of the discovered server process (S16), when present.
-    server_pid: Option<u32>,
+    // Stable identity (PID + start time) of the discovered server process
+    // (S16), when present.
+    server_identity: Option<LocalServerIdentity>,
     initial_settings: config::AppConfig,
     // True when `server` was resolved via local auto-discovery.
     server_auto: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = server.to_string();
-    let mut server_auto = server_auto;
+    // Endpoint, local server identity and origin are tracked together but
+    // compared independently: a stable URL can still get a new identity, and
+    // the origin can flip while the URL stays the same (see `reconcile_server`).
+    let mut resolved = crate::ResolvedServer {
+        endpoint: server.to_string(),
+        identity: server_identity,
+        auto: server_auto,
+    };
     let mut settings = initial_settings.sanitized();
     let mut refresh_ms = settings.refresh_ms.clamp(MIN_REFRESH_MS, MAX_REFRESH_MS);
     settings.refresh_ms = refresh_ms;
@@ -61,11 +75,17 @@ pub fn run(
     let gpu_selector_shared = Arc::new(RwLock::new(settings.gpu_selector.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let (fast_tx, fast_rx) = mpsc::sync_channel::<FastSnapshot>(2);
-    let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmStats>(2);
-    let (server_tx, server_rx) = mpsc::channel::<String>();
-    let (server_pid_tx, server_pid_rx) = mpsc::channel::<Option<u32>>();
-    if let Some(pid) = server_pid {
-        let _ = server_pid_tx.send(Some(pid));
+    let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmSample>(2);
+    // Endpoint/PID/origin changes are carried with a monotonically increasing
+    // generation so a result produced for a previous target can be rejected
+    // instead of being shown under the new one (see `apply_server_resolution`).
+    let (server_tx, server_rx) = mpsc::channel::<LlmCommand>();
+    let (server_identity_tx, server_identity_rx) =
+        mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
+    let mut llm_generation: u64 = 0;
+    let mut mapping_generation: u64 = 0;
+    if let Some(identity) = server_identity {
+        let _ = server_identity_tx.send((mapping_generation, Some(identity)));
     }
 
     let fast_worker = spawn_fast_worker(
@@ -74,10 +94,10 @@ pub fn run(
         Arc::clone(&refresh_shared),
         Arc::clone(&stop),
         fast_tx,
-        server_pid_rx,
+        server_identity_rx,
     );
     let llm_worker = spawn_llm_worker(
-        server.clone(),
+        resolved.endpoint.clone(),
         Arc::clone(&refresh_shared),
         Arc::clone(&offline_grace_shared),
         Arc::clone(&stop),
@@ -87,18 +107,42 @@ pub fn run(
 
     let mut snapshot = DashboardSnapshot::default();
     let mut ui_state = UiState::default();
+    let mut last_server_resync = Instant::now();
 
     loop {
         while let Ok(next) = fast_rx.try_recv() {
-            ui_state.clamp_process_selection(&next.system.processes);
-            ui_state.push_sample(&next.gpu, &next.system);
-            snapshot.gpu = next.gpu;
-            snapshot.system = next.system;
-            snapshot.gpu_map = next.gpu_map;
+            apply_fast_snapshot(&mut snapshot, &mut ui_state, mapping_generation, next);
         }
         while let Ok(next) = llm_rx.try_recv() {
-            ui_state.observe_llm_sample(&next);
-            snapshot.llm = next;
+            // Drop results produced for a server we already switched away from:
+            // they can still arrive after the channel drained (a sample was
+            // already in flight) and must not appear under the new endpoint.
+            if !accepts_llm_sample(llm_generation, &next) {
+                continue;
+            }
+            ui_state.observe_llm_sample(&next.stats);
+            snapshot.llm = next.stats;
+        }
+
+        // S16: an auto-discovered server is dynamic — it can restart on the
+        // same port (new PID) or exit entirely during a run. Re-resolve on a
+        // bounded cadence so the local GPU mapping and the auto label cannot
+        // stay pinned to a stale PID. Manual/remote endpoints are static, so
+        // this is skipped for them. The UI thread never scans `/proc` per
+        // frame; the worst-case staleness is `SERVER_RESYNC_INTERVAL`.
+        if settings.auto_discovery && last_server_resync.elapsed() >= SERVER_RESYNC_INTERVAL {
+            let next = crate::resolve_monitor_target(&settings);
+            apply_server_resolution(
+                &mut resolved,
+                next,
+                &mut llm_generation,
+                &mut mapping_generation,
+                &server_tx,
+                &server_identity_tx,
+                &mut snapshot,
+                &mut ui_state,
+            );
+            last_server_resync = Instant::now();
         }
 
         terminal.draw(|frame| {
@@ -109,9 +153,9 @@ pub fn run(
                 &snapshot.gpu,
                 &snapshot.gpu_map,
                 &mut ui_state,
-                &server,
+                &resolved.endpoint,
                 refresh_ms,
-                server_auto,
+                resolved.auto,
             )
         })?;
 
@@ -153,9 +197,6 @@ pub fn run(
                         KeyCode::Enter => match ui_state.settings_config() {
                             Ok(next_settings) => match config::save(&next_settings) {
                                 Ok(()) => {
-                                    let (next_server, next_pid) =
-                                        crate::resolve_server_full(&next_settings);
-                                    let server_changed = next_server != server;
                                     settings = next_settings;
                                     refresh_ms = settings.refresh_ms;
                                     refresh_shared.store(refresh_ms, Ordering::Relaxed);
@@ -167,14 +208,22 @@ pub fn run(
                                         .write()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                         settings.gpu_selector.clone();
-                                    if server_changed {
-                                        server = next_server.clone();
-                                        server_auto = crate::server_is_auto_discovered(&settings);
-                                        snapshot.llm = LlmStats::default();
-                                        ui_state.reset_llm_connection_state();
-                                        let _ = server_tx.send(next_server);
-                                        let _ = server_pid_tx.send(next_pid);
-                                    }
+                                    // Re-resolve every field independently:
+                                    // a settings edit can change the PID or the
+                                    // auto/manual origin without changing the
+                                    // endpoint (and vice versa).
+                                    let next = crate::resolve_monitor_target(&settings);
+                                    apply_server_resolution(
+                                        &mut resolved,
+                                        next,
+                                        &mut llm_generation,
+                                        &mut mapping_generation,
+                                        &server_tx,
+                                        &server_identity_tx,
+                                        &mut snapshot,
+                                        &mut ui_state,
+                                    );
+                                    last_server_resync = Instant::now();
                                     ui_state.close_settings();
                                 }
                                 Err(err) => ui_state
@@ -211,7 +260,7 @@ pub fn run(
                     KeyCode::Char('h') => ui_state.toggle_help(),
                     KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
                     _ if ui_state.is_help_open() => {}
-                    KeyCode::Char('q') => ui_state.open_settings(&server, &settings),
+                    KeyCode::Char('q') => ui_state.open_settings(&resolved.endpoint, &settings),
                     KeyCode::Esc => break,
                     KeyCode::Char('-') | KeyCode::Char('[') => {
                         change_refresh(&mut refresh_ms, false, &refresh_shared);
@@ -332,13 +381,152 @@ fn change_refresh(refresh_ms: &mut u64, increase: bool, shared: &AtomicU64) {
     shared.store(*refresh_ms, Ordering::Relaxed);
 }
 
+/// Which parts of the resolved monitor target changed between two
+/// resolutions. Each field is independent so the caller can react precisely:
+/// only an endpoint change requires resetting the LLM HTTP session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServerChange {
+    endpoint: bool,
+    pid: bool,
+    auto: bool,
+}
+
+/// Compare two resolutions of the monitor target field by field, instead of
+/// keying everything off the URL.
+fn reconcile_server(
+    previous: &crate::ResolvedServer,
+    next: &crate::ResolvedServer,
+) -> ServerChange {
+    ServerChange {
+        endpoint: previous.endpoint != next.endpoint,
+        pid: previous.identity != next.identity,
+        auto: previous.auto != next.auto,
+    }
+}
+
+/// One LLM sample tagged with the session generation it was produced for.
+///
+/// A sample is sampled synchronously by the LLM worker, so an endpoint change
+/// can land while a request for the previous server is still in flight. The
+/// tag lets the app reject that late sample instead of showing it under the
+/// new endpoint. Generations increase monotonically, so A→B→A is handled too
+/// (the second A session has a different generation than the first).
+struct LlmSample {
+    generation: u64,
+    stats: LlmStats,
+}
+
+/// True when an LLM sample belongs to the currently selected LLM generation.
+fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
+    sample.generation == current_generation
+}
+
+/// Command to the LLM worker.
+enum LlmCommand {
+    /// Poll a new endpoint: start a new LLM session (new generation).
+    Switch { generation: u64, endpoint: String },
+    /// The process behind the current endpoint was replaced (e.g. a llama.cpp
+    /// restart on the same port). A new process is not a cosmetic label
+    /// change: its /metrics counters and /props start over, so the
+    /// server-dependent caches (counter baselines, cached props, slot
+    /// baselines) are dropped without starting a new LLM session.
+    ResetServer,
+}
+
+/// Apply a fast snapshot.
+///
+/// `gpu`/`system` are always applied — they do not belong to the server
+/// session. The server→GPU mapping is applied only when the snapshot was
+/// computed for the current mapping generation, so a snapshot carrying the
+/// previous server's mapping cannot overwrite the new state.
+fn apply_fast_snapshot(
+    snapshot: &mut DashboardSnapshot,
+    ui_state: &mut UiState,
+    current_mapping_generation: u64,
+    next: FastSnapshot,
+) {
+    ui_state.clamp_process_selection(&next.system.processes);
+    ui_state.push_sample(&next.gpu, &next.system);
+    snapshot.gpu = next.gpu;
+    snapshot.system = next.system;
+    if next.mapping_generation == current_mapping_generation {
+        snapshot.gpu_map = next.gpu_map;
+    }
+}
+
+/// Apply an independently-detected endpoint/PID/origin change to the running
+/// app:
+/// * an endpoint change resets the LLM HTTP session (a new server to poll) and
+///   advances the LLM generation, so late results of the previous session are
+///   rejected;
+/// * a PID-only change updates the local GPU mapping without touching the
+///   monitor or its history (a pure local re-attribution), advancing the
+///   mapping generation so a stale mapping cannot overwrite the new one;
+/// * an origin-only change just relabels the display.
+#[allow(clippy::too_many_arguments)]
+fn apply_server_resolution(
+    current: &mut crate::ResolvedServer,
+    next: crate::ResolvedServer,
+    llm_generation: &mut u64,
+    mapping_generation: &mut u64,
+    server_tx: &mpsc::Sender<LlmCommand>,
+    server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
+    snapshot: &mut DashboardSnapshot,
+    ui_state: &mut UiState,
+) {
+    let change = reconcile_server(current, &next);
+    if change.endpoint {
+        *llm_generation = llm_generation.wrapping_add(1);
+        snapshot.llm = LlmStats::default();
+        ui_state.reset_llm_connection_state();
+        let _ = server_tx.send(LlmCommand::Switch {
+            generation: *llm_generation,
+            endpoint: next.endpoint.clone(),
+        });
+    } else if change.pid {
+        // Same endpoint, new process: reset the monitor's server-dependent
+        // caches (counter baselines, /props) so a restart cannot produce
+        // spurious deltas or carry stale speculative parameters.
+        let _ = server_tx.send(LlmCommand::ResetServer);
+    }
+    if change.pid {
+        // The fast worker recomputes the server→GPU mapping from this identity;
+        // a `None` clears it so a vanished server leaves no stale attribution.
+        *mapping_generation = mapping_generation.wrapping_add(1);
+        let _ = server_identity_tx.send((*mapping_generation, next.identity));
+    }
+    if change.endpoint || change.pid || change.auto {
+        *current = next;
+    }
+}
+
+/// Map the local server to a GPU, gated on its identity.
+///
+/// `current_start_time` is `/proc/<pid>/stat` field 22 read now for the
+/// expected PID. It must equal the start time captured at discovery: a PID
+/// reused by another process (or an unreadable one) yields `Unknown` instead
+/// of attributing the new process's GPU usage to the earlier server. The next
+/// server resync supplies the fresh identity that re-enables the mapping.
+fn map_server_identity(
+    expected: LocalServerIdentity,
+    current_start_time: Option<u64>,
+    render: Vec<crate::domain::DeviceId>,
+    nvml: Vec<crate::domain::DeviceId>,
+    gpus: &[crate::discovery::DiscoveredGpu],
+) -> GpuMapping {
+    if current_start_time != Some(expected.start_time) {
+        return GpuMapping::Unknown;
+    }
+    map_server_gpus(true, render, nvml, gpus)
+}
+
 fn spawn_fast_worker(
     gpu_selector: Arc<RwLock<GpuSelector>>,
     process_refresh_ms: Arc<AtomicU64>,
     refresh_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<FastSnapshot>,
-    server_pid_rx: Receiver<Option<u32>>,
+    server_identity_rx: Receiver<(u64, Option<LocalServerIdentity>)>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut current_selector = gpu_selector
@@ -370,7 +558,10 @@ fn spawn_fast_worker(
 
         // S16: server→GPU mapping state. Static topology and NVML are cached
         // once; the mapping itself is recomputed on the process-refresh cadence.
-        let mut server_pid: Option<u32> = None;
+        let mut server_identity: Option<LocalServerIdentity> = None;
+        // Mapping generation the current `server_identity` was published with;
+        // stamped into every snapshot so the app can drop stale mappings.
+        let mut server_generation: u64 = 0;
         let nvml_handle = Nvml::init().ok();
         // MIG topology is static: captured once at startup and never re-probed
         // on the process-refresh cadence (no static NVML polling in the loop).
@@ -389,9 +580,10 @@ fn spawn_fast_worker(
                 current_selector = requested_selector;
                 gpu = new_gpu_provider(current_selector.clone(), &static_gpus);
             }
-            // Drain any server→PID updates (initial + settings edits).
-            while let Ok(pid) = server_pid_rx.try_recv() {
-                server_pid = pid;
+            // Drain any server-identity updates (initial + resync/settings).
+            while let Ok((generation, identity)) = server_identity_rx.try_recv() {
+                server_generation = generation;
+                server_identity = identity;
                 gpu_map = GpuMapping::None;
             }
             let process_interval =
@@ -416,15 +608,16 @@ fn spawn_fast_worker(
                 last_process_refresh = Some(Instant::now());
 
                 // S16: recompute the server→GPU mapping on the process cadence.
-                // A live local process appears in the table with a start_time;
-                // that is what makes the fd/NVML evidence trustworthy.
-                if let Some(pid) = server_pid {
-                    let server_running = process_stats
-                        .iter()
-                        .any(|p| p.pid == pid && p.start_time > 0);
-                    let render = process_render_gpus(&RealSys, pid, &static_gpus);
-                    let nvml = nvml_compute_gpus(nvml_handle.as_ref(), pid, &mig_children);
-                    gpu_map = map_server_gpus(server_running, render, nvml, &static_gpus);
+                // The mapping is only trusted while the PID still carries the
+                // start time read at discovery, so a reused PID is invalidated
+                // immediately — before the next server resync.
+                if let Some(expected) = server_identity {
+                    let current_start =
+                        crate::discovery_llm::read_process_start_time(&RealSys, expected.pid);
+                    let render = process_render_gpus(&RealSys, expected.pid, &static_gpus);
+                    let nvml = nvml_compute_gpus(nvml_handle.as_ref(), expected.pid, &mig_children);
+                    gpu_map =
+                        map_server_identity(expected, current_start, render, nvml, &static_gpus);
                 } else {
                     // No local server process (configured/remote endpoint) →
                     // there is no process to attribute; keep the mapping empty.
@@ -498,6 +691,7 @@ fn spawn_fast_worker(
                 gpu: gpu.sample(),
                 system: system_stats.clone(),
                 gpu_map: gpu_map.clone(),
+                mapping_generation: server_generation,
             };
 
             match tx.try_send(snapshot) {
@@ -510,15 +704,19 @@ fn spawn_fast_worker(
     })
 }
 
-/// Cached stable process metadata, keyed by [`ProcessIdentity`].
+/// Cached *static* process metadata, keyed by [`ProcessIdentity`].
 ///
 /// The kernel recycles PIDs, so identity is `pid + start_time`. Once a
-/// process has been seen, its stable metadata (program name, executable
-/// path, thread count) is cached and reused; only the dynamic counters
-/// (CPU, memory) are resampled on each process refresh. The thread count
-/// in particular is read from `/proc/<pid>/status`, which is the expensive
-/// per-PID filesystem access — caching it means it is read once per process
-/// instance instead of once per process refresh.
+/// process has been seen, its static metadata (program name, executable
+/// path) is cached and reused; only the dynamic counters (CPU, memory,
+/// thread count) are resampled on each process refresh.
+///
+/// The thread count is deliberately **not** cached here: a process can create
+/// and destroy threads at any time, so a cached value goes stale immediately,
+/// and a one-off read failure must not pin a fabricated count forever. It is
+/// re-read from `/proc/<pid>/status` on every process refresh (not per UI
+/// frame) and reported as `Option`: an unreadable process is `None` and the
+/// next refresh retries.
 #[derive(Default)]
 struct ProcessCache {
     entries: std::collections::HashMap<ProcessIdentity, CachedProcess>,
@@ -527,24 +725,20 @@ struct ProcessCache {
 struct CachedProcess {
     program: String,
     command: String,
-    threads: usize,
 }
 
 impl ProcessCache {
+    /// Return the cached static metadata for `identity`, computing and storing
+    /// it on first sight. Only identity-bound, stable fields are cached.
     fn stable(
         &mut self,
         identity: ProcessIdentity,
         program: &str,
         command: &str,
-    ) -> (String, String, usize) {
+    ) -> (String, String) {
         if let Some(cached) = self.entries.get(&identity) {
-            return (
-                cached.program.clone(),
-                cached.command.clone(),
-                cached.threads,
-            );
+            return (cached.program.clone(), cached.command.clone());
         }
-        let threads = read_process_thread_count(identity.pid).unwrap_or(1);
         let program = program.to_string();
         let command = command.to_string();
         self.entries.insert(
@@ -552,10 +746,9 @@ impl ProcessCache {
             CachedProcess {
                 program: program.clone(),
                 command: command.clone(),
-                threads,
             },
         );
-        (program, command, threads)
+        (program, command)
     }
 
     /// Drop entries for identities that no longer exist (exited processes).
@@ -563,6 +756,25 @@ impl ProcessCache {
         let live: std::collections::HashSet<_> = live.collect();
         self.entries.retain(|identity, _| live.contains(identity));
     }
+}
+
+/// Static metadata from the cache plus a freshly read dynamic thread count.
+///
+/// `read_threads` is injected so the refresh behavior is testable without a
+/// live `/proc`: the count is read on every call (never taken from the
+/// cache), and a failed read yields `None` rather than a substitute value.
+fn refresh_process_metadata<F>(
+    cache: &mut ProcessCache,
+    identity: ProcessIdentity,
+    program: &str,
+    command: &str,
+    read_threads: F,
+) -> (String, String, Option<usize>)
+where
+    F: FnOnce(u32) -> Option<usize>,
+{
+    let (program, command) = cache.stable(identity, program, command);
+    (program, command, read_threads(identity.pid))
 }
 
 fn collect_process_stats(
@@ -584,7 +796,13 @@ fn collect_process_stats(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| program.clone());
 
-        let (program, command, threads) = cache.stable(identity, &program, &command);
+        let (program, command, threads) = refresh_process_metadata(
+            cache,
+            identity,
+            &program,
+            &command,
+            read_process_thread_count,
+        );
 
         // S8: per-device GPU usage from the process's DRM fdinfo entries.
         let gpu = sample_process_gpus(&RealSys, now, identity, drm);
@@ -691,11 +909,15 @@ fn spawn_llm_worker(
     refresh_ms: Arc<AtomicU64>,
     offline_grace_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    tx: SyncSender<LlmStats>,
-    server_rx: Receiver<String>,
+    tx: SyncSender<LlmSample>,
+    server_rx: Receiver<LlmCommand>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut current_server = server;
+        // Generation of the LLM session this worker is currently configured
+        // for; every published sample is tagged with it so the app can reject
+        // results of a session it already switched away from.
+        let mut current_generation: u64 = 0;
         let mut llama = LlamaMonitor::new(&current_server).ok();
         let mut llama_init_error = if llama.is_none() {
             "failed to initialize HTTP client".to_string()
@@ -706,8 +928,21 @@ fn spawn_llm_worker(
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
-            while let Ok(next_server) = server_rx.try_recv() {
-                current_server = next_server;
+            while let Ok(command) = server_rx.try_recv() {
+                match command {
+                    LlmCommand::Switch {
+                        generation,
+                        endpoint,
+                    } => {
+                        current_generation = generation;
+                        current_server = endpoint;
+                    }
+                    LlmCommand::ResetServer => {
+                        // Same endpoint, new process: keep the generation (and
+                        // thus the UI history) but drop every server-dependent
+                        // cache by rebuilding the monitor.
+                    }
+                }
                 llama = LlamaMonitor::new(&current_server).ok();
                 llama_init_error = if llama.is_none() {
                     "failed to initialize HTTP client".to_string()
@@ -716,6 +951,8 @@ fn spawn_llm_worker(
                 };
                 last_good_llm = None;
             }
+            // `sample` is synchronous; `current_generation` cannot change
+            // while it runs, so the tag is the session this sample belongs to.
             let raw_stats = match llama.as_mut() {
                 Some(monitor) => monitor.sample(),
                 None => LlmStats {
@@ -731,7 +968,11 @@ fn spawn_llm_worker(
             let stats =
                 stabilize_llm_sample(raw_stats, &mut last_good_llm, Instant::now(), offline_grace);
 
-            match tx.try_send(stats) {
+            let sample = LlmSample {
+                generation: current_generation,
+                stats,
+            };
+            match tx.try_send(sample) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Disconnected(_)) => break,
             }
@@ -826,8 +1067,62 @@ mod tests {
         let old = ProcessIdentity::new(4242, 1000);
         let new = ProcessIdentity::new(4242, 2000);
         cache.stable(old, "old-prog", "/bin/old");
-        let (_, command, _) = cache.stable(new, "new-prog", "/bin/new");
+        let (_, command) = cache.stable(new, "new-prog", "/bin/new");
         assert_eq!(command, "/bin/new");
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn thread_count_is_resampled_each_refresh_and_recovers_after_a_failed_read() {
+        let mut cache = ProcessCache::default();
+        let identity = ProcessIdentity::new(4242, 1000);
+
+        // First sighting: static metadata is cached, threads read fresh.
+        let (program, command, first) =
+            refresh_process_metadata(&mut cache, identity, "app", "/bin/app", |_| Some(4));
+        assert_eq!((program.as_str(), command.as_str()), ("app", "/bin/app"));
+        assert_eq!(first, Some(4));
+
+        // Same identity: the static metadata is reused, but the thread count
+        // is read again — a changed count reaches the next refresh.
+        let (program, command, second) =
+            refresh_process_metadata(&mut cache, identity, "app", "/bin/app", |_| Some(9));
+        assert_eq!((program.as_str(), command.as_str()), ("app", "/bin/app"));
+        assert_eq!(second, Some(9));
+
+        // A transient read failure is unknown for that cycle, not a
+        // permanent substitute...
+        let (_, _, failed) =
+            refresh_process_metadata(&mut cache, identity, "app", "/bin/app", |_| None);
+        assert_eq!(failed, None);
+
+        // ...and the next successful read recovers.
+        let (_, _, recovered) =
+            refresh_process_metadata(&mut cache, identity, "app", "/bin/app", |_| Some(11));
+        assert_eq!(recovered, Some(11));
+
+        assert_eq!(cache.entries.len(), 1, "static metadata stays cached once");
+    }
+
+    #[test]
+    fn reused_pid_does_not_inherit_cached_static_metadata() {
+        let mut cache = ProcessCache::default();
+        let old = ProcessIdentity::new(5150, 1000);
+        let new = ProcessIdentity::new(5150, 2000);
+        refresh_process_metadata(
+            &mut cache,
+            old,
+            "llama-server",
+            "/usr/bin/llama-server",
+            |_| Some(8),
+        );
+        let (program, command, threads) =
+            refresh_process_metadata(&mut cache, new, "other", "/usr/bin/other", |_| Some(2));
+        assert_eq!(
+            (program.as_str(), command.as_str()),
+            ("other", "/usr/bin/other")
+        );
+        assert_eq!(threads, Some(2));
         assert_eq!(cache.entries.len(), 2);
     }
 
@@ -934,6 +1229,337 @@ mod tests {
         assert_eq!(
             next_cycle_target(&unbounded, MIN_LLM_POLL_MS),
             Duration::from_millis(MAX_REFRESH_MS)
+        );
+    }
+
+    fn ident(pid: u32, start_time: u64) -> LocalServerIdentity {
+        LocalServerIdentity { pid, start_time }
+    }
+
+    fn target(
+        endpoint: &str,
+        identity: Option<LocalServerIdentity>,
+        auto: bool,
+    ) -> crate::ResolvedServer {
+        crate::ResolvedServer {
+            endpoint: endpoint.to_string(),
+            identity,
+            auto,
+        }
+    }
+
+    fn mapped(bdf: &str) -> crate::domain::MappedGpu {
+        crate::domain::MappedGpu {
+            device: crate::domain::DeviceId::new(Some(bdf.to_string()), None),
+            name: "card0".to_string(),
+            vendor: crate::domain::GpuVendor::Amd,
+            evidence: crate::domain::GpuEvidence::RenderNodeFd,
+        }
+    }
+
+    fn discovered_gpu(bdf: &str) -> crate::discovery::DiscoveredGpu {
+        crate::discovery::DiscoveredGpu {
+            card: "card0".to_string(),
+            device_id: crate::domain::DeviceId::new(Some(bdf.to_string()), None),
+            vendor: crate::domain::GpuVendor::Amd,
+            pci_vendor_id: 0x1002,
+            pci_device_id: 0x74a0,
+            pci_class_code: 0x030000,
+            driver: "amdgpu".to_string(),
+            render_nodes: vec!["renderD128".to_string()],
+            outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_detects_endpoint_identity_and_origin_independently() {
+        let unchanged = ServerChange {
+            endpoint: false,
+            pid: false,
+            auto: false,
+        };
+        let base = target("http://127.0.0.1:8081", Some(ident(5000, 1)), true);
+
+        assert_eq!(reconcile_server(&base, &base), unchanged);
+
+        // Restart on the same port: endpoint stable, identity changed.
+        assert_eq!(
+            reconcile_server(
+                &base,
+                &target("http://127.0.0.1:8081", Some(ident(6000, 1)), true)
+            ),
+            ServerChange {
+                endpoint: false,
+                pid: true,
+                auto: false,
+            }
+        );
+
+        // Reused PID (same number, new start time) still counts as a changed
+        // identity, so the mapping is invalidated even before the next resync.
+        assert_eq!(
+            reconcile_server(
+                &base,
+                &target("http://127.0.0.1:8081", Some(ident(5000, 2)), true)
+            ),
+            ServerChange {
+                endpoint: false,
+                pid: true,
+                auto: false,
+            }
+        );
+
+        // Server disappeared: identity cleared and origin flips to manual.
+        assert_eq!(
+            reconcile_server(&base, &target("http://127.0.0.1:8081", None, false)),
+            ServerChange {
+                endpoint: false,
+                pid: true,
+                auto: true,
+            }
+        );
+
+        // New endpoint entirely.
+        assert_eq!(
+            reconcile_server(
+                &base,
+                &target("http://127.0.0.1:9090", Some(ident(5000, 1)), true)
+            ),
+            ServerChange {
+                endpoint: true,
+                pid: false,
+                auto: false,
+            }
+        );
+
+        // Origin-only change is still detected (defensive: the origin is
+        // tracked separately, not inferred from the URL).
+        assert_eq!(
+            reconcile_server(
+                &base,
+                &target("http://127.0.0.1:8081", Some(ident(5000, 1)), false)
+            ),
+            ServerChange {
+                endpoint: false,
+                pid: false,
+                auto: true,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_resets_llm_only_on_endpoint_change_and_forwards_identity() {
+        let (server_tx, server_rx) = mpsc::channel::<LlmCommand>();
+        let (identity_tx, identity_rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
+        let mut snapshot = DashboardSnapshot::default();
+        snapshot.llm.model = "kept".to_string();
+        let mut ui_state = UiState::default();
+        let mut llm_generation = 0u64;
+        let mut mapping_generation = 0u64;
+        let mut current = target("http://127.0.0.1:8081", Some(ident(5000, 1)), true);
+
+        // An identity-only change (server restart, same URL): the GPU mapping
+        // is refreshed, but the LLM session and its history are preserved.
+        apply_server_resolution(
+            &mut current,
+            target("http://127.0.0.1:8081", Some(ident(6000, 1)), true),
+            &mut llm_generation,
+            &mut mapping_generation,
+            &server_tx,
+            &identity_tx,
+            &mut snapshot,
+            &mut ui_state,
+        );
+        assert_eq!(snapshot.llm.model, "kept");
+        assert_eq!(
+            llm_generation, 0,
+            "identity-only change keeps the LLM session"
+        );
+        assert_eq!(mapping_generation, 1);
+        assert_eq!(identity_rx.try_recv().unwrap(), (1, Some(ident(6000, 1))));
+        // A same-endpoint process change resets the server-dependent caches
+        // but keeps the LLM session (generation unchanged).
+        assert!(matches!(
+            server_rx.try_recv().unwrap(),
+            LlmCommand::ResetServer
+        ));
+        assert_eq!(current.identity, Some(ident(6000, 1)));
+
+        // An endpoint change resets the LLM session and re-targets the worker;
+        // the identity is cleared along with the local attribution.
+        apply_server_resolution(
+            &mut current,
+            target("http://127.0.0.1:9090", None, false),
+            &mut llm_generation,
+            &mut mapping_generation,
+            &server_tx,
+            &identity_tx,
+            &mut snapshot,
+            &mut ui_state,
+        );
+        assert_eq!(
+            snapshot.llm.model, "",
+            "endpoint change resets the LLM session"
+        );
+        assert_eq!(llm_generation, 1);
+        assert_eq!(mapping_generation, 2);
+        assert!(matches!(
+            server_rx.try_recv().unwrap(),
+            LlmCommand::Switch { generation: 1, endpoint } if endpoint == "http://127.0.0.1:9090"
+        ));
+        assert_eq!(identity_rx.try_recv().unwrap(), (2, None));
+        assert!(!current.auto);
+    }
+
+    #[test]
+    fn stale_llm_sample_is_rejected_across_a_b_a() {
+        let (server_tx, _server_rx) = mpsc::channel::<LlmCommand>();
+        let (identity_tx, _identity_rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
+        let mut snapshot = DashboardSnapshot::default();
+        let mut ui_state = UiState::default();
+        let mut llm_generation = 0u64;
+        let mut mapping_generation = 0u64;
+        let mut current = target("http://127.0.0.1:8081", Some(ident(1, 1)), true);
+
+        let a_sample = LlmSample {
+            generation: 0,
+            stats: LlmStats {
+                model: "A".to_string(),
+                ..Default::default()
+            },
+        };
+        assert!(accepts_llm_sample(llm_generation, &a_sample));
+
+        let switch = |current: &mut crate::ResolvedServer,
+                      next,
+                      llm_generation: &mut u64,
+                      mapping_generation: &mut u64,
+                      snapshot: &mut DashboardSnapshot,
+                      ui_state: &mut UiState| {
+            apply_server_resolution(
+                current,
+                next,
+                llm_generation,
+                mapping_generation,
+                &server_tx,
+                &identity_tx,
+                snapshot,
+                ui_state,
+            );
+        };
+
+        // Switch A → B: the endpoint change advances the LLM generation, so
+        // A's in-flight result must be rejected under B.
+        switch(
+            &mut current,
+            target("http://127.0.0.1:9090", Some(ident(2, 1)), true),
+            &mut llm_generation,
+            &mut mapping_generation,
+            &mut snapshot,
+            &mut ui_state,
+        );
+        assert_eq!(llm_generation, 1);
+        assert!(!accepts_llm_sample(llm_generation, &a_sample));
+        let b_sample = LlmSample {
+            generation: 1,
+            stats: LlmStats {
+                model: "B".to_string(),
+                ..Default::default()
+            },
+        };
+        assert!(accepts_llm_sample(llm_generation, &b_sample));
+
+        // Back to A: a *new* generation. A late result from the first A
+        // session (generation 0) is still rejected even though the URL matches
+        // A again — a pure URL comparison could not distinguish them.
+        switch(
+            &mut current,
+            target("http://127.0.0.1:8081", Some(ident(3, 1)), true),
+            &mut llm_generation,
+            &mut mapping_generation,
+            &mut snapshot,
+            &mut ui_state,
+        );
+        assert_eq!(llm_generation, 2);
+        assert!(!accepts_llm_sample(llm_generation, &a_sample));
+        let a2_sample = LlmSample {
+            generation: 2,
+            stats: LlmStats {
+                model: "A".to_string(),
+                ..Default::default()
+            },
+        };
+        assert!(accepts_llm_sample(llm_generation, &a2_sample));
+    }
+
+    #[test]
+    fn stale_gpu_mapping_is_not_applied_but_system_data_is() {
+        let mapped_b = crate::domain::GpuMapping::Single(mapped("0000:02:00.0"));
+        let mut snapshot = DashboardSnapshot {
+            gpu_map: mapped_b.clone(),
+            ..DashboardSnapshot::default()
+        };
+        let mut ui_state = UiState::default();
+
+        // A snapshot from the previous mapping generation carries A's mapping
+        // plus fresh system/GPU data. The mapping must be ignored; the rest
+        // must still be applied.
+        let stale = FastSnapshot {
+            gpu: crate::domain::GpuStats {
+                name: "fresh-gpu".to_string(),
+                ..Default::default()
+            },
+            system: SystemStats {
+                cpu_usage: 42.0,
+                ..Default::default()
+            },
+            gpu_map: crate::domain::GpuMapping::Single(mapped("0000:01:00.0")),
+            mapping_generation: 1,
+        };
+        apply_fast_snapshot(&mut snapshot, &mut ui_state, 2, stale);
+
+        assert_eq!(
+            snapshot.gpu_map, mapped_b,
+            "stale GPU mapping must not overwrite the current one"
+        );
+        assert_eq!(snapshot.system.cpu_usage, 42.0, "system data still applies");
+        assert_eq!(snapshot.gpu.name, "fresh-gpu", "GPU data still applies");
+    }
+
+    #[test]
+    fn reused_pid_with_a_new_start_time_gets_no_gpu_mapping() {
+        let gpus = vec![discovered_gpu("0000:01:00.0")];
+        let evidence = vec![crate::domain::DeviceId::new(
+            Some("0000:01:00.0".into()),
+            None,
+        )];
+        let old = ident(4242, 1000);
+
+        // Same PID number, different start time: a different process now owns
+        // the PID. GPU evidence is present, but it must not be attributed to
+        // the earlier server — the mapping is invalid immediately, not only
+        // after the next resync.
+        let stale = map_server_identity(old, Some(2000), evidence.clone(), Vec::new(), &gpus);
+        assert!(
+            !matches!(stale, GpuMapping::Single(_) | GpuMapping::Multi(_)),
+            "reused PID must not map to the earlier server: {stale:?}"
+        );
+        assert!(stale.is_empty(), "expected no attribution, got {stale:?}");
+
+        // An unreadable start time is also untrusted.
+        let unreadable = map_server_identity(old, None, evidence.clone(), Vec::new(), &gpus);
+        assert!(
+            unreadable.is_empty(),
+            "expected no attribution: {unreadable:?}"
+        );
+
+        // When discovery reports the genuine new llama.cpp process (same PID,
+        // new start time), the mapping is re-enabled for it.
+        let new = ident(4242, 2000);
+        let fresh = map_server_identity(new, Some(2000), evidence, Vec::new(), &gpus);
+        assert!(
+            matches!(fresh, GpuMapping::Single(_)),
+            "a genuine new server must map again: {fresh:?}"
         );
     }
 }

@@ -124,6 +124,12 @@ pub struct UiState {
     settings_field: SettingsField,
     settings_host: String,
     settings_port: String,
+    /// Exact endpoint string the dialog was opened with, returned verbatim
+    /// when host/port are left unchanged so no URL part is silently lost.
+    settings_server_original: String,
+    /// Parsed form of the endpoint, used to rebuild the URL while preserving
+    /// scheme, path, userinfo, query and fragment.
+    settings_server_base: Option<reqwest::Url>,
     settings_gpu: String,
     settings_refresh_ms: String,
     settings_process_refresh_ms: String,
@@ -168,6 +174,8 @@ impl Default for UiState {
             settings_field: SettingsField::Host,
             settings_host: "127.0.0.1".to_string(),
             settings_port: "8080".to_string(),
+            settings_server_original: String::new(),
+            settings_server_base: None,
             settings_gpu: "0".to_string(),
             settings_refresh_ms: "1000".to_string(),
             settings_process_refresh_ms: "1000".to_string(),
@@ -550,6 +558,11 @@ impl UiState {
         self.settings_field = SettingsField::Host;
         self.settings_host = host;
         self.settings_port = port.to_string();
+        // Keep the exact original and, when parseable, a structured base so
+        // saving can preserve everything the dialog does not edit (scheme,
+        // path, userinfo, …) instead of rebuilding a bare `http://host:port`.
+        self.settings_server_original = editable_server.to_string();
+        self.settings_server_base = reqwest::Url::parse(editable_server.trim()).ok();
         self.settings_gpu = settings.gpu_selector.as_string();
         self.settings_refresh_ms = settings.refresh_ms.to_string();
         self.settings_process_refresh_ms = settings.process_refresh_ms.to_string();
@@ -662,7 +675,7 @@ impl UiState {
     }
 
     pub fn settings_config(&self) -> Result<AppConfig, String> {
-        let endpoint = build_endpoint(&self.settings_host, &self.settings_port)?;
+        let endpoint = self.settings_endpoint()?;
         let gpu_selector = GpuSelector::parse(&self.settings_gpu);
         let refresh_ms = parse_setting_u64(
             &self.settings_refresh_ms,
@@ -691,6 +704,68 @@ impl UiState {
             offline_grace_ms,
             auto_discovery: self.settings_auto_discovery,
         })
+    }
+
+    /// The endpoint to persist from the dialog.
+    ///
+    /// When the dialog was opened with a parseable URL, only host and port are
+    /// edited: scheme, path, userinfo, query and fragment are preserved. If
+    /// host and port are unchanged the exact original string is returned, so
+    /// opening the dialog and saving without edits round-trips byte for byte
+    /// (no silent `https` → `http` downgrade). Legacy endpoints without a
+    /// scheme fall back to the historical `http://host:port` builder.
+    fn settings_endpoint(&self) -> Result<String, String> {
+        // `host_str` keeps the brackets of an IPv6 literal; compare and set
+        // hosts in their bare form and re-add the brackets for the URL parser.
+        let host = self
+            .settings_host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if host.is_empty() {
+            return Err("Host / IP must not be empty".to_string());
+        }
+        if host.chars().any(char::is_whitespace) {
+            return Err("Host / IP contains invalid characters".to_string());
+        }
+        let port = self
+            .settings_port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Port must be between 1 and 65535".to_string())?;
+
+        let Some(base) = &self.settings_server_base else {
+            return build_endpoint(&self.settings_host, &self.settings_port);
+        };
+
+        let base_host = base
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let base_port = base.port_or_known_default().unwrap_or(0);
+        if host.eq_ignore_ascii_case(base_host) && port == base_port {
+            return Ok(self.settings_server_original.clone());
+        }
+
+        let mut url = base.clone();
+        let host_for_url = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        url.set_host(Some(&host_for_url))
+            .map_err(|_| "Host / IP is not a valid URL host".to_string())?;
+        if default_port_for_scheme(url.scheme()) == Some(port) {
+            url.set_port(None)
+                .map_err(|_| "Port is not valid for this endpoint".to_string())?;
+        } else {
+            url.set_port(Some(port))
+                .map_err(|_| "Port is not valid for this endpoint".to_string())?;
+        }
+        Ok(url.to_string())
     }
 
     pub fn set_settings_error(&mut self, error: String) {
@@ -1072,7 +1147,6 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &GpuMapping)
     let fan_text = optional_number(gpu.fan_percent, 0, "%");
     let core_text = optional_number(gpu.graphics_clock_mhz, 0, " MHz");
     let vclk_text = optional_number(gpu.memory_clock_mhz, 0, " MHz");
-    let power_pct_value = power_pct.unwrap_or(0.0);
     let power_tint = power_pct.map(power_color).unwrap_or(MUTED);
     let io_suffix = || {
         let mut suffix = vec![
@@ -1155,15 +1229,13 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &GpuMapping)
             ],
         ),
     };
-    let mut lines = vec![
-        gpu_row,
-        vram_row,
-        meter_line(
+    let power_row = match power_pct {
+        Some(pct) => meter_line(
             "PWR",
-            power_pct_value,
+            pct,
             bar_width,
             power_tint,
-            format!("{:>3.0}%", power_pct_value),
+            format!("{:>3.0}%", pct),
             vec![
                 fixed_data_pair("DRAW", draw_text, power_tint, 21),
                 fixed_data_pair(
@@ -1175,6 +1247,25 @@ fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &GpuMapping)
                 fixed_data_pair("FAN", fan_text, ORK_GREEN, 13),
             ],
         ),
+        None => unavailable_meter_line(
+            "PWR",
+            bar_width,
+            vec![
+                fixed_data_pair("DRAW", draw_text, power_tint, 21),
+                fixed_data_pair(
+                    "TEMP",
+                    temp_text,
+                    gpu.temperature_c.map(temperature_color).unwrap_or(MUTED),
+                    16,
+                ),
+                fixed_data_pair("FAN", fan_text, ORK_GREEN, 13),
+            ],
+        ),
+    };
+    let mut lines = vec![
+        gpu_row,
+        vram_row,
+        power_row,
         match gpu::pcie_utilization_pct(
             gpu.pcie_rx_mb_s,
             gpu.pcie_tx_mb_s,
@@ -2699,7 +2790,7 @@ struct ProcessGroup<'a> {
     cpu_pct: f64,
     memory_bytes: u64,
     gpu_bytes: u64,
-    threads: usize,
+    threads: Option<usize>,
     min_pid: u32,
 }
 
@@ -2715,7 +2806,7 @@ enum ProcessDisplayRow<'a> {
         cpu_pct: f64,
         memory_bytes: u64,
         gpu_bytes: u64,
-        threads: usize,
+        threads: Option<usize>,
         expanded: bool,
     },
 }
@@ -2776,7 +2867,13 @@ fn grouped_process_rows_filtered<'a>(
             cpu_pct: members.iter().map(|process| process.cpu_pct).sum(),
             memory_bytes: members.iter().map(|process| process.memory_bytes).sum(),
             gpu_bytes: members.iter().map(|process| process.gpu_bytes()).sum(),
-            threads: members.iter().map(|process| process.threads).sum(),
+            // Aggregate only when every member's thread count is known: a
+            // partial sum would present an unknown as a verified total.
+            threads: members
+                .iter()
+                .map(|process| process.threads)
+                .collect::<Option<Vec<_>>>()
+                .map(|counts| counts.into_iter().sum()),
             min_pid: members.iter().map(|process| process.pid).min().unwrap_or(0),
             members,
         })
@@ -3300,7 +3397,7 @@ fn process_group_line_compact(
     count: usize,
     cpu_pct: f64,
     memory_bytes: u64,
-    threads: usize,
+    threads: Option<usize>,
     expanded: bool,
     selected: bool,
     width: usize,
@@ -3331,7 +3428,7 @@ fn process_group_line_compact(
             process_cell_style(CYAN, selected, false),
         ),
         Span::styled(
-            format!(" {:>5}", threads),
+            format!(" {:>5}", thread_cell(threads)),
             process_cell_style(MUTED, selected, false),
         ),
     ])
@@ -3378,7 +3475,7 @@ fn process_line_compact(
             process_cell_style(CYAN, selected, false),
         ),
         Span::styled(
-            format!(" {:>5}", process.threads),
+            format!(" {:>5}", thread_cell(process.threads)),
             process_cell_style(MUTED, selected, false),
         ),
     ])
@@ -3391,7 +3488,7 @@ fn process_group_line_wide(
     cpu_pct: f64,
     memory_bytes: u64,
     gpu_bytes: u64,
-    threads: usize,
+    threads: Option<usize>,
     expanded: bool,
     selected: bool,
     width: usize,
@@ -3428,7 +3525,7 @@ fn process_group_line_wide(
             process_cell_style(CYAN, selected, false),
         ),
         Span::styled(
-            format!(" {:>5}", threads),
+            format!(" {:>5}", thread_cell(threads)),
             process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
@@ -3485,7 +3582,7 @@ fn process_line_wide(
             process_cell_style(CYAN, selected, false),
         ),
         Span::styled(
-            format!(" {:>5}", process.threads),
+            format!(" {:>5}", thread_cell(process.threads)),
             process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
@@ -3545,6 +3642,14 @@ fn gpu_cell(bytes: u64) -> String {
     } else {
         "—".to_string()
     }
+}
+
+/// Thread count cell. A process whose `/proc/<pid>/status` could not be read
+/// on this cycle renders `—` (unknown), never a fabricated value.
+fn thread_cell(threads: Option<usize>) -> String {
+    threads
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn process_cpu_color(cpu_pct: f64) -> Color {
@@ -3834,6 +3939,17 @@ fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
 }
 
 fn endpoint_parts(server: &str) -> (String, u16) {
+    // Prefer the URL parser: it is scheme-aware (https without an explicit
+    // port shows 443, not a made-up 8080) and keeps IPv6 hosts readable.
+    if let Ok(url) = reqwest::Url::parse(server.trim()) {
+        if let Some(host) = url.host_str() {
+            return (
+                host.to_string(),
+                url.port_or_known_default().unwrap_or(8080),
+            );
+        }
+    }
+
     let compact = server
         .trim()
         .trim_start_matches("http://")
@@ -3867,6 +3983,17 @@ fn parse_setting_u64(value: &str, label: &str, min: u64, max: u64) -> Result<u64
         return Err(format!("{label} must be between {min} and {max}"));
     }
     Ok(parsed)
+}
+
+/// The implicit port of a well-known URL scheme, used to decide whether a
+/// port must be written out or can stay implicit in the saved endpoint.
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
+    }
 }
 
 fn build_endpoint(host: &str, port: &str) -> Result<String, String> {
@@ -4398,7 +4525,7 @@ mod tests {
                 program: "qemu-system-x86".to_string(),
                 cpu_pct: 120.0,
                 memory_bytes: 2_000,
-                threads: 8,
+                threads: Some(8),
                 ..ProcessStats::default()
             },
             ProcessStats {
@@ -4406,7 +4533,7 @@ mod tests {
                 program: "qemu-system-x86".to_string(),
                 cpu_pct: 80.0,
                 memory_bytes: 3_000,
-                threads: 7,
+                threads: Some(7),
                 ..ProcessStats::default()
             },
             ProcessStats {
@@ -4436,11 +4563,44 @@ mod tests {
                 assert_eq!(*cpu_pct, 200.0);
                 assert_eq!(*memory_bytes, 5_000);
                 assert_eq!(*gpu_bytes, 0);
-                assert_eq!(*threads, 15);
+                assert_eq!(*threads, Some(15));
                 assert!(!expanded);
             }
             _ => panic!("expected grouped qemu row"),
         }
+    }
+
+    #[test]
+    fn group_thread_total_is_unknown_when_any_member_is_unknown() {
+        // A partial sum would present an unknown member as a verified total,
+        // so the aggregate stays unknown until every member is readable.
+        let processes = vec![
+            ProcessStats {
+                pid: 10,
+                program: "qemu-system-x86".to_string(),
+                threads: Some(4),
+                ..ProcessStats::default()
+            },
+            ProcessStats {
+                pid: 20,
+                program: "qemu-system-x86".to_string(),
+                threads: None,
+                ..ProcessStats::default()
+            },
+        ];
+        let expanded = HashSet::new();
+        let (_, rows) =
+            grouped_process_rows(&processes, ProcessSortKey::Cpu, true, None, &expanded);
+        match &rows[0] {
+            ProcessDisplayRow::Group { threads, .. } => assert_eq!(*threads, None),
+            _ => panic!("expected grouped row"),
+        }
+    }
+
+    #[test]
+    fn thread_cell_renders_unknown_as_dash() {
+        assert_eq!(thread_cell(Some(12)), "12");
+        assert_eq!(thread_cell(None), "—");
     }
 
     #[test]
@@ -5052,6 +5212,79 @@ mod tests {
     #[test]
     fn settings_endpoint_supports_ipv6() {
         assert_eq!(build_endpoint("::1", "8081").unwrap(), "http://[::1]:8081");
+    }
+
+    fn settings_for(server: &str) -> AppConfig {
+        AppConfig {
+            server: Some(server.to_string()),
+            auto_discovery: false,
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn opening_and_saving_an_https_endpoint_preserves_it() {
+        let settings = settings_for("https://example.invalid:8443");
+        let mut state = UiState::default();
+        state.open_settings("https://example.invalid:8443", &settings);
+        assert_eq!(
+            state.settings_config().unwrap().server.as_deref(),
+            Some("https://example.invalid:8443")
+        );
+    }
+
+    #[test]
+    fn changing_only_refresh_keeps_endpoint_scheme_and_path() {
+        let server = "https://example.invalid:8443/v1?x=1";
+        let settings = settings_for(server);
+        let mut state = UiState::default();
+        state.open_settings(server, &settings);
+        // Change only the refresh interval.
+        state.settings_field = SettingsField::Refresh;
+        state.settings_refresh_ms = "500".to_string();
+        let saved = state.settings_config().unwrap();
+        assert_eq!(saved.refresh_ms, 500);
+        assert_eq!(saved.server.as_deref(), Some(server));
+    }
+
+    #[test]
+    fn https_without_an_explicit_port_round_trips() {
+        let settings = settings_for("https://example.invalid");
+        let mut state = UiState::default();
+        state.open_settings("https://example.invalid", &settings);
+        assert_eq!(state.settings_port, "443");
+        assert_eq!(
+            state.settings_config().unwrap().server.as_deref(),
+            Some("https://example.invalid")
+        );
+    }
+
+    #[test]
+    fn editing_host_preserves_scheme_port_and_path() {
+        let mut state = UiState::default();
+        let settings = settings_for("https://old.invalid:8443/v1");
+        state.open_settings("https://old.invalid:8443/v1", &settings);
+        state.settings_host = "new.invalid".to_string();
+        let endpoint = state.settings_config().unwrap().server.unwrap();
+        let url = reqwest::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("new.invalid"));
+        assert_eq!(url.port(), Some(8443));
+        assert_eq!(url.path(), "/v1");
+    }
+
+    #[test]
+    fn ipv6_and_hostname_endpoints_round_trip() {
+        for server in ["https://[::1]:8443", "http://llama.local:9090"] {
+            let settings = settings_for(server);
+            let mut state = UiState::default();
+            state.open_settings(server, &settings);
+            assert_eq!(
+                state.settings_config().unwrap().server.as_deref(),
+                Some(server),
+                "endpoint {server} changed"
+            );
+        }
     }
 
     #[test]
@@ -5667,6 +5900,68 @@ mod tests {
         assert!(
             !text.contains("LLM"),
             "unmapped GPU title must not carry the LLM chip, got:\n{text}",
+        );
+    }
+
+    fn render_gpu_panel(gpu: &GpuStats, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_gpu(frame, area, gpu, &GpuMapping::None))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn gpu_panel_renders_pwr_unavailable_without_power_telemetry() {
+        // Regression: the PWR meter was built unconditionally from
+        // `power_pct.unwrap_or(0.0)`, so a driver that exposes no power
+        // telemetry (e.g. the Intel xe iGPU) rendered an empty bar with
+        // "0%" — indistinguishable from a real 0 W reading. It must render
+        // unavailable ("—") like the GPU/VRAM rows do.
+        let gpu = GpuStats {
+            available: true,
+            name: "Intel Arc (Core Ultra 200V iGPU)".to_string(),
+            utilization: Some(12.0),
+            ..Default::default()
+        };
+        let text = render_gpu_panel(&gpu, 80, 8);
+        assert!(
+            text.contains("PWR"),
+            "PWR row must still render, got:\n{text}"
+        );
+        assert!(
+            !text.contains("0%"),
+            "PWR must not fabricate a 0% reading, got:\n{text}"
+        );
+        assert!(
+            text.matches('—').count() >= 3,
+            "PWR/VRAM/DRAW must all render unavailable, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn gpu_panel_renders_pwr_meter_when_power_is_reported() {
+        // Guard the other direction: with real power telemetry the meter
+        // still renders a percentage instead of degrading to "—".
+        let gpu = GpuStats {
+            available: true,
+            name: "RTX 4090".to_string(),
+            power_w: Some(150.0),
+            power_limit_w: Some(450.0),
+            ..Default::default()
+        };
+        let text = render_gpu_panel(&gpu, 80, 8);
+        assert!(
+            text.contains("PWR") && text.contains("33%"),
+            "PWR meter must render the real percentage, got:\n{text}"
         );
     }
 

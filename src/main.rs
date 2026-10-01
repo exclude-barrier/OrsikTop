@@ -12,6 +12,7 @@ mod gpu;
 mod gpu_map;
 mod llama;
 mod providers;
+mod redact;
 mod system;
 mod ui;
 
@@ -128,9 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.gpu_selector = GpuSelector::Index(gpu_index);
     }
     settings = settings.sanitized();
-    let server = resolve_server(&settings);
-    let server_pid = resolve_server_pid(&settings);
-    let server_auto = server_is_auto_discovered(&settings);
+    let resolved = resolve_monitor_target(&settings);
 
     enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
@@ -142,7 +141,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    app::run(&mut terminal, &server, server_pid, settings, server_auto)
+    app::run(
+        &mut terminal,
+        &resolved.endpoint,
+        resolved.identity,
+        settings,
+        resolved.auto,
+    )
 }
 
 fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
@@ -293,39 +298,96 @@ fn uninstall_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Resolve the endpoint to monitor *and* the local process PID behind it,
-/// scanning `/proc` once.
-pub(crate) fn resolve_server_full(settings: &config::AppConfig) -> (String, Option<u32>) {
-    let candidates = discovery_llm::collect_candidates(
-        &system::RealSys,
-        settings.auto_discovery,
-        settings.server.as_deref(),
-    );
+/// The resolved monitor target: the endpoint to poll, the local process PID
+/// behind it (when it was produced by a discovered llama server) and whether
+/// auto-discovery produced it.
+///
+/// The three fields change independently — a stable endpoint can still get a
+/// new PID (server restart on the same port), and the origin can flip while
+/// the endpoint stays the same (auto ↔ manual). Callers must therefore
+/// compare them separately instead of keying everything off the URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedServer {
+    pub endpoint: String,
+    /// Stable identity (PID + process start time) of the local server behind
+    /// `endpoint`; `None` for configured/remote endpoints and when the
+    /// identity cannot be read. Never a bare PID, so a reused PID cannot be
+    /// mistaken for the earlier server.
+    pub identity: Option<discovery_llm::LocalServerIdentity>,
+    pub auto: bool,
+}
+
+/// Resolve the endpoint to monitor, its local process PID and whether
+/// auto-discovery produced it, with a single `/proc` scan.
+pub(crate) fn resolve_monitor_target(settings: &config::AppConfig) -> ResolvedServer {
+    resolve_monitor_target_with(&system::RealSys, settings)
+}
+
+/// Fixture-testable [`resolve_monitor_target`]: every filesystem read goes
+/// through `sys`.
+///
+/// Selection follows the documented order: a discovered local server wins
+/// (lowest port, never by PID), else the configured endpoint, else the
+/// default. [`ResolvedServer::auto`] is true only when auto-discovery is on
+/// *and* a local server process is currently running; the PID is `None` for
+/// configured/remote endpoints, so a manual URL never gains a local GPU
+/// attribution by guessing.
+pub(crate) fn resolve_monitor_target_with<S: system::Sys>(
+    sys: &S,
+    settings: &config::AppConfig,
+) -> ResolvedServer {
+    let candidates =
+        discovery_llm::collect_candidates(sys, settings.auto_discovery, settings.server.as_deref());
     let endpoint = discovery_llm::select_endpoint(&candidates, DEFAULT_SERVER);
-    let pid = discovery_llm::selected_endpoint_pid(&candidates, &endpoint);
-    (endpoint, pid)
-}
-
-fn resolve_server(settings: &config::AppConfig) -> String {
-    resolve_server_full(settings).0
-}
-
-/// The local process PID behind the resolved endpoint, when it was produced
-/// by a discovered `llama-server` / `llama serve` process (used to map the
-/// server to a GPU, S16). `None` for configured/remote endpoints.
-fn resolve_server_pid(settings: &config::AppConfig) -> Option<u32> {
-    resolve_server_full(settings).1
-}
-
-/// True when auto-discovery is enabled and at least one local llama server
-/// process is running. Recomputed after settings edits in `app::run`.
-pub(crate) fn server_is_auto_discovered(settings: &config::AppConfig) -> bool {
-    settings.auto_discovery && !discovery_llm::discover_processes(&system::RealSys).is_empty()
+    let identity = discovery_llm::selected_endpoint_server(&candidates, &endpoint);
+    let auto = settings.auto_discovery
+        && candidates.iter().any(|candidate| {
+            matches!(
+                candidate.source,
+                discovery_llm::ServerSource::Process { .. }
+            )
+        });
+    ResolvedServer {
+        endpoint,
+        identity,
+        auto,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::FixtureSys;
+
+    fn cmdline(parts: &[&str]) -> String {
+        parts.join("\0")
+    }
+
+    /// A fixture with one `llama-server` per `(pid, port)` pair. Each process
+    /// gets a distinct start time so the identity is fully populated.
+    fn llama_fixture(servers: &[(u32, u16)]) -> FixtureSys {
+        let mut sys = FixtureSys::default();
+        for (pid, port) in servers {
+            sys.dir_entry("/proc", &pid.to_string(), false, false);
+            sys.file(
+                &format!("/proc/{pid}/cmdline"),
+                cmdline(&["/usr/bin/llama-server", "--port", &port.to_string()]),
+            );
+            let start_time = u64::from(*pid) * 1_000;
+            sys.file(
+                &format!("/proc/{pid}/stat"),
+                format!(
+                    "{pid} (llama-server) S 1 {pid} {pid} 0 -1 4194560 100 0 0 0 5 5 5 0 20 0 \
+                     1 0 {start_time} 12345 678 90"
+                ),
+            );
+        }
+        sys
+    }
+
+    fn identity(pid: u32, start_time: u64) -> discovery_llm::LocalServerIdentity {
+        discovery_llm::LocalServerIdentity { pid, start_time }
+    }
 
     #[test]
     fn manual_server_is_used_when_auto_discovery_is_disabled() {
@@ -334,7 +396,57 @@ mod tests {
             auto_discovery: false,
             ..config::AppConfig::default()
         };
-        assert_eq!(resolve_server(&settings), "http://10.0.0.5:8080");
+        // Even with a local server running on the same URL, a manual endpoint
+        // gets no local PID (no GPU attribution by guessing).
+        let sys = llama_fixture(&[(5000, 8080)]);
+        let resolved = resolve_monitor_target_with(&sys, &settings);
+        assert_eq!(resolved.endpoint, "http://10.0.0.5:8080");
+        assert_eq!(resolved.identity, None);
+        assert!(!resolved.auto);
+    }
+
+    #[test]
+    fn auto_discovery_reports_endpoint_pid_and_origin_independently() {
+        let settings = config::AppConfig {
+            auto_discovery: true,
+            ..config::AppConfig::default()
+        };
+
+        // A restart on the same port keeps the endpoint but changes the
+        // identity (new PID here; a reused PID would carry a new start time).
+        let first = resolve_monitor_target_with(&llama_fixture(&[(5000, 8081)]), &settings);
+        assert_eq!(first.endpoint, "http://127.0.0.1:8081");
+        assert_eq!(first.identity, Some(identity(5000, 5_000_000)));
+        assert!(first.auto);
+
+        let restarted = resolve_monitor_target_with(&llama_fixture(&[(6000, 8081)]), &settings);
+        assert_eq!(restarted.endpoint, first.endpoint);
+        assert_eq!(restarted.identity, Some(identity(6000, 6_000_000)));
+        assert!(restarted.auto);
+
+        // The server disappearing clears the identity and the auto origin,
+        // falling back to the configured server (or the default).
+        let gone = resolve_monitor_target_with(&llama_fixture(&[]), &settings);
+        assert_eq!(gone.endpoint, DEFAULT_SERVER);
+        assert_eq!(gone.identity, None);
+        assert!(!gone.auto);
+
+        // Enabling auto with the same URL the manual config used picks up the
+        // running process: same endpoint, PID appears, origin flips.
+        let manual = config::AppConfig {
+            server: Some("http://127.0.0.1:8081".to_string()),
+            auto_discovery: false,
+            ..config::AppConfig::default()
+        };
+        let manual_target = resolve_monitor_target_with(&llama_fixture(&[(5000, 8081)]), &manual);
+        assert_eq!(manual_target.endpoint, "http://127.0.0.1:8081");
+        assert_eq!(manual_target.identity, None);
+        assert!(!manual_target.auto);
+
+        let auto_target = resolve_monitor_target_with(&llama_fixture(&[(5000, 8081)]), &settings);
+        assert_eq!(auto_target.endpoint, manual_target.endpoint);
+        assert_eq!(auto_target.identity, Some(identity(5000, 5_000_000)));
+        assert!(auto_target.auto);
     }
 
     #[test]

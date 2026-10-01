@@ -95,7 +95,9 @@ struct PreviousMetricCounters {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SlotCounter {
-    slot_id: u64,
+    /// The slot's own `id` from /slots, or `None` when the response did not
+    /// provide one. Deliberately not the array position: order is not identity.
+    slot_id: Option<u64>,
     task_id: Option<i64>,
     prompt_processed: u64,
     decoded: u64,
@@ -115,6 +117,10 @@ struct CachedProps {
     spec_enabled: bool,
     spec_is_mtp: bool,
     spec_n_max: Option<u64>,
+    /// True once a /props response has actually described the speculative
+    /// config. Until then, the local server process config is used as a
+    /// fallback; afterwards /props is authoritative.
+    spec_known: bool,
     last_refresh: Option<Instant>,
 }
 
@@ -203,11 +209,17 @@ impl LlamaMonitor {
         stats.spec_is_mtp = self.props.spec_is_mtp;
         stats.spec_n_max = self.props.spec_n_max;
 
-        if let Some(local_spec) = self.local_spec_config() {
-            stats.spec_enabled |= local_spec.enabled;
-            stats.spec_is_mtp |= local_spec.is_mtp;
-            if stats.spec_n_max.is_none() {
-                stats.spec_n_max = local_spec.n_max;
+        // The local server process config is a fallback used only until a
+        // /props response has described the speculative config; afterwards the
+        // server's own report is authoritative (so a stale CLI flag cannot
+        // resurrect an explicitly disabled state).
+        if !self.props.spec_known {
+            if let Some(local_spec) = self.local_spec_config() {
+                stats.spec_enabled |= local_spec.enabled;
+                stats.spec_is_mtp |= local_spec.is_mtp;
+                if stats.spec_n_max.is_none() {
+                    stats.spec_n_max = local_spec.n_max;
+                }
             }
         }
 
@@ -318,10 +330,18 @@ impl LlamaMonitor {
 
         let metric_live = self.update_metric_counters(&mut stats);
         match self.apply_slots_outcome(&mut stats, slots_result) {
-            Some(slots) => self.update_live_slot_throughput(&mut stats, slots),
+            Some(slots) => {
+                // A formally successful /slots array is not enough: if its
+                // entries cannot be paired by a verified identity, the
+                // aggregated /metrics counters are used instead of fabricating
+                // per-slot deltas.
+                let slot_live = self.update_live_slot_throughput(&mut stats, slots);
+                (stats.prompt_tps, stats.generation_tps) =
+                    choose_live_throughput(slot_live, metric_live);
+            }
             None => {
-                stats.prompt_tps = metric_live.0;
-                stats.generation_tps = metric_live.1;
+                (stats.prompt_tps, stats.generation_tps) =
+                    choose_live_throughput(None, metric_live);
                 self.previous_slots = PreviousSlotCounters::default();
             }
         }
@@ -382,26 +402,29 @@ impl LlamaMonitor {
             .and_then(Value::as_u64)
             .unwrap_or(self.props.total_slots);
 
-        if let Some(defaults) = props.get("default_generation_settings") {
-            let spec = speculative_config(defaults);
-            if let Some(enabled) = spec.enabled {
-                self.props.spec_enabled = enabled;
-            }
-            self.props.spec_is_mtp |= spec.is_mtp;
-            if let Some(n_max) = spec.n_max {
-                self.props.spec_n_max = (n_max > 0).then_some(n_max);
-                if n_max > 0 {
-                    self.props.spec_enabled = true;
-                }
-            }
-        }
-        let root_spec = speculative_config(&props);
-        if let Some(enabled) = root_spec.enabled {
-            self.props.spec_enabled |= enabled;
-        }
-        self.props.spec_is_mtp |= root_spec.is_mtp;
-        if self.props.spec_n_max.is_none() {
-            self.props.spec_n_max = root_spec.n_max.filter(|value| *value > 0);
+        // Merge the nested (`default_generation_settings`) and root variants,
+        // nested field taking precedence. A successful response that mentions
+        // the speculative config is then authoritative: the cache is replaced,
+        // not accumulated, so an explicit disable (`false`/`0`/empty) clears
+        // the previous state and a changed `n_max` (3 → 8) is adopted. A
+        // response with no speculative information at all leaves the cache
+        // untouched, so older servers do not erase what was already known.
+        let nested = props
+            .get("default_generation_settings")
+            .map(speculative_config);
+        let root = speculative_config(&props);
+        let merged = SpeculativeConfig {
+            present: nested.is_some_and(|spec| spec.present) || root.present,
+            enabled: nested.and_then(|spec| spec.enabled).or(root.enabled),
+            is_mtp: nested.is_some_and(|spec| spec.is_mtp) || root.is_mtp,
+            n_max: nested.and_then(|spec| spec.n_max).or(root.n_max),
+        };
+        if merged.present {
+            let n_max = merged.n_max.filter(|value| *value > 0);
+            self.props.spec_enabled = merged.enabled.unwrap_or(n_max.is_some());
+            self.props.spec_is_mtp = merged.is_mtp;
+            self.props.spec_n_max = n_max;
+            self.props.spec_known = true;
         }
 
         let model = json_string(&props, &["model_name", "model_alias", "model_path"])
@@ -452,19 +475,31 @@ impl LlamaMonitor {
         live
     }
 
-    fn update_live_slot_throughput(&mut self, stats: &mut LlmStats, slots: Vec<SlotCounter>) {
+    /// Update the slot-derived live throughput. Returns the values on success,
+    /// or `None` when the slots could not be paired safely; the caller then
+    /// uses the aggregated `/metrics` counters.
+    fn update_live_slot_throughput(
+        &mut self,
+        stats: &mut LlmStats,
+        slots: Vec<SlotCounter>,
+    ) -> Option<(f64, f64)> {
         let now = Instant::now();
+        let mut live = None;
 
         if let Some(previous_at) = self.previous_slots.at {
             let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
-            let (prompt_tps, generation_tps) =
-                slot_delta_tps(&self.previous_slots.slots, &slots, seconds);
-            stats.prompt_tps = prompt_tps;
-            stats.generation_tps = generation_tps;
+            if let Some((prompt_tps, generation_tps)) =
+                slot_delta_tps(&self.previous_slots.slots, &slots, seconds)
+            {
+                stats.prompt_tps = prompt_tps;
+                stats.generation_tps = generation_tps;
+                live = Some((prompt_tps, generation_tps));
+            }
         }
 
         self.previous_slots.at = Some(now);
         self.previous_slots.slots = slots;
+        live
     }
 
     fn apply_slots_outcome(
@@ -522,7 +557,9 @@ enum JsonOutcome {
 fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     let response = match client.get(url).send() {
         Ok(response) => response,
-        Err(err) => return MetricsOutcome::Unreachable(err.to_string()),
+        // Structured redaction: strip the request URL (which may carry
+        // credentials/query secrets) before it becomes a telemetry string.
+        Err(err) => return MetricsOutcome::Unreachable(crate::redact::describe_reqwest_error(err)),
     };
     let status = response.status();
     if !status.is_success() {
@@ -530,7 +567,7 @@ fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     }
     match response.text() {
         Ok(body) => MetricsOutcome::Ok(body),
-        Err(err) => MetricsOutcome::Body(err.to_string()),
+        Err(err) => MetricsOutcome::Body(crate::redact::describe_reqwest_error(err)),
     }
 }
 
@@ -538,7 +575,7 @@ fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
 fn fetch_json(client: &Client, url: String) -> JsonOutcome {
     let response = match client.get(url).send() {
         Ok(response) => response,
-        Err(err) => return JsonOutcome::Unreachable(err.to_string()),
+        Err(err) => return JsonOutcome::Unreachable(crate::redact::describe_reqwest_error(err)),
     };
     let status = response.status();
     if !status.is_success() {
@@ -546,7 +583,7 @@ fn fetch_json(client: &Client, url: String) -> JsonOutcome {
     }
     match response.json::<Value>() {
         Ok(value) => JsonOutcome::Ok(value),
-        Err(err) => JsonOutcome::Invalid(err.to_string()),
+        Err(err) => JsonOutcome::Invalid(crate::redact::describe_reqwest_error(err)),
     }
 }
 
@@ -572,7 +609,7 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     let mut counters = Vec::with_capacity(slots.len());
     let mut overview = Vec::with_capacity(slots.len());
 
-    for (index, slot) in slots.iter().enumerate() {
+    for slot in slots.iter() {
         let n_ctx = slot.get("n_ctx").and_then(Value::as_u64).unwrap_or(0);
         // The slot's own identity from /slots. Absent in older responses —
         // kept as None rather than guessed.
@@ -632,7 +669,9 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
         }
 
         counters.push(SlotCounter {
-            slot_id: slot_id.unwrap_or(index as u64),
+            // Never substitute the array position: a slot without a reported
+            // id has no trustworthy identity (see `slot_delta_tps`).
+            slot_id,
             task_id: slot.get("id_task").and_then(Value::as_i64),
             prompt_processed: prompt_processed.unwrap_or(0),
             decoded: decoded.unwrap_or(0),
@@ -671,24 +710,30 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct SpeculativeConfig {
+    /// True when the payload actually mentions the speculative config, so a
+    /// successful response can be treated as authoritative. An explicit
+    /// `null` counts as present (it clears the cached state); a payload with
+    /// no speculative keys at all does not.
+    present: bool,
     enabled: Option<bool>,
     is_mtp: bool,
     n_max: Option<u64>,
 }
 
 fn speculative_config(value: &Value) -> SpeculativeConfig {
-    let enabled = value.get("speculative").and_then(Value::as_bool);
     let params = value.get("params");
-    let n_max = params
+    let enabled_value = value.get("speculative");
+    let n_max_value = params
         .and_then(|params| params.get("speculative.n_max"))
-        .or_else(|| value.get("speculative.n_max"))
-        .and_then(Value::as_u64);
-    let types = params
+        .or_else(|| value.get("speculative.n_max"));
+    let types_value = params
         .and_then(|params| params.get("speculative.types"))
-        .or_else(|| value.get("speculative.types"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+        .or_else(|| value.get("speculative.types"));
+    let enabled = enabled_value.and_then(Value::as_bool);
+    let n_max = n_max_value.and_then(Value::as_u64);
+    let types = types_value.and_then(Value::as_str).unwrap_or_default();
     SpeculativeConfig {
+        present: enabled_value.is_some() || n_max_value.is_some() || types_value.is_some(),
         enabled,
         is_mtp: types.split(',').any(|kind| kind.trim() == "draft-mtp"),
         n_max,
@@ -808,21 +853,50 @@ fn env_value(env_bytes: Option<&[u8]>, key: &str) -> Option<String> {
         .find_map(|entry| entry.strip_prefix(&format!("{key}=")).map(str::to_string))
 }
 
-fn slot_delta_tps(previous: &[SlotCounter], current: &[SlotCounter], seconds: f64) -> (f64, f64) {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return (0.0, 0.0);
+/// Per-slot delta throughput, or `None` when the slots cannot be paired
+/// safely.
+///
+/// Array position is never used as identity. Every current slot must carry a
+/// unique `id` that also exists exactly once in the previous sample, and the
+/// task must not have switched. If any of that fails — missing ids, duplicate
+/// ids, a new/disappeared slot, a task change, or the first sample — the whole
+/// slot-delta path abstains and the caller falls back to the aggregated
+/// `/metrics` counters, so reordered or changed slots cannot fabricate
+/// activity.
+fn slot_delta_tps(
+    previous: &[SlotCounter],
+    current: &[SlotCounter],
+    seconds: f64,
+) -> Option<(f64, f64)> {
+    if !seconds.is_finite() || seconds <= 0.0 || current.is_empty() {
+        return None;
     }
 
     let mut prompt_delta = 0u64;
     let mut decoded_delta = 0u64;
 
     for current_slot in current {
-        let Some(previous_slot) = previous.iter().find(|previous_slot| {
-            previous_slot.slot_id == current_slot.slot_id
-                && task_ids_match(previous_slot.task_id, current_slot.task_id)
-        }) else {
-            continue;
-        };
+        let slot_id = current_slot.slot_id?;
+        if current
+            .iter()
+            .filter(|slot| slot.slot_id == Some(slot_id))
+            .count()
+            != 1
+        {
+            return None;
+        }
+        if previous
+            .iter()
+            .filter(|slot| slot.slot_id == Some(slot_id))
+            .count()
+            != 1
+        {
+            return None;
+        }
+        let previous_slot = previous.iter().find(|slot| slot.slot_id == Some(slot_id))?;
+        if !task_ids_match(previous_slot.task_id, current_slot.task_id) {
+            return None;
+        }
 
         prompt_delta = prompt_delta.saturating_add(
             current_slot
@@ -833,16 +907,26 @@ fn slot_delta_tps(previous: &[SlotCounter], current: &[SlotCounter], seconds: f6
             .saturating_add(current_slot.decoded.saturating_sub(previous_slot.decoded));
     }
 
-    (
+    Some((
         prompt_delta as f64 / seconds,
         decoded_delta as f64 / seconds,
-    )
+    ))
+}
+
+/// Prefer trustworthy per-slot deltas; otherwise fall back to the aggregated
+/// `/metrics` counters. Never a fabricated per-slot value.
+fn choose_live_throughput(slot_live: Option<(f64, f64)>, metric_live: (f64, f64)) -> (f64, f64) {
+    slot_live.unwrap_or(metric_live)
 }
 
 fn task_ids_match(previous: Option<i64>, current: Option<i64>) -> bool {
     match (previous, current) {
         (Some(previous), Some(current)) => previous == current,
-        _ => true,
+        // Both absent: no task id is available (older responses), so slot-id
+        // pairing is the best available identity. A one-sided id is a
+        // possible task switch and must not be paired.
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -977,6 +1061,92 @@ mod tests {
         assert_eq!(monitor.props.model, "Qwen3-4B-Q4_K_M");
         assert_eq!(monitor.props.context_size, 4096);
         assert_eq!(monitor.props.total_slots, 2);
+    }
+
+    #[test]
+    fn successful_props_response_replaces_spec_state_instead_of_accumulating() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "model_name": "model-A",
+            "speculative": true,
+            "speculative.n_max": 3,
+            "speculative.types": "draft-mtp"
+        })));
+        assert!(monitor.props.spec_enabled);
+        assert!(monitor.props.spec_is_mtp);
+        assert_eq!(monitor.props.spec_n_max, Some(3));
+
+        // Explicit disable on the same endpoint (new model / restarted server):
+        // the previous active state must be removed, not OR-ed into.
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "model_name": "model-B",
+            "speculative": false,
+            "speculative.n_max": 0,
+            "speculative.types": ""
+        })));
+        assert!(!monitor.props.spec_enabled, "stale enabled flag");
+        assert!(!monitor.props.spec_is_mtp, "stale mtp flag");
+        assert_eq!(monitor.props.spec_n_max, None, "stale n_max");
+        assert_eq!(monitor.props.model, "model-B");
+    }
+
+    #[test]
+    fn successful_props_response_adopts_a_changed_n_max() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": true,
+            "params": {"speculative.n_max": 3}
+        })));
+        assert_eq!(monitor.props.spec_n_max, Some(3));
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": true,
+            "params": {"speculative.n_max": 8}
+        })));
+        assert_eq!(monitor.props.spec_n_max, Some(8));
+    }
+
+    #[test]
+    fn props_without_spec_info_keeps_the_cached_state() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": true,
+            "speculative.n_max": 4,
+            "speculative.types": "draft-mtp"
+        })));
+        // An older response that says nothing about spec must not erase it...
+        monitor.apply_props_result(JsonOutcome::Ok(json!({"model_name": "model-C"})));
+        assert!(monitor.props.spec_enabled);
+        assert!(monitor.props.spec_is_mtp);
+        assert_eq!(monitor.props.spec_n_max, Some(4));
+
+        // ...and neither must a failed refresh.
+        monitor.apply_props_result(JsonOutcome::Unreachable("connect error".into()));
+        assert!(monitor.props.spec_enabled);
+        assert_eq!(monitor.props.spec_n_max, Some(4));
+    }
+
+    #[test]
+    fn default_generation_settings_takes_precedence_over_root() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": true,
+            "speculative.n_max": 3,
+            "default_generation_settings": {
+                "speculative": false,
+                "speculative.n_max": 0
+            }
+        })));
+        assert!(!monitor.props.spec_enabled, "nested disable must win");
+        assert_eq!(monitor.props.spec_n_max, None);
+
+        // Root fields fill what the nested variant does not mention.
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": true,
+            "speculative.n_max": 6,
+            "default_generation_settings": {"n_ctx": 4096}
+        })));
+        assert!(monitor.props.spec_enabled);
+        assert_eq!(monitor.props.spec_n_max, Some(6));
     }
 
     #[test]
@@ -1140,19 +1310,19 @@ mod tests {
     #[test]
     fn derives_live_throughput_from_matching_slot_task() {
         let previous = vec![SlotCounter {
-            slot_id: 0,
+            slot_id: Some(0),
             task_id: Some(42),
             prompt_processed: 1000,
             decoded: 100,
         }];
         let current = vec![SlotCounter {
-            slot_id: 0,
+            slot_id: Some(0),
             task_id: Some(42),
             prompt_processed: 1250,
             decoded: 130,
         }];
 
-        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 0.5);
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 0.5).unwrap();
         assert_eq!(prompt_tps, 500.0);
         assert_eq!(generation_tps, 60.0);
     }
@@ -1160,19 +1330,21 @@ mod tests {
     #[test]
     fn new_slot_task_does_not_create_false_live_spike() {
         let previous = vec![SlotCounter {
-            slot_id: 0,
+            slot_id: Some(0),
             task_id: Some(42),
             prompt_processed: 1000,
             decoded: 500,
         }];
         let current = vec![SlotCounter {
-            slot_id: 0,
+            slot_id: Some(0),
             task_id: Some(43),
             prompt_processed: 100,
             decoded: 5,
         }];
 
-        assert_eq!(slot_delta_tps(&previous, &current, 0.5), (0.0, 0.0));
+        // A task switch makes the pair unverifiable: abstain (the caller falls
+        // back to the aggregated counters) rather than emit a fake spike.
+        assert_eq!(slot_delta_tps(&previous, &current, 0.5), None);
     }
 
     #[test]
@@ -1512,13 +1684,13 @@ mod tests {
     fn slot_delta_tps_sums_active_slots_into_server_aggregate() {
         let previous = vec![
             SlotCounter {
-                slot_id: 0,
+                slot_id: Some(0),
                 task_id: Some(1),
                 prompt_processed: 1000,
                 decoded: 100,
             },
             SlotCounter {
-                slot_id: 1,
+                slot_id: Some(1),
                 task_id: Some(2),
                 prompt_processed: 2000,
                 decoded: 200,
@@ -1526,20 +1698,20 @@ mod tests {
         ];
         let current = vec![
             SlotCounter {
-                slot_id: 0,
+                slot_id: Some(0),
                 task_id: Some(1),
                 prompt_processed: 1100,
                 decoded: 150,
             },
             SlotCounter {
-                slot_id: 1,
+                slot_id: Some(1),
                 task_id: Some(2),
                 prompt_processed: 2200,
                 decoded: 300,
             },
         ];
 
-        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0);
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0).unwrap();
         assert_eq!(prompt_tps, 150.0);
         assert_eq!(generation_tps, 75.0);
     }
@@ -1548,13 +1720,13 @@ mod tests {
     fn slot_delta_tps_ignores_disappeared_slot_and_restarted_task() {
         let previous = vec![
             SlotCounter {
-                slot_id: 0,
+                slot_id: Some(0),
                 task_id: Some(1),
                 prompt_processed: 1000,
                 decoded: 500,
             },
             SlotCounter {
-                slot_id: 1,
+                slot_id: Some(1),
                 task_id: Some(2),
                 prompt_processed: 2000,
                 decoded: 300,
@@ -1563,31 +1735,149 @@ mod tests {
         // Slot 0 disappeared; slot 1's task finished and a new task started
         // on the same slot — neither may leak a stale delta.
         let current = vec![SlotCounter {
-            slot_id: 1,
+            slot_id: Some(1),
             task_id: Some(3),
             prompt_processed: 50,
             decoded: 5,
         }];
 
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (0.0, 0.0));
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
     }
 
     #[test]
     fn slot_delta_tps_clamps_counter_decrease_to_zero() {
         let previous = vec![SlotCounter {
-            slot_id: 0,
+            slot_id: Some(0),
             task_id: Some(1),
             prompt_processed: 1000,
             decoded: 900,
         }];
         let current = vec![SlotCounter {
-            slot_id: 0,
+            slot_id: Some(0),
             task_id: Some(1),
             prompt_processed: 900,
             decoded: 100,
         }];
 
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (0.0, 0.0));
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn reordered_slots_without_ids_abstain_and_fall_back_to_metrics() {
+        // Two slots with no `id`: array order is not identity, so a pure
+        // reordering (identical counters) must not be read as activity.
+        let previous = apply_slots_json(
+            &mut LlmStats::default(),
+            &json!([
+                {"is_processing": true, "n_prompt_tokens_processed": 100, "next_token": {"n_decoded": 10}},
+                {"is_processing": true, "n_prompt_tokens_processed": 1000, "next_token": {"n_decoded": 100}}
+            ]),
+        )
+        .unwrap();
+        let current = apply_slots_json(
+            &mut LlmStats::default(),
+            &json!([
+                {"is_processing": true, "n_prompt_tokens_processed": 1000, "next_token": {"n_decoded": 100}},
+                {"is_processing": true, "n_prompt_tokens_processed": 100, "next_token": {"n_decoded": 10}}
+            ]),
+        )
+        .unwrap();
+        assert!(previous.iter().all(|slot| slot.slot_id.is_none()));
+
+        let slot_live = slot_delta_tps(&previous, &current, 1.0);
+        assert_eq!(slot_live, None, "no identity → no per-slot delta");
+        // The decision must fall back to the aggregated metrics, never to the
+        // fabricated 900/90 the old index-as-id behavior produced.
+        assert_eq!(choose_live_throughput(slot_live, (0.0, 0.0)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn stable_slot_ids_keep_correct_deltas_when_reordered() {
+        let previous = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: 1000,
+                decoded: 100,
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: Some(2),
+                prompt_processed: 2000,
+                decoded: 200,
+            },
+        ];
+        // Same slots, reordered, each advanced by its own amount.
+        let current = vec![
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: Some(2),
+                prompt_processed: 2200,
+                decoded: 300,
+            },
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: 1100,
+                decoded: 150,
+            },
+        ];
+        assert_eq!(
+            slot_delta_tps(&previous, &current, 2.0),
+            Some((150.0, 75.0))
+        );
+    }
+
+    #[test]
+    fn duplicate_slot_ids_abstain() {
+        let previous = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: 1000,
+            decoded: 100,
+        }];
+        let current = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: 1100,
+                decoded: 150,
+            },
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: 1200,
+                decoded: 160,
+            },
+        ];
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
+    }
+
+    #[test]
+    fn new_slot_among_known_ones_abstains() {
+        // A new slot (id present, no previous match) makes the totals
+        // untrustworthy, so the whole slot-delta path abstains.
+        let previous = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: 1000,
+            decoded: 100,
+        }];
+        let current = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: 1100,
+                decoded: 150,
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: Some(2),
+                prompt_processed: 5,
+                decoded: 1,
+            },
+        ];
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
     }
 
     #[test]
@@ -1724,6 +2014,7 @@ mod speculative_status_tests {
         assert_eq!(
             speculative_config(&slot),
             SpeculativeConfig {
+                present: true,
                 enabled: Some(true),
                 is_mtp: false,
                 n_max: Some(3)
