@@ -115,12 +115,19 @@ struct CachedProps {
     context_size: u64,
     total_slots: u64,
     spec_enabled: bool,
+    /// True when the server's response explicitly carried the `speculative`
+    /// boolean. Then the server's enabled/disabled decision is authoritative.
+    spec_enabled_known: bool,
     spec_is_mtp: bool,
+    /// True when a server response explicitly named a speculative type other
+    /// than `none`/empty (`draft-mtp`, `ngram`, …). A named type is
+    /// authoritative; a type list that names nothing (`none`, empty or
+    /// absent) leaves the field to the local process CLI.
+    spec_named_type: bool,
     spec_n_max: Option<u64>,
-    /// True once a /props response has actually described the speculative
-    /// config. Until then, the local server process config is used as a
-    /// fallback; afterwards /props is authoritative.
-    spec_known: bool,
+    /// True when the server's response explicitly carried `speculative.n_max`
+    /// (including an explicit `0`, which disables it).
+    spec_n_max_known: bool,
     last_refresh: Option<Instant>,
 }
 
@@ -209,18 +216,10 @@ impl LlamaMonitor {
         stats.spec_is_mtp = self.props.spec_is_mtp;
         stats.spec_n_max = self.props.spec_n_max;
 
-        // The local server process config is a fallback used only until a
-        // /props response has described the speculative config; afterwards the
-        // server's own report is authoritative (so a stale CLI flag cannot
-        // resurrect an explicitly disabled state).
-        if !self.props.spec_known {
-            if let Some(local_spec) = self.local_spec_config() {
-                stats.spec_enabled |= local_spec.enabled;
-                stats.spec_is_mtp |= local_spec.is_mtp;
-                if stats.spec_n_max.is_none() {
-                    stats.spec_n_max = local_spec.n_max;
-                }
-            }
+        // Fill in the fields the server's own responses did not decide from
+        // the local server process CLI (see `apply_local_spec_fallback`).
+        if let Some(local_spec) = self.local_spec_config() {
+            apply_local_spec_fallback(&self.props, &mut stats, local_spec);
         }
 
         let metrics_text = match metrics_result {
@@ -413,18 +412,29 @@ impl LlamaMonitor {
             .get("default_generation_settings")
             .map(speculative_config);
         let root = speculative_config(&props);
+        // The nested variant wins per field; root fills what it omits. The
+        // type is taken from whichever source actually carried a `types`
+        // string, so a root `speculative.types` is not silently mixed with a
+        // nested variant that describes the type differently.
+        let type_source = nested.filter(|spec| spec.types_known);
         let merged = SpeculativeConfig {
             present: nested.is_some_and(|spec| spec.present) || root.present,
             enabled: nested.and_then(|spec| spec.enabled).or(root.enabled),
-            is_mtp: nested.is_some_and(|spec| spec.is_mtp) || root.is_mtp,
+            is_mtp: type_source.map_or(root.is_mtp, |spec| spec.is_mtp),
             n_max: nested.and_then(|spec| spec.n_max).or(root.n_max),
+            types_known: type_source.is_some() || root.types_known,
+            named_type: type_source.map_or(root.named_type, |spec| spec.named_type),
         };
         if merged.present {
             let n_max = merged.n_max.filter(|value| *value > 0);
-            self.props.spec_enabled = merged.enabled.unwrap_or(n_max.is_some());
+            // A named MTP type implies speculative decoding is enabled even
+            // when the server did not send the `speculative` boolean.
+            self.props.spec_enabled = merged.enabled.unwrap_or(n_max.is_some() || merged.is_mtp);
+            self.props.spec_enabled_known = merged.enabled.is_some();
             self.props.spec_is_mtp = merged.is_mtp;
+            self.props.spec_named_type = merged.named_type;
+            self.props.spec_n_max_known = merged.n_max.is_some();
             self.props.spec_n_max = n_max;
-            self.props.spec_known = true;
         }
 
         let model = json_string(&props, &["model_name", "model_alias", "model_path"])
@@ -718,6 +728,11 @@ struct SpeculativeConfig {
     enabled: Option<bool>,
     is_mtp: bool,
     n_max: Option<u64>,
+    /// True when the payload carried a `speculative.types` string.
+    types_known: bool,
+    /// True when that string names a real type (`draft-mtp`, `ngram`, …),
+    /// as opposed to being absent, empty or just `none`.
+    named_type: bool,
 }
 
 fn speculative_config(value: &Value) -> SpeculativeConfig {
@@ -732,11 +747,50 @@ fn speculative_config(value: &Value) -> SpeculativeConfig {
     let enabled = enabled_value.and_then(Value::as_bool);
     let n_max = n_max_value.and_then(Value::as_u64);
     let types = types_value.and_then(Value::as_str).unwrap_or_default();
+    let named_type = types.split(',').any(|kind| {
+        let kind = kind.trim();
+        !kind.is_empty() && kind != "none"
+    });
     SpeculativeConfig {
         present: enabled_value.is_some() || n_max_value.is_some() || types_value.is_some(),
         enabled,
         is_mtp: types.split(',').any(|kind| kind.trim() == "draft-mtp"),
         n_max,
+        types_known: types_value.is_some(),
+        named_type,
+    }
+}
+
+/// Fill the speculative fields the server did not decide from the local
+/// server process CLI.
+///
+/// Precedence (unambiguous):
+/// * a server `speculative` boolean is authoritative for enabled/disabled;
+/// * a server type list decides the type when it names a real type
+///   (`draft-mtp` → MTP; any other named type → not MTP);
+/// * a server `speculative.n_max` (including an explicit `0`) is authoritative;
+/// * anything the server did not state is filled from the CLI, so a server
+///   whose only type report is `speculative.types: "none"` still shows the MTP
+///   the process was actually launched with;
+/// * a server that explicitly says `speculative: false` is never overridden
+///   to MTP by the CLI.
+fn apply_local_spec_fallback(
+    props: &CachedProps,
+    stats: &mut LlmStats,
+    local: LocalSpeculativeConfig,
+) {
+    // The server disabled speculation either explicitly (`speculative: false`)
+    // or by reporting `speculative.n_max: 0` (known, but filtered to `None`).
+    let n_max_zero = props.spec_n_max_known && props.spec_n_max.is_none();
+    let server_disabled = (props.spec_enabled_known && !props.spec_enabled) || n_max_zero;
+    if !props.spec_enabled_known && !server_disabled {
+        stats.spec_enabled |= local.enabled;
+    }
+    if !props.spec_named_type && !server_disabled {
+        stats.spec_is_mtp |= local.is_mtp;
+    }
+    if !props.spec_n_max_known && !server_disabled && stats.spec_n_max.is_none() {
+        stats.spec_n_max = local.n_max;
     }
 }
 
@@ -1061,6 +1115,161 @@ mod tests {
         assert_eq!(monitor.props.model, "Qwen3-4B-Q4_K_M");
         assert_eq!(monitor.props.context_size, 4096);
         assert_eq!(monitor.props.total_slots, 2);
+    }
+
+    #[test]
+    fn speculative_type_list_distinguishes_none_from_a_named_type() {
+        let none = speculative_config(&json!({"speculative.types": "none"}));
+        assert!(none.types_known);
+        assert!(!none.named_type, "\"none\" names no type");
+        assert!(!none.is_mtp);
+
+        let mtp = speculative_config(&json!({"speculative.types": "draft-mtp"}));
+        assert!(mtp.named_type);
+        assert!(mtp.is_mtp);
+
+        let other = speculative_config(&json!({"speculative.types": "ngram"}));
+        assert!(other.named_type);
+        assert!(!other.is_mtp);
+
+        let absent = speculative_config(&json!({"n_ctx": 4096}));
+        assert!(!absent.types_known);
+        assert!(!absent.named_type);
+    }
+
+    #[test]
+    fn local_mtp_is_shown_when_the_server_only_reports_types_none() {
+        // Live shape on cf-desktop: /props carries only
+        // `speculative.types: "none"`, the CLI is launched with draft-mtp/8.
+        // The server did not name a type, so the CLI fills it in.
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "default_generation_settings": {"params": {"speculative.types": "none"}}
+        })));
+        let mut stats = LlmStats {
+            spec_enabled: monitor.props.spec_enabled,
+            spec_is_mtp: monitor.props.spec_is_mtp,
+            spec_n_max: monitor.props.spec_n_max,
+            ..Default::default()
+        };
+        apply_local_spec_fallback(
+            &monitor.props,
+            &mut stats,
+            LocalSpeculativeConfig {
+                enabled: true,
+                is_mtp: true,
+                n_max: Some(8),
+            },
+        );
+        assert!(stats.spec_enabled);
+        assert!(stats.spec_is_mtp, "CLI draft-mtp must surface");
+        assert_eq!(stats.spec_n_max, Some(8));
+    }
+
+    #[test]
+    fn named_mtp_type_implies_enabled_from_the_server_alone() {
+        // A server that names draft-mtp but omits the `speculative` boolean
+        // still means speculative decoding is on.
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative.types": "draft-mtp"
+        })));
+        assert!(monitor.props.spec_enabled);
+        assert!(monitor.props.spec_is_mtp);
+    }
+
+    #[test]
+    fn nested_type_none_takes_precedence_over_root_mtp() {
+        // Documented precedence: the nested default_generation_settings wins
+        // per field, so a nested `types: "none"` overrides a root draft-mtp.
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative.types": "draft-mtp",
+            "default_generation_settings": {"params": {"speculative.types": "none"}}
+        })));
+        assert!(!monitor.props.spec_is_mtp);
+        assert!(!monitor.props.spec_named_type);
+    }
+
+    #[test]
+    fn standalone_n_max_zero_suppresses_local_mtp() {
+        // An explicit server `speculative.n_max: 0` (no `speculative` boolean)
+        // disables speculation: the CLI MTP must not override it.
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "params": {"speculative.n_max": 0}
+        })));
+        let mut stats = LlmStats {
+            spec_enabled: monitor.props.spec_enabled,
+            spec_is_mtp: monitor.props.spec_is_mtp,
+            spec_n_max: monitor.props.spec_n_max,
+            ..Default::default()
+        };
+        apply_local_spec_fallback(
+            &monitor.props,
+            &mut stats,
+            LocalSpeculativeConfig {
+                enabled: true,
+                is_mtp: true,
+                n_max: Some(8),
+            },
+        );
+        assert!(!stats.spec_enabled);
+        assert!(!stats.spec_is_mtp);
+        assert_eq!(stats.spec_n_max, None);
+    }
+
+    #[test]
+    fn local_mtp_does_not_override_an_explicit_server_disable() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": false,
+            "speculative.types": ""
+        })));
+        let mut stats = LlmStats {
+            spec_enabled: monitor.props.spec_enabled,
+            spec_is_mtp: monitor.props.spec_is_mtp,
+            spec_n_max: monitor.props.spec_n_max,
+            ..Default::default()
+        };
+        apply_local_spec_fallback(
+            &monitor.props,
+            &mut stats,
+            LocalSpeculativeConfig {
+                enabled: true,
+                is_mtp: true,
+                n_max: Some(8),
+            },
+        );
+        assert!(!stats.spec_enabled);
+        assert!(!stats.spec_is_mtp);
+        assert_eq!(stats.spec_n_max, None);
+    }
+
+    #[test]
+    fn local_mtp_does_not_override_a_server_named_non_mtp_type() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();
+        monitor.apply_props_result(JsonOutcome::Ok(json!({
+            "speculative": true,
+            "speculative.types": "ngram"
+        })));
+        let mut stats = LlmStats {
+            spec_enabled: monitor.props.spec_enabled,
+            spec_is_mtp: monitor.props.spec_is_mtp,
+            spec_n_max: monitor.props.spec_n_max,
+            ..Default::default()
+        };
+        apply_local_spec_fallback(
+            &monitor.props,
+            &mut stats,
+            LocalSpeculativeConfig {
+                enabled: true,
+                is_mtp: true,
+                n_max: Some(8),
+            },
+        );
+        assert!(stats.spec_enabled);
+        assert!(!stats.spec_is_mtp, "server named a non-MTP type");
     }
 
     #[test]
@@ -2017,7 +2226,9 @@ mod speculative_status_tests {
                 present: true,
                 enabled: Some(true),
                 is_mtp: false,
-                n_max: Some(3)
+                n_max: Some(3),
+                types_known: false,
+                named_type: false,
             }
         );
     }

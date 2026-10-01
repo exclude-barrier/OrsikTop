@@ -1866,11 +1866,12 @@ fn llm_spec_row(
         && llm.spec_draft_tokens == 0.0
         && llm.spec_accepted_tokens == 0.0
     {
-        // Counters exist only in llama-server >= b10700; an enabled run that
-        // reports all zeros means the server predates them, not a broken read.
+        // The server reports speculative decoding as enabled but exposes no
+        // draft/accept counters (older builds, or an idle server). Say so
+        // neutrally instead of asserting a server version or a broken read.
         return Line::from(vec![
             label_span(" SPEC TOK   "),
-            llm_metric_cell("no data (server < b10700)", metric_width, MUTED, false),
+            llm_metric_cell("no counters", metric_width, MUTED, false),
             llm_metric_cell("—", metric_width, MUTED, false),
         ]);
     }
@@ -5411,7 +5412,7 @@ mod tests {
         };
         let row = llm_spec_row(&llm, 24, None);
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
-        assert!(text.contains("no data (server < b10700)"), "row: {text:?}");
+        assert!(text.contains("no counters"), "row: {text:?}");
         assert!(text.contains("SPEC"));
     }
 

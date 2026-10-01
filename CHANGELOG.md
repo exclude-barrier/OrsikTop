@@ -133,7 +133,11 @@ All notable changes to OrsikTop will be documented here.
   the LLM worker separately and drops the server-dependent caches (counter
   baselines, cached /props) without starting a new UI session. Deterministic
   tests exercise the held-A → B → release-A flow, the A→B→A case and the
-  stale-mapping rejection; they fail against the previous untagged flow.
+  stale-mapping rejection; they fail against the previous untagged flow. The
+  guarantee is bounded by detection: until a restart is observed and the
+  generation is advanced, results are still treated as current — the
+  generation prevents applying old results after invalidation, it does not
+  retroactively recognise a restart that has not been detected yet.
 
 - The settings dialog preserves the endpoint it was opened with. Only host and
   port are edited; scheme, path, userinfo, query and fragment are kept, and
@@ -151,9 +155,38 @@ All notable changes to OrsikTop will be documented here.
   changed `n_max` (3 → 8) is adopted, while a response that says nothing about
   speculation (or a failed fetch) keeps the cache. `default_generation_settings`
   takes precedence over root fields per field. The local server process config
-  is only a fallback until `/props` has described speculation. Regression
+  fills only the fields `/props` did not decide (see the granular rule below);
+  a server that explicitly disables speculation is never overridden. Regression
   tests cover the A→B disable, 3→8, no-info, failed-fetch and nested/root
   priority cases; they fail against the previous `|=` accumulation.
+
+- `orsiktop diag` now honors the same one-off CLI overrides as the TUI:
+  `--server`, `--gpu`/`--gpu-index` and `--interval-ms` are resolved once,
+  before subcommand dispatch, and the diagnostics report uses the resulting
+  configuration. `--server` and `--gpu` are reflected in the report (endpoint
+  and provider selector); the report has no refresh-interval section, so
+  `--interval-ms` only affects the settings it shares with the TUI. Previously
+  `orsiktop --server … diag` silently ignored the override and always
+  auto-discovered, and `--gpu` never changed the reported selector.
+
+- Speculative-decoding classification is now unambiguous and driven by what
+  the server actually reports, with the local process CLI filling only the
+  gaps: a server `speculative` boolean is authoritative for on/off; a server
+  `speculative.types` list decides the type when it names a real type
+  (`draft-mtp` → MTP; any other named type → not MTP); a list that names
+  nothing (`none`, empty or absent) leaves the field to the process CLI, so a
+  server reporting only `speculative.types: "none"` still shows the MTP the
+  process was launched with; a server `speculative.n_max` (including an
+  explicit `0`) is authoritative; and an explicit server `speculative: false`
+  is never overridden to MTP by the CLI. The SPEC TOK row now says the neutral
+  `no counters` instead of asserting a server build number when speculative is
+  enabled but no counters are exposed.
+
+- The GPU-dispatch error-path test no longer depends on the host's real GPUs:
+  it drives `new_gpu_provider_with` over an empty `FixtureSys`, so the AMD and
+  Intel backends deterministically report their device-specific error. (On a
+  machine whose real dGPU shares the fabricated BDF the previous test read
+  live sysfs and failed.)
 
 - Per-slot throughput no longer treats the array position as a slot identity.
   A delta is only computed when every slot carries a unique `id` that also
