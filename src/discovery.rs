@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::{DeviceId, GpuVendor};
+use crate::domain::{parse_pci_bdf, DeviceId, GpuVendor};
 use crate::system::Sys;
 
 /// A GPU discovered through DRM sysfs, before any vendor telemetry.
@@ -37,25 +37,12 @@ fn is_display_class(class: u32) -> bool {
     (class >> 16) & 0xff == 0x03
 }
 
-/// Parse and validate a PCI BDF like `0000:01:00.0` (no external regex).
+/// Parse and validate a PCI BDF, accepting both the 4-digit and 8-digit
+/// domain forms and returning the canonical form. Delegates to the shared
+/// [`crate::domain::parse_pci_bdf`] grammar so discovery and GPU attribution
+/// never disagree on which domain forms are valid.
 fn parse_bdf(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 12 {
-        return None;
-    }
-    let is_hex = |b: u8| b.is_ascii_hexdigit();
-    if !(0..4).all(|i| is_hex(bytes[i]))
-        || bytes[4] != b':'
-        || !(5..7).all(|i| is_hex(bytes[i]))
-        || bytes[7] != b':'
-        || !(8..10).all(|i| is_hex(bytes[i]))
-        || bytes[10] != b'.'
-        || !bytes[11].is_ascii_digit()
-        || bytes[11] > b'7'
-    {
-        return None;
-    }
-    Some(text.to_ascii_lowercase())
+    parse_pci_bdf(text)
 }
 
 /// The PCI BDF is the final component of the PCI device directory, with a
@@ -419,7 +406,18 @@ mod tests {
     #[test]
     fn parse_bdf_accepts_valid_and_rejects_garbage() {
         assert_eq!(parse_bdf("0000:01:00.0"), Some("0000:01:00.0".to_string()));
+        // 8-digit domains are accepted and canonicalized, matching the
+        // GPU-attribution grammar — no identity is lost.
+        assert_eq!(
+            parse_bdf("00000000:01:00.0"),
+            Some("0000:01:00.0".to_string())
+        );
+        assert_eq!(
+            parse_bdf("00010000:01:00.0"),
+            Some("00010000:01:00.0".to_string())
+        );
         assert_eq!(parse_bdf("0000:01:00.8"), None);
+        assert_eq!(parse_bdf("00000000:01:00.8"), None);
         assert_eq!(parse_bdf("0000:01:00"), None);
         assert_eq!(parse_bdf("0000-01-00-0"), None);
         assert_eq!(parse_bdf("zzzz:01:00.0"), None);

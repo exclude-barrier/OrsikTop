@@ -28,6 +28,13 @@ const LLM_REQUEST_TIMEOUT_MS: u64 = 1200;
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
     pub connected: bool,
+    /// True when `/metrics` answered successfully this sample, so the
+    /// metric-derived fields below (counters, throughput, request counts,
+    /// timings) carry real values. False when `/metrics` failed or is
+    /// disabled — even if `/slots` is reachable and `connected` is true. The
+    /// slot/context fields stay valid; the metric fields are unavailable
+    /// (`—`) rather than a fabricated zero.
+    pub metrics_available: bool,
     pub reconnecting: bool,
     pub model: String,
     pub context_size: u64,
@@ -200,9 +207,20 @@ impl LlamaMonitor {
             let slots_handle = scope.spawn(move || fetch_json(client, format!("{base}/slots")));
 
             (
-                props_handle.map(|handle| handle.join().unwrap()),
-                metrics_handle.join().unwrap(),
-                slots_handle.join().unwrap(),
+                props_handle.map(|handle| {
+                    join_or(
+                        handle,
+                        JsonOutcome::Unreachable("props fetch task panicked".to_string()),
+                    )
+                }),
+                join_or(
+                    metrics_handle,
+                    MetricsOutcome::Unreachable("metrics fetch task panicked".to_string()),
+                ),
+                join_or(
+                    slots_handle,
+                    JsonOutcome::Unreachable("slots fetch task panicked".to_string()),
+                ),
             )
         });
 
@@ -222,28 +240,44 @@ impl LlamaMonitor {
             apply_local_spec_fallback(&self.props, &mut stats, local_spec);
         }
 
+        // /metrics and /slots are independent endpoints: a metrics-disabled or
+        // failing server must not hide a healthy /slots response. The metrics
+        // outcome decides only whether the metric-derived fields are
+        // available; /slots is applied below regardless.
         let metrics_text = match metrics_result {
-            MetricsOutcome::Ok(text) => text,
+            MetricsOutcome::Ok(text) => Some(text),
             MetricsOutcome::Http(status) => {
                 stats.error = if status == StatusCode::NOT_IMPLEMENTED {
                     "/metrics disabled; start llama.cpp with --metrics".to_string()
                 } else {
                     format!("/metrics returned HTTP {status}")
                 };
-                return stats;
+                None
             }
             MetricsOutcome::Body(err) => {
                 stats.error = format!("metrics response error: {err}");
-                return stats;
+                None
             }
             MetricsOutcome::Unreachable(err) => {
                 stats.error = format!("cannot reach llama.cpp: {err}");
-                return stats;
+                None
             }
         };
+        // A 2xx with no parseable sample carries no metric data, so it must
+        // not be presented as a real set of zeroes.
+        let metrics = parse_prometheus(metrics_text.as_deref().unwrap_or_default());
+        stats.metrics_available = metrics_text.is_some() && !metrics.is_empty();
+        if metrics_text.is_some() && !stats.metrics_available {
+            stats.error = "/metrics returned no metrics".to_string();
+        }
 
-        stats.connected = true;
-        let metrics = parse_prometheus(&metrics_text);
+        // Slot state is served by its own endpoint and stays valid (and
+        // visible) when /metrics is disabled or failing.
+        let slots_outcome = self.apply_slots_outcome(&mut stats, slots_result);
+
+        // The server is reachable when either endpoint answered successfully;
+        // missing metric values are unavailable, not zero.
+        stats.connected = stats.metrics_available || stats.slots_available;
 
         // Current llama.cpp names first, older names retained as compatibility fallbacks.
         stats.prompt_total = pick_metric(
@@ -327,8 +361,17 @@ impl LlamaMonitor {
             stats.spec_enabled = true;
         }
 
-        let metric_live = self.update_metric_counters(&mut stats);
-        match self.apply_slots_outcome(&mut stats, slots_result) {
+        let metric_live = if stats.metrics_available {
+            self.update_metric_counters(&mut stats)
+        } else {
+            // No /metrics: leave the metric-derived throughput unavailable
+            // rather than deriving it from zeroed counters, and drop the
+            // counter baseline so the first sample after recovery cannot
+            // report a delta averaged over the whole outage.
+            self.previous_metrics = PreviousMetricCounters::default();
+            (0.0, 0.0)
+        };
+        match slots_outcome {
             Some(slots) => {
                 // A formally successful /slots array is not enough: if its
                 // entries cannot be paired by a verified identity, the
@@ -561,6 +604,13 @@ enum JsonOutcome {
     Http(StatusCode),
     Invalid(String),
     Unreachable(String),
+}
+
+/// Join a scoped fetch handle, converting a thread panic into the caller's
+/// error outcome instead of propagating it. A panic in one endpoint's fetch
+/// must not kill the whole LLM worker and stop all telemetry.
+fn join_or<T>(handle: std::thread::ScopedJoinHandle<'_, T>, on_panic: T) -> T {
+    handle.join().unwrap_or(on_panic)
 }
 
 /// Fetches a raw text endpoint (currently only /metrics).
@@ -801,10 +851,24 @@ struct LocalSpeculativeConfig {
     n_max: Option<u64>,
 }
 
+/// True when `host` (as returned by [`reqwest::Url::host_str`]) names the
+/// local machine. IPv6 hosts come back bracketed (`[::1]`), so brackets are
+/// stripped before the address is parsed; a hostname is only `localhost`.
+/// This keeps the local SPEC-CLI fallback available for IPv6 loopback
+/// endpoints exactly as for IPv4.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 fn local_speculative_process_config(base: &str) -> Option<LocalSpeculativeConfig> {
     let url = reqwest::Url::parse(base).ok()?;
     let host = url.host_str()?;
-    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+    if !is_loopback_host(host) {
         return None;
     }
     let target_port = url.port_or_known_default()?;
@@ -961,6 +1025,24 @@ fn slot_delta_tps(
             .saturating_add(current_slot.decoded.saturating_sub(previous_slot.decoded));
     }
 
+    // The loop above only verifies that every *current* slot can be paired.
+    // Every *previous* slot must also still be present exactly once — without
+    // this, a slot that disappeared would let the survivors' deltas be summed
+    // and preferred over the aggregate, silently under-reporting server
+    // activity. A previous slot without an `id` cannot be verified either, so
+    // it abstains for the same reason.
+    for previous_slot in previous {
+        let slot_id = previous_slot.slot_id?;
+        if current
+            .iter()
+            .filter(|slot| slot.slot_id == Some(slot_id))
+            .count()
+            != 1
+        {
+            return None;
+        }
+    }
+
     Some((
         prompt_delta as f64 / seconds,
         decoded_delta as f64 / seconds,
@@ -1092,6 +1174,18 @@ fn model_display_name(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_panicking_fetch_task_is_turned_into_an_outcome() {
+        // Regression: join().unwrap() used to propagate a fetch panic and kill
+        // the LLM worker permanently. The result must become the fallback
+        // error outcome instead, so sampling continues.
+        let outcome: MetricsOutcome = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| -> MetricsOutcome { panic!("simulated fetch panic") });
+            join_or(handle, MetricsOutcome::Unreachable("fallback".to_string()))
+        });
+        assert!(matches!(outcome, MetricsOutcome::Unreachable(message) if message == "fallback"));
+    }
 
     #[test]
     fn props_failure_retries_next_sample() {
@@ -1954,6 +2048,67 @@ mod tests {
     }
 
     #[test]
+    fn slot_delta_tps_abstains_when_a_slot_disappears_without_a_task_change() {
+        // Regression: the surviving slot keeps the same task, so the task
+        // check alone would pair it and return a survivor-only delta. A
+        // disappeared slot must force the aggregate fallback regardless.
+        let previous = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(7),
+                prompt_processed: 1000,
+                decoded: 500,
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: Some(8),
+                prompt_processed: 2000,
+                decoded: 300,
+            },
+        ];
+        let current = vec![SlotCounter {
+            slot_id: Some(1),
+            task_id: Some(8),
+            prompt_processed: 2100,
+            decoded: 400,
+        }];
+
+        assert_eq!(
+            slot_delta_tps(&previous, &current, 1.0),
+            None,
+            "a disappeared slot must abstain even when the survivor's task is unchanged"
+        );
+    }
+
+    #[test]
+    fn slot_delta_tps_abstains_when_a_previous_slot_has_no_id() {
+        // A previous slot that cannot be identified cannot be proven present,
+        // so it abstains instead of trusting the identified survivors.
+        let previous = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: None,
+                prompt_processed: 1000,
+                decoded: 500,
+            },
+            SlotCounter {
+                slot_id: None,
+                task_id: None,
+                prompt_processed: 2000,
+                decoded: 300,
+            },
+        ];
+        let current = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: None,
+            prompt_processed: 1100,
+            decoded: 550,
+        }];
+
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
+    }
+
+    #[test]
     fn slot_delta_tps_clamps_counter_decrease_to_zero() {
         let previous = vec![SlotCounter {
             slot_id: Some(0),
@@ -2256,6 +2411,25 @@ mod speculative_status_tests {
 #[cfg(test)]
 mod local_speculative_process_tests {
     use super::*;
+
+    #[test]
+    fn loopback_host_matches_ipv4_ipv6_and_localhost_equally() {
+        // IPv6 hosts come back from Url::host_str() bracketed; the local
+        // SPEC-CLI fallback must treat `[::1]` exactly like `127.0.0.1`.
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        // Any loopback address in the reserved ranges counts.
+        assert!(is_loopback_host("127.0.0.2"));
+        // A remote or wildcard host must not trigger a local /proc scan.
+        assert!(!is_loopback_host("192.168.1.20"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("[::]"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host(""));
+    }
 
     #[test]
     fn reads_draft_mtp_type_from_custom_slot_shape() {

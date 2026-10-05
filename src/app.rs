@@ -652,8 +652,9 @@ fn spawn_fast_worker(
                     previous_cpu_times = current_cpu_times;
                 }
 
-                let (load_one, load_five, load_fifteen) =
-                    read_load_average().unwrap_or((0.0, 0.0, 0.0));
+                // Unknown when /proc/loadavg is unreadable: kept as `None`
+                // and rendered `—`, never silently turned into a fake zero.
+                let load_average = read_load_average();
                 let per_cpu_usage = system
                     .cpus()
                     .iter()
@@ -675,9 +676,9 @@ fn spawn_fast_worker(
                     cpu_temperature_c,
                     cpu_power_w,
                     io_wait_pct,
-                    load_one,
-                    load_five,
-                    load_fifteen,
+                    load_one: load_average.map(|(one, _, _)| one),
+                    load_five: load_average.map(|(_, five, _)| five),
+                    load_fifteen: load_average.map(|(_, _, fifteen)| fifteen),
                     memory_used_bytes: system.used_memory(),
                     memory_total_bytes: system.total_memory(),
                     swap_used_bytes: system.used_swap(),
@@ -1715,6 +1716,224 @@ mod tests {
             }
         });
         (addr, stop, handle)
+    }
+
+    /// A mock server whose `/metrics` reports 501 (metrics disabled) while
+    /// `/props` and `/slots` answer normally.
+    fn spawn_metrics_off_server() -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(path) = read_request_path(&mut stream) else {
+                            continue;
+                        };
+                        if path.contains("/metrics") {
+                            let body = "metrics disabled";
+                            let response = format!(
+                                "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        } else {
+                            let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
+                            write_http(&mut stream, &body, content_type);
+                        }
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    /// Write a non-2xx HTTP response with a short body.
+    fn write_http_status(stream: &mut TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// A mock whose `/metrics` returns 501 on request `fail_on` and 200 with
+    /// increasing counters otherwise; `/slots` is always 501 so the metric
+    /// path (not the slot path) supplies the live rate.
+    fn spawn_flaky_metrics_server(
+        fail_on: usize,
+    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let metrics_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(path) = read_request_path(&mut stream) else {
+                            continue;
+                        };
+                        if path.contains("/metrics") {
+                            let index = metrics_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                            if index == fail_on {
+                                write_http_status(&mut stream, "501 Not Implemented", "disabled");
+                            } else {
+                                let prompt = 1000 * index as u64;
+                                let predicted = 500 * index as u64;
+                                let body = format!(
+                                    "llamacpp:prompt_tokens_total {prompt}\nllamacpp:tokens_predicted_total {predicted}\n"
+                                );
+                                write_http(&mut stream, &body, "text/plain");
+                            }
+                        } else if path.contains("/slots") {
+                            write_http_status(&mut stream, "501 Not Implemented", "no slots");
+                        } else {
+                            let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
+                            write_http(&mut stream, &body, content_type);
+                        }
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    /// A mock whose `/metrics` returns 200 with an empty body while `/slots`
+    /// answers normally.
+    fn spawn_empty_metrics_server() -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(path) = read_request_path(&mut stream) else {
+                            continue;
+                        };
+                        if path.contains("/metrics") {
+                            write_http(&mut stream, "", "text/plain");
+                        } else {
+                            let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
+                            write_http(&mut stream, &body, content_type);
+                        }
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    #[test]
+    fn metrics_disabled_still_exposes_slot_state() {
+        // Regression: a 501 on /metrics must not discard a healthy /slots
+        // response. The server is reachable; the slot/context state stays
+        // available while the metric-derived values are marked unavailable.
+        let (addr, stop, handle) = spawn_metrics_off_server();
+        let mut monitor = crate::llama::LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+        let stats = monitor.sample();
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert!(stats.connected, "a reachable /slots server is connected");
+        assert!(
+            !stats.metrics_available,
+            "a 501 /metrics must mark metrics unavailable"
+        );
+        assert!(
+            stats.slots_available,
+            "/slots succeeded and must stay visible"
+        );
+        assert_eq!(stats.slot_count, 1);
+        assert_eq!(stats.context_size, 4096);
+        assert_eq!(stats.slot_overview.len(), 1);
+        assert_eq!(stats.slot_overview[0].id, 0);
+        assert!(
+            stats.error.contains("--metrics"),
+            "the metrics-disabled reason must still be surfaced: {:?}",
+            stats.error
+        );
+    }
+
+    #[test]
+    fn empty_metrics_body_is_unavailable_not_a_fake_zero() {
+        // A 2xx /metrics with no parseable sample must be treated as
+        // unavailable, not as a real set of zeroes.
+        let (addr, stop, handle) = spawn_empty_metrics_server();
+        let mut monitor = crate::llama::LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+        let stats = monitor.sample();
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert!(stats.connected, "/slots answered");
+        assert!(
+            !stats.metrics_available,
+            "an empty /metrics body carries no metric data"
+        );
+        assert!(stats.slots_available);
+        assert_eq!(stats.prompt_total, 0.0);
+        assert!(
+            stats.error.contains("no metrics"),
+            "the reason must be stated, got: {:?}",
+            stats.error
+        );
+    }
+
+    #[test]
+    fn metrics_counter_baseline_resets_across_an_outage() {
+        // Regression: a metrics outage must not leave a stale counter baseline
+        // that turns the first post-outage sample into an average over the
+        // whole outage. /slots is 501 throughout so the metric path decides.
+        let (addr, stop, handle) = spawn_flaky_metrics_server(2);
+        let mut monitor = crate::llama::LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+
+        let first = monitor.sample();
+        assert!(first.metrics_available);
+        assert_eq!((first.prompt_tps, first.generation_tps), (0.0, 0.0));
+
+        let outage = monitor.sample();
+        assert!(!outage.metrics_available, "second /metrics request is 501");
+        assert!(
+            !outage.connected,
+            "with /metrics and /slots both down the server is unreachable"
+        );
+
+        thread::sleep(Duration::from_millis(5));
+
+        let recovered = monitor.sample();
+        assert!(recovered.metrics_available);
+        assert_eq!(
+            (recovered.prompt_tps, recovered.generation_tps),
+            (0.0, 0.0),
+            "the first sample after an outage must not average the delta over the outage"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
     }
 
     #[test]
