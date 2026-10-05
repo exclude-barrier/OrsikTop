@@ -90,16 +90,25 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
         .read_to_string(&PathBuf::from("/proc/cpuinfo"))
         .unwrap_or_default();
     let (vendor, model) = parse_cpu_identity(&cpuinfo);
-    let core_groups = read_core_groups(logical_cpus, sys);
+
+    // Use the actual online CPU ids, not `0..logical_cpus`: under affinity, a
+    // cpuset or `isolcpus` the online set is not a prefix of the CPU index
+    // space, and reading `cpu0..cpuN` would classify the wrong CPUs. The
+    // per-CPU vectors stay indexed by CPU id (size `span`), with offline holes
+    // left as `Unknown`.
+    let indices = online_cpu_indices(logical_cpus, sys);
+    let span = indices.iter().copied().max().map_or(0, |max| max + 1);
+
+    let core_groups = read_core_groups(&indices, span, sys);
     let physical_cores = count_unique_groups(&core_groups);
 
-    let mut core_kinds = detect_kernel_core_groups(logical_cpus, sys);
+    let mut core_kinds = detect_kernel_core_groups(span, sys);
 
     // cpu_capacity is architecture-neutral Linux scheduler information. Prefer it
     // over model-name tables so future heterogeneous CPUs can work without an
     // OrsikTop update when the kernel exposes distinct capacities.
     if !has_multiple_core_kinds(&core_kinds) {
-        if let Some(capacity_kinds) = detect_capacity_classes(logical_cpus, sys) {
+        if let Some(capacity_kinds) = detect_capacity_classes(&indices, span, sys) {
             core_kinds = capacity_kinds;
         }
     }
@@ -108,7 +117,7 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
     // SMT topology is a conservative fallback: P-cores have more sibling
     // threads than E-cores on the Intel generations this fallback targets.
     if !has_multiple_core_kinds(&core_kinds) && vendor == CpuVendor::Intel {
-        if let Some(topology_kinds) = detect_smt_classes(logical_cpus, sys) {
+        if let Some(topology_kinds) = detect_smt_classes(&indices, span, sys) {
             core_kinds = topology_kinds;
         }
     }
@@ -125,7 +134,7 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
     CpuTopology {
         vendor,
         model,
-        logical_cpus,
+        logical_cpus: indices.len(),
         physical_cores,
         performance_cores,
         efficiency_cores,
@@ -133,6 +142,14 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
         core_kinds,
         physical_core_groups,
     }
+}
+
+/// The CPUs to inspect: the kernel's online set when it can be read, otherwise
+/// the caller-provided `0..logical_cpus` prefix.
+fn online_cpu_indices<S: Sys>(logical_cpus: usize, sys: &S) -> Vec<usize> {
+    read_cpu_list_file(sys, "/sys/devices/system/cpu/online")
+        .filter(|cpus| !cpus.is_empty())
+        .unwrap_or_else(|| (0..logical_cpus).collect())
 }
 
 fn parse_cpu_identity(cpuinfo: &str) -> (CpuVendor, String) {
@@ -208,15 +225,20 @@ fn apply_kind(kinds: &mut [CpuCoreKind], cpus: &[usize], kind: CpuCoreKind) {
     }
 }
 
-fn detect_capacity_classes<S: Sys>(logical_cpus: usize, sys: &S) -> Option<Vec<CpuCoreKind>> {
-    let capacities = (0..logical_cpus)
-        .map(|cpu| {
-            read_u64(
+fn detect_capacity_classes<S: Sys>(
+    indices: &[usize],
+    span: usize,
+    sys: &S,
+) -> Option<Vec<CpuCoreKind>> {
+    let mut capacities = vec![None; span];
+    for &cpu in indices {
+        if let Some(slot) = capacities.get_mut(cpu) {
+            *slot = read_u64(
                 sys,
                 &PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity")),
-            )
-        })
-        .collect::<Vec<_>>();
+            );
+        }
+    }
 
     classify_capacity_values(&capacities)
 }
@@ -255,16 +277,17 @@ fn classify_capacity_values(capacities: &[Option<u64>]) -> Option<Vec<CpuCoreKin
     has_both_core_kinds(&kinds).then_some(kinds)
 }
 
-fn detect_smt_classes<S: Sys>(logical_cpus: usize, sys: &S) -> Option<Vec<CpuCoreKind>> {
-    let sibling_counts = (0..logical_cpus)
-        .map(|cpu| {
-            read_cpu_list_file(
+fn detect_smt_classes<S: Sys>(indices: &[usize], span: usize, sys: &S) -> Option<Vec<CpuCoreKind>> {
+    let mut sibling_counts: Vec<Option<usize>> = vec![None; span];
+    for &cpu in indices {
+        if let Some(slot) = sibling_counts.get_mut(cpu) {
+            *slot = read_cpu_list_file(
                 sys,
                 format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
             )
-            .map(|cpus| cpus.len())
-        })
-        .collect::<Vec<_>>();
+            .map(|cpus| cpus.len());
+        }
+    }
 
     classify_sibling_counts(&sibling_counts)
 }
@@ -304,28 +327,36 @@ fn classify_sibling_counts(counts: &[Option<usize>]) -> Option<Vec<CpuCoreKind>>
     .then_some(kinds)
 }
 
-fn read_core_groups<S: Sys>(logical_cpus: usize, sys: &S) -> Vec<Option<String>> {
-    (0..logical_cpus)
-        .map(|cpu| {
-            let list_path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list");
-            if let Some(cpus) = read_cpu_list_file(sys, &list_path) {
-                return Some(
-                    cpus.into_iter()
-                        .map(|value| value.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-            }
+fn read_core_groups<S: Sys>(indices: &[usize], span: usize, sys: &S) -> Vec<Option<String>> {
+    let mut groups: Vec<Option<String>> = vec![None; span];
+    for &cpu in indices {
+        if let Some(slot) = groups.get_mut(cpu) {
+            *slot = read_core_group(cpu, sys);
+        }
+    }
+    groups
+}
 
-            let package = sys.read_to_string(&PathBuf::from(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
-            )))?;
-            let core = sys.read_to_string(&PathBuf::from(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
-            )))?;
-            Some(format!("{}:{}", package.trim(), core.trim()))
-        })
-        .collect()
+/// The core identity string for one CPU: the `core_cpus_list` set when present,
+/// otherwise `package:core` from the topology attributes.
+fn read_core_group<S: Sys>(cpu: usize, sys: &S) -> Option<String> {
+    let list_path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list");
+    if let Some(cpus) = read_cpu_list_file(sys, &list_path) {
+        return Some(
+            cpus.into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
+    let package = sys.read_to_string(&PathBuf::from(format!(
+        "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
+    )))?;
+    let core = sys.read_to_string(&PathBuf::from(format!(
+        "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
+    )))?;
+    Some(format!("{}:{}", package.trim(), core.trim()))
 }
 
 fn build_physical_core_groups(
@@ -616,6 +647,37 @@ mod fixture_tests {
             .unwrap();
         assert_eq!(core0.kind, CpuCoreKind::Performance);
         assert_eq!(core0.logical_cpus, vec![0, 1]);
+    }
+
+    #[test]
+    fn fixture_reads_only_online_cpus_when_the_set_is_not_a_prefix() {
+        // Affinity/cpuset/isolcpus: online CPUs 4-7, not 0-3. A `0..logical`
+        // scan would read the wrong CPUs; the online list must drive it.
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 4\nvendor_id\t: GenuineIntel\nmodel name\t: Core(TM) Ultra 7\n",
+        );
+        fixture.file("/sys/devices/system/cpu/online", "4-7\n");
+        // CPUs 0-3 are deliberately absent.
+        fixture.file("/sys/devices/cpu_core/cpus", "4-5");
+        fixture.file("/sys/devices/cpu_atom/cpus", "6-7");
+        for cpu in 4..8 {
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                cpu.to_string(),
+            );
+        }
+
+        let topology = detect_topology(4, &fixture);
+
+        assert_eq!(topology.logical_cpus, 4, "only the online CPUs count");
+        assert_eq!(topology.core_kinds.len(), 8, "vectors stay CPU-id indexed");
+        assert_eq!(topology.core_kinds[0], CpuCoreKind::Unknown);
+        assert_eq!(topology.core_kinds[4], CpuCoreKind::Performance);
+        assert_eq!(topology.core_kinds[5], CpuCoreKind::Performance);
+        assert_eq!(topology.core_kinds[6], CpuCoreKind::Efficiency);
+        assert!(topology.is_hybrid());
     }
 
     #[test]

@@ -247,7 +247,8 @@ fn read_i64<S: Sys>(sys: &S, path: &Path) -> Option<i64> {
 /// limit to a non-negative draw, mirroring the AMD provider's sanitization.
 /// (The four utilization/memory fields are `None` for Intel and left as-is.)
 fn sanitize(stats: &mut GpuStats) {
-    stats.temperature_c = nonnegative(stats.temperature_c);
+    // Temperature keeps its sign: sub-ambient readings are real.
+    stats.temperature_c = finite(stats.temperature_c);
     stats.power_limit_w = nonnegative(stats.power_limit_w);
     stats.graphics_clock_mhz = nonnegative(stats.graphics_clock_mhz);
 }
@@ -256,9 +257,22 @@ fn nonnegative(value: Option<f64>) -> Option<f64> {
     value.filter(|v| v.is_finite()).map(|v| v.max(0.0))
 }
 
+/// Drop non-finite values but keep the sign (temperatures can be negative).
+fn finite(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_keeps_the_sign_but_drops_non_finite_temperatures() {
+        assert_eq!(finite(Some(-5.0)), Some(-5.0));
+        assert_eq!(finite(Some(40.0)), Some(40.0));
+        assert_eq!(finite(Some(f64::NAN)), None);
+        assert_eq!(finite(None), None);
+    }
     use crate::domain::{DeviceId, GpuVendor};
     use crate::system::FixtureSys;
 

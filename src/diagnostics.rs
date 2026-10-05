@@ -61,9 +61,12 @@ pub fn run(settings: &config::AppConfig) -> Result<(), Box<dyn std::error::Error
 
 /// Build the diagnostics report as a string (testable without a TTY).
 ///
-/// Pure with respect to the filesystem: every read goes through `sys`, so a
-/// `FixtureSys` yields a deterministic report. The llama section prints
-/// discovery + the mapping decision, not live connection state.
+/// The CPU, sensor and llama/discovery/mapping sections read only through
+/// `sys`, so a `FixtureSys` makes them deterministic. The GPU provider sample
+/// (`provider_section`) and the NVML mapping query run against live hardware —
+/// NVML cannot be injected — so those parts stay host-dependent even under a
+/// fixture. The llama section prints discovery + the mapping decision, not live
+/// connection state.
 pub fn render<S: crate::system::Sys>(
     sys: &S,
     logical: usize,
