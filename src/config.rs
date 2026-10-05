@@ -735,6 +735,88 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_through_a_dangling_symlink_creates_the_target() {
+        let dir = unique_temp_dir("dangling-symlink");
+        let target = dir.join("missing-target");
+        let link = dir.join("config");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let config = AppConfig {
+            server: Some("http://new:2".to_string()),
+            ..AppConfig::default()
+        };
+        save_to_path(&link, &config).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the dangling symlink must survive and now resolve"
+        );
+        let text = fs::read_to_string(&target).unwrap();
+        assert!(text.contains("http://new:2"), "got: {text}");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Forces child processes to perform one save, proving the PID in the temp
+    /// name keeps concurrent saves from different processes collision-free.
+    const CROSS_SAVE_ENV: &str = "ORSIKTOP_TEST_SAVE_PATH";
+
+    #[test]
+    fn cross_process_saves_are_safe_and_leave_no_temp_files() {
+        // Child mode: an env var makes this same test binary perform one save
+        // and exit, so the parent can race real processes against each other.
+        if let Ok(path) = std::env::var(CROSS_SAVE_ENV) {
+            let config = AppConfig {
+                server: Some(format!("http://child:{}", std::process::id())),
+                refresh_ms: 250,
+                ..AppConfig::default()
+            };
+            save_to_path(Path::new(&path), &config).unwrap();
+            return;
+        }
+
+        let dir = unique_temp_dir("cross-process");
+        let path = dir.join("config");
+        fs::write(&path, "server=http://init:1\n").unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for _ in 0..8 {
+            let child = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "config::tests::cross_process_saves_are_safe_and_leave_no_temp_files",
+                    "--nocapture",
+                ])
+                .env(CROSS_SAVE_ENV, &path)
+                .spawn()
+                .unwrap();
+            children.push(child);
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "a child save failed");
+        }
+
+        // At least one real child must have written, and no temp may survive.
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("http://child:"),
+            "a child process must have written the config, got: {text}"
+        );
+        assert!(parse_config(&text).server.is_some(), "got: {text}");
+        assert!(
+            temp_file_names(&dir).is_empty(),
+            "cross-process saves must not leave temporary files"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn concurrent_saves_leave_one_complete_config_and_no_temp_files() {
         let dir = unique_temp_dir("concurrent");
