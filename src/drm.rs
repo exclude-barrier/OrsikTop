@@ -25,11 +25,11 @@
 //! telemetry — device attribution is S16's [`crate::gpu_map`] concern, and the
 //! richer engine-level UX is a later UX stage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::domain::ProcessIdentity;
+use crate::domain::{parse_pci_bdf, ProcessIdentity};
 use crate::system::Sys;
 
 /// One GPU device used by a process, keyed by its PCI BDF (from `drm-pdev`).
@@ -142,10 +142,20 @@ pub fn sample_process_gpus<S: Sys>(
         return Vec::new();
     }
 
-    // Aggregate the parsed fds per PCI BDF.
+    // Aggregate the parsed fds per PCI BDF. A process can hold several fds
+    // that share one DRM client (`dup`/`dup2`/`F_DUPFD`, fd passing); those fds
+    // have identical fdinfo payloads, so counting each one would double-count
+    // memory and engine time. Keep the first fd per (BDF, `drm-client-id`); an
+    // fd without a client id cannot be deduplicated and is kept as-is.
+    let mut seen_clients: HashSet<(String, u64)> = HashSet::new();
     let mut order: Vec<String> = Vec::new();
     let mut by_bdf: HashMap<String, AggGpu> = HashMap::new();
     for fd in parsed {
+        if let Some(client_id) = fd.client_id {
+            if !seen_clients.insert((fd.bdf.clone(), client_id)) {
+                continue;
+            }
+        }
         let agg = by_bdf.entry(fd.bdf.clone()).or_insert_with(|| {
             order.push(fd.bdf.clone());
             AggGpu {
@@ -339,6 +349,9 @@ fn utilization_cycles(
 struct ParsedFd {
     bdf: String,
     driver: String,
+    /// `drm-client-id` when present: duplicated fds of one client share it and
+    /// must not be counted twice.
+    client_id: Option<u64>,
     engines: Vec<(String, ParsedEngine)>,
     resident: u64,
     total: u64,
@@ -358,6 +371,7 @@ struct ParsedEngine {
 fn parse_fdinfo(content: &str) -> Option<ParsedFd> {
     let mut bdf: Option<String> = None;
     let mut driver: Option<String> = None;
+    let mut client_id: Option<u64> = None;
     let mut engines: HashMap<String, ParsedEngine> = HashMap::new();
     let mut resident: u64 = 0;
     let mut total: u64 = 0;
@@ -370,9 +384,13 @@ fn parse_fdinfo(content: &str) -> Option<ParsedFd> {
         let value = raw_value.trim();
 
         if key == "drm-pdev" {
-            bdf = Some(value.to_string());
+            // Normalize to the canonical BDF (lowercase, 4-digit domain) so the
+            // identity matches everywhere else; non-BDF values pass through.
+            bdf = Some(parse_pci_bdf(value).unwrap_or_else(|| value.to_string()));
         } else if key == "drm-driver" {
             driver = Some(value.to_string());
+        } else if key == "drm-client-id" {
+            client_id = parse_u64(value);
         } else if let Some(name) = key.strip_prefix("drm-engine-capacity-") {
             if let Some(n) = parse_u64(value) {
                 if let Ok(cap) = u32::try_from(n) {
@@ -411,6 +429,7 @@ fn parse_fdinfo(content: &str) -> Option<ParsedFd> {
     Some(ParsedFd {
         bdf,
         driver,
+        client_id,
         engines: engine_vec,
         resident,
         total,
@@ -634,6 +653,61 @@ mod tests {
         sys.dir_entry(&format!("/proc/{pid}/fd"), "9", false, true);
         sys.symlink(&format!("/proc/{pid}/fd/9"), "/dev/dri/renderD129");
         sys.file(&format!("/proc/{pid}/fdinfo/9"), fdinfo);
+        let mut state = DrmSamplerState::default();
+        let gpus = sample_process_gpus(
+            &sys,
+            Instant::now(),
+            ProcessIdentity::new(pid, 100),
+            &mut state,
+        );
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].client_count, 2);
+        assert_eq!(gpus[0].resident_bytes, 2000);
+    }
+
+    #[test]
+    fn duplicated_fds_of_one_client_are_counted_once() {
+        // Two fds sharing a drm-client-id are one client (dup/fd passing); the
+        // identically repeated fdinfo must not double the memory or the count.
+        let mut sys = FixtureSys::default();
+        let pid = 42u32;
+        let fdinfo = format!(
+            "drm-driver:\tamdgpu\ndrm-pdev:\t{BDF}\ndrm-client-id:\t128\ndrm-resident-vram:\t1000\n"
+        );
+        sys.dir_entry(&format!("/proc/{pid}/fd"), "3", false, true);
+        sys.symlink(&format!("/proc/{pid}/fd/3"), "/dev/dri/renderD129");
+        sys.file(&format!("/proc/{pid}/fdinfo/3"), fdinfo.clone());
+        sys.dir_entry(&format!("/proc/{pid}/fd"), "9", false, true);
+        sys.symlink(&format!("/proc/{pid}/fd/9"), "/dev/dri/renderD129");
+        sys.file(&format!("/proc/{pid}/fdinfo/9"), fdinfo);
+        let mut state = DrmSamplerState::default();
+        let gpus = sample_process_gpus(
+            &sys,
+            Instant::now(),
+            ProcessIdentity::new(pid, 100),
+            &mut state,
+        );
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].client_count, 1, "one DRM client, not two fds");
+        assert_eq!(gpus[0].resident_bytes, 1000);
+    }
+
+    #[test]
+    fn distinct_client_ids_are_counted_separately() {
+        let mut sys = FixtureSys::default();
+        let pid = 42u32;
+        for (fd, client) in [("3", 128u64), ("9", 129u64)] {
+            sys.dir_entry(&format!("/proc/{pid}/fd"), fd, false, true);
+            sys.symlink(&format!("/proc/{pid}/fd/{fd}"), "/dev/dri/renderD129");
+            sys.file(
+                &format!("/proc/{pid}/fdinfo/{fd}"),
+                format!(
+                    "drm-driver:\tamdgpu\ndrm-pdev:\t{BDF}\ndrm-client-id:\t{client}\ndrm-resident-vram:\t1000\n"
+                ),
+            );
+        }
         let mut state = DrmSamplerState::default();
         let gpus = sample_process_gpus(
             &sys,

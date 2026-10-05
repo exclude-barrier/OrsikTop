@@ -602,7 +602,10 @@ fn spawn_fast_worker(
                     ProcessRefreshKind::nothing()
                         .with_memory()
                         .with_cpu()
-                        .with_exe(UpdateKind::OnlyIfNotSet),
+                        // Refresh on every cycle: `execve` keeps the PID and
+                        // start time, so `OnlyIfNotSet` would pin the pre-exec
+                        // image forever.
+                        .with_exe(UpdateKind::Always),
                 );
                 process_stats = collect_process_stats(&system, &mut process_cache, &mut drm_state);
                 last_process_refresh = Some(Instant::now());
@@ -737,19 +740,23 @@ impl ProcessCache {
         program: &str,
         command: &str,
     ) -> (String, String) {
-        if let Some(cached) = self.entries.get(&identity) {
-            return (cached.program.clone(), cached.command.clone());
+        let entry = self
+            .entries
+            .entry(identity)
+            .or_insert_with(|| CachedProcess {
+                program: program.to_string(),
+                command: command.to_string(),
+            });
+        // `execve` keeps the PID and start time, so the same identity can name a
+        // new image. Refresh the cached names when the freshly read ones change
+        // (an empty read is transient and keeps the last good value).
+        if !program.is_empty() && entry.program != program {
+            entry.program = program.to_string();
         }
-        let program = program.to_string();
-        let command = command.to_string();
-        self.entries.insert(
-            identity,
-            CachedProcess {
-                program: program.clone(),
-                command: command.clone(),
-            },
-        );
-        (program, command)
+        if !command.is_empty() && entry.command != command {
+            entry.command = command.to_string();
+        }
+        (entry.program.clone(), entry.command.clone())
     }
 
     /// Drop entries for identities that no longer exist (exited processes).
@@ -1059,6 +1066,33 @@ mod tests {
         let first = cache.stable(identity, "app", "/bin/app");
         let second = cache.stable(identity, "app", "/bin/app");
         assert_eq!(first, second);
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn cache_refreshes_static_metadata_when_it_changes_for_the_same_identity() {
+        // `execve` keeps the PID and start time but changes the image.
+        let mut cache = ProcessCache::default();
+        let identity = ProcessIdentity::new(4242, 1000);
+        assert_eq!(
+            cache.stable(identity, "sh", "/bin/sh"),
+            ("sh".to_string(), "/bin/sh".to_string())
+        );
+        assert_eq!(
+            cache.stable(identity, "llama-server", "/usr/bin/llama-server"),
+            (
+                "llama-server".to_string(),
+                "/usr/bin/llama-server".to_string()
+            )
+        );
+        // An empty transient read keeps the last good value.
+        assert_eq!(
+            cache.stable(identity, "", ""),
+            (
+                "llama-server".to_string(),
+                "/usr/bin/llama-server".to_string()
+            )
+        );
         assert_eq!(cache.entries.len(), 1);
     }
 

@@ -2140,7 +2140,12 @@ fn llm_slot_overview_line(
     // entries (none after the padded label), and the remainder suffix.
     let fits = |kept: usize| {
         let hidden = entries.len() - kept;
-        let text: usize = entries[..kept].iter().map(|(text, _)| text.len()).sum();
+        // Measure display cells, not UTF-8 bytes: `—` is three bytes but one
+        // cell, so a byte count would hide slots that actually fit.
+        let text: usize = entries[..kept]
+            .iter()
+            .map(|(text, _)| text.chars().count())
+            .sum();
         LABEL_LEN + text + ENTRY_GAP * (kept - 1) + suffix_len(hidden) <= width as usize
     };
 
@@ -4014,8 +4019,11 @@ fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         ])
     };
 
-    let preview = build_endpoint(&state.settings_host, &state.settings_port)
-        .unwrap_or_else(|_| "http://…".to_string());
+    // Preview the endpoint that would actually be saved, so an `https` (or
+    // custom-scheme) URL is not misrepresented as `http`.
+    let preview = state
+        .settings_endpoint()
+        .unwrap_or_else(|_| "…".to_string());
     let auto = if state.settings_auto_discovery {
         "ON"
     } else {
@@ -4186,10 +4194,20 @@ pub fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 }
 
 fn compact_endpoint(server: &str) -> String {
-    server
-        .trim_start_matches("http://")
+    // Never paint a credential, path or query token: reuse the diagnostics
+    // redactor, then drop the scheme for the compact header.
+    let safe = crate::redact::safe_endpoint(server);
+    if safe == crate::redact::UNPARSEABLE_ENDPOINT {
+        // A legacy scheme-less `host:port` with no userinfo/path/query/fragment
+        // is safe to show; anything else stays hidden.
+        let trimmed = server.trim();
+        if !trimmed.is_empty() && !trimmed.contains(['@', '/', '?', '#', ' ']) {
+            return trimmed.to_string();
+        }
+        return safe;
+    }
+    safe.trim_start_matches("http://")
         .trim_start_matches("https://")
-        .trim_end_matches('/')
         .to_string()
 }
 
@@ -5346,6 +5364,23 @@ mod tests {
     #[test]
     fn endpoint_is_compact() {
         assert_eq!(compact_endpoint("http://127.0.0.1:8081/"), "127.0.0.1:8081");
+    }
+
+    #[test]
+    fn compact_endpoint_never_shows_credentials_path_or_query() {
+        // Regression: the header used to paint the endpoint verbatim.
+        assert_eq!(
+            compact_endpoint("http://demo-user:demo-password@10.0.0.7:8080/v1?token=demo_secret"),
+            "10.0.0.7:8080/…?…"
+        );
+        assert!(!compact_endpoint("https://user:s3cret@host:8443/x").contains("s3cret"));
+        // A legacy scheme-less host:port stays readable.
+        assert_eq!(compact_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
+        // Anything ambiguous is hidden, never echoed.
+        assert_eq!(
+            compact_endpoint("localhost:8080?token=demo_secret"),
+            crate::redact::UNPARSEABLE_ENDPOINT
+        );
     }
 
     #[test]

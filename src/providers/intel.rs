@@ -154,8 +154,11 @@ impl<S: Sys> IntelGpuProvider<S> {
     fn sample_xe(&self, stats: &mut GpuStats) {
         let dir = gt_sysfs_dir(&self.gpu);
         stats.graphics_clock_mhz = read_u64(&self.sys, &dir.join("cur_freq")).map(|v| v as f64);
+        // A present reading (including the literal `none`) is a real state; a
+        // missing/unreadable source is unknown, rendered `—` like every other
+        // unavailable metric.
         stats.limit_reason =
-            read_throttle_reason(read_text(&self.sys, &dir.join("throttle/reasons")));
+            read_text(&self.sys, &dir.join("throttle/reasons")).unwrap_or_else(|| "—".to_string());
     }
 
     /// i915: graphics clock is the current RPS frequency (MHz). The root-GT
@@ -179,6 +182,7 @@ impl<S: Sys> IntelGpuProvider<S> {
         }
 
         let mut reasons: Vec<String> = Vec::new();
+        let mut any_source = false;
         for (attr, label) in [
             ("throttle_reason_pl1", "power"),
             ("throttle_reason_pl2", "power"),
@@ -189,14 +193,21 @@ impl<S: Sys> IntelGpuProvider<S> {
             ("throttle_reason_vr_thermalert", "vr-thermalert"),
             ("throttle_reason_vr_tdc", "vr-tdc"),
         ] {
-            if read_u64(&self.sys, &base.join(attr)) == Some(1) {
-                reasons.push(label.to_string());
+            match read_u64(&self.sys, &base.join(attr)) {
+                Some(1) => reasons.push(label.to_string()),
+                Some(_) => any_source = true,
+                None => {}
             }
         }
-        stats.limit_reason = if reasons.is_empty() {
+        stats.limit_reason = if !reasons.is_empty() {
+            reasons.join("+")
+        } else if any_source {
+            // At least one boolean file was readable and all were false: the
+            // device is genuinely not throttled.
             "none".to_string()
         } else {
-            reasons.join("+")
+            // No throttle source at all: unknown, not "none".
+            "—".to_string()
         };
     }
 
@@ -215,16 +226,6 @@ impl<S: Sys> IntelGpuProvider<S> {
         stats.power_limit_w = read_i64(&self.sys, &dir.join("power1_max"))
             .filter(|v| *v > 0)
             .map(|v| v as f64 / 1_000_000.0);
-    }
-}
-
-/// Map a raw throttle-reason source to the normalized `limit_reason` string: a
-/// missing or empty reading is `none`, otherwise the text is passed through
-/// (xe emits a space-separated word list, `none` when not throttled).
-fn read_throttle_reason(raw: Option<String>) -> String {
-    match raw {
-        Some(text) if !text.is_empty() => text,
-        _ => "none".to_string(),
     }
 }
 
@@ -463,6 +464,24 @@ mod tests {
         assert!(stats.available);
         assert_eq!(stats.graphics_clock_mhz, Some(1000.0));
         assert_eq!(stats.limit_reason, "none");
+    }
+
+    #[test]
+    fn missing_throttle_source_is_unavailable_not_none() {
+        // xe: no throttle/reasons file at all -> unknown, not "none".
+        let mut sys = FixtureSys::default();
+        add_xe(&mut sys, "0000:01:00.0", Some(900), None);
+        let mut xe = provider(sys, intel_gpu("xe", "0000:01:00.0", "card0"));
+        assert_eq!(xe.sample().limit_reason, "—");
+
+        // i915: clock present in gt/gt0 but no throttle_reason_* files.
+        let mut sys = FixtureSys::default();
+        let dir = "/sys/class/drm/card0";
+        sys.dir_entry("/sys/class/drm", "card0", false, false);
+        sys.dir_entry(dir, "", false, false);
+        sys.file(format!("{dir}/gt/gt0/rps_cur_freq_mhz").as_str(), "1200\n");
+        let mut i915 = provider(sys, intel_gpu("i915", "0000:00:02.0", "card0"));
+        assert_eq!(i915.sample().limit_reason, "—");
     }
 
     #[test]

@@ -24,6 +24,10 @@ const SPEC_REFRESH: Duration = Duration::from_secs(30);
 const LLM_CONNECT_TIMEOUT_MS: u64 = 750;
 /// Total (connect + response) timeout for a single llama.cpp request.
 const LLM_REQUEST_TIMEOUT_MS: u64 = 1200;
+/// Upper bound on a telemetry response body. `/metrics` on a busy server is
+/// tens of KB; this cap keeps a hostile or broken endpoint from exhausting
+/// memory while leaving ample headroom.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
@@ -171,6 +175,9 @@ impl LlamaMonitor {
         let client = Client::builder()
             .connect_timeout(Duration::from_millis(LLM_CONNECT_TIMEOUT_MS))
             .timeout(Duration::from_millis(LLM_REQUEST_TIMEOUT_MS))
+            // Monitor exactly the configured endpoint: never silently follow
+            // a redirect to another host/port.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -199,12 +206,13 @@ impl LlamaMonitor {
             let client = &self.client;
             let base = &self.base;
             let props_handle = if fetch_props {
-                Some(scope.spawn(move || fetch_json(client, format!("{base}/props"))))
+                Some(scope.spawn(move || fetch_json(client, endpoint_url(base, "props"))))
             } else {
                 None
             };
-            let metrics_handle = scope.spawn(move || fetch_raw(client, format!("{base}/metrics")));
-            let slots_handle = scope.spawn(move || fetch_json(client, format!("{base}/slots")));
+            let metrics_handle =
+                scope.spawn(move || fetch_raw(client, endpoint_url(base, "metrics")));
+            let slots_handle = scope.spawn(move || fetch_json(client, endpoint_url(base, "slots")));
 
             (
                 props_handle.map(|handle| {
@@ -613,6 +621,22 @@ fn join_or<T>(handle: std::thread::ScopedJoinHandle<'_, T>, on_panic: T) -> T {
     handle.join().unwrap_or(on_panic)
 }
 
+/// Build an API endpoint URL from the configured base, appending `segment`
+/// (`metrics`/`props`/`slots`) to the base *path* and preserving any query
+/// (e.g. a token). A plain `format!("{base}/{segment}")` would fold the segment
+/// into a base query (`?token=x/metrics`) or a path segment (`/v1/metrics`)
+/// instead, so `/metrics` was never actually requested.
+fn endpoint_url(base: &str, segment: &str) -> String {
+    match reqwest::Url::parse(base) {
+        Ok(mut url) => {
+            let path = url.path().trim_end_matches('/');
+            url.set_path(&format!("{path}/{segment}"));
+            url.to_string()
+        }
+        Err(_) => format!("{}/{segment}", base.trim_end_matches('/')),
+    }
+}
+
 /// Fetches a raw text endpoint (currently only /metrics).
 fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     let response = match client.get(url).send() {
@@ -625,10 +649,26 @@ fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     if !status.is_success() {
         return MetricsOutcome::Http(status);
     }
-    match response.text() {
+    match read_body_limited(response, MAX_RESPONSE_BYTES) {
         Ok(body) => MetricsOutcome::Ok(body),
-        Err(err) => MetricsOutcome::Body(crate::redact::describe_reqwest_error(err)),
+        Err(err) => MetricsOutcome::Body(err),
     }
+}
+
+/// Read a response body up to `limit` bytes, refusing an oversized one instead
+/// of allocating without bound. The error carries no request URL, so it is safe
+/// to surface.
+fn read_body_limited(response: reqwest::blocking::Response, limit: u64) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut buffer = Vec::new();
+    response
+        .take(limit + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|err| err.to_string())?;
+    if buffer.len() as u64 > limit {
+        return Err(format!("response body exceeded {limit} bytes"));
+    }
+    String::from_utf8(buffer).map_err(|err| err.to_string())
 }
 
 /// Fetches a JSON endpoint (/props, /slots).
@@ -641,9 +681,12 @@ fn fetch_json(client: &Client, url: String) -> JsonOutcome {
     if !status.is_success() {
         return JsonOutcome::Http(status);
     }
-    match response.json::<Value>() {
-        Ok(value) => JsonOutcome::Ok(value),
-        Err(err) => JsonOutcome::Invalid(crate::redact::describe_reqwest_error(err)),
+    match read_body_limited(response, MAX_RESPONSE_BYTES) {
+        Ok(body) => match serde_json::from_str::<Value>(&body) {
+            Ok(value) => JsonOutcome::Ok(value),
+            Err(err) => JsonOutcome::Invalid(err.to_string()),
+        },
+        Err(err) => JsonOutcome::Invalid(err),
     }
 }
 
@@ -1174,6 +1217,28 @@ fn model_display_name(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn endpoint_url_appends_to_the_path_and_keeps_the_query() {
+        assert_eq!(
+            endpoint_url("http://127.0.0.1:8080", "metrics"),
+            "http://127.0.0.1:8080/metrics"
+        );
+        assert_eq!(
+            endpoint_url("http://127.0.0.1:8080/", "slots"),
+            "http://127.0.0.1:8080/slots"
+        );
+        // A configured base path is preserved.
+        assert_eq!(
+            endpoint_url("http://h:8080/v1", "props"),
+            "http://h:8080/v1/props"
+        );
+        // A query token stays a query; it must not absorb the segment.
+        assert_eq!(
+            endpoint_url("http://h:8080/v1?token=abc", "metrics"),
+            "http://h:8080/v1/metrics?token=abc"
+        );
+    }
 
     #[test]
     fn a_panicking_fetch_task_is_turned_into_an_outcome() {

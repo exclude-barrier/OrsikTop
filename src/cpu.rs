@@ -437,7 +437,13 @@ fn read_u64<S: Sys>(sys: &S, path: &std::path::Path) -> Option<u64> {
 
 pub(crate) fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
     let mut cpus = Vec::new();
-    for part in text.trim().split(',').filter(|part| !part.is_empty()) {
+    // Accept both the cpumask form (`0-3,8`) used by `/sys/devices/system/cpu_*`
+    // and the space-separated form (`0 1 2 3`) emitted by cpufreq's
+    // `affected_cpus`/`related_cpus`.
+    for part in text
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+    {
         if let Some((start, end)) = part.split_once('-') {
             let start = start.trim().parse::<usize>().ok()?;
             let end = end.trim().parse::<usize>().ok()?;
@@ -463,6 +469,9 @@ mod tests {
             Some(vec![0, 1, 2, 3, 8, 10, 11])
         );
         assert_eq!(parse_cpu_list("7"), Some(vec![7]));
+        // cpufreq `affected_cpus` is space-separated, not a comma cpumask.
+        assert_eq!(parse_cpu_list("0 1 2 3\n"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpu_list("0 2-4"), Some(vec![0, 2, 3, 4]));
         assert_eq!(parse_cpu_list("3-1"), None);
     }
 

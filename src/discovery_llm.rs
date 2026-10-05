@@ -68,7 +68,10 @@ pub fn discover_processes<S: Sys>(sys: &S) -> Vec<LlamaServerCandidate> {
         let Ok(pid) = entry.name.parse::<u32>() else {
             continue;
         };
-        let Some(cmdline) = sys.read_to_string(&proc_root.join(&entry.name).join("cmdline")) else {
+        // `/proc/<pid>/cmdline` is arbitrary bytes; a non-UTF-8 argument must
+        // not drop an otherwise valid server from discovery.
+        let Some(cmdline) = sys.read_to_string_lossy(&proc_root.join(&entry.name).join("cmdline"))
+        else {
             continue;
         };
         let args = parse_cmdline(&cmdline);
@@ -175,7 +178,9 @@ pub fn selected_endpoint_server(
 /// Read a process's start time (`/proc/<pid>/stat` field 22, clock ticks
 /// since boot). `None` when the file is missing/unreadable or malformed.
 pub fn read_process_start_time<S: Sys>(sys: &S, pid: u32) -> Option<u64> {
-    let stat = sys.read_to_string(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
+    // `comm` inside stat is arbitrary bytes; read lossily so a valid process
+    // keeps its start time (and therefore its PID-reuse-safe identity).
+    let stat = sys.read_to_string_lossy(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
     parse_start_time(&stat)
 }
 
