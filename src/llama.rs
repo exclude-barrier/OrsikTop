@@ -42,7 +42,10 @@ pub struct LlmStats {
     pub reconnecting: bool,
     pub model: String,
     pub context_size: u64,
-    pub context_used: u64,
+    /// Tokens the selected slot is using, or the `/metrics` high-water mark
+    /// without `/slots`. `None` when `/slots` reports no usable occupancy:
+    /// unknown, rendered `—`, never a fabricated `0`.
+    pub context_used: Option<u64>,
     pub context_high_watermark: u64,
     /// ID of the slot the displayed (context_used, context_size) pair comes
     /// from, per the slot's own `id` field in /slots. `None` when /slots is
@@ -706,6 +709,11 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     // capacities differ.
     let mut best_busy: Option<(u64, u64, Option<u64>)> = None;
     let mut best_any: Option<(u64, u64, Option<u64>)> = None;
+    // Carries (n_ctx, slot id) for the size/id when no slot reports a usable
+    // occupancy, so the pair still has a real capacity while the used count
+    // stays unknown.
+    let mut fallback_busy: Option<(u64, Option<u64>)> = None;
+    let mut fallback_any: Option<(u64, Option<u64>)> = None;
     let mut busy = 0u64;
     let mut request_prompt_tokens = 0u64;
     let mut request_generated_tokens = 0u64;
@@ -763,12 +771,21 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
                 (None, None) => None,
             },
         };
-        let used = used_opt.unwrap_or(0);
-        if is_processing && best_busy.is_none_or(|best| used > best.0) {
-            best_busy = Some((used, n_ctx, slot_id));
+        // Only a known occupancy may win the CTX row; an unknown slot can at
+        // most supply the capacity/id via `fallback_*`.
+        if let Some(used) = used_opt {
+            if is_processing && best_busy.is_none_or(|best| used > best.0) {
+                best_busy = Some((used, n_ctx, slot_id));
+            }
+            if best_any.is_none_or(|best| used > best.0) {
+                best_any = Some((used, n_ctx, slot_id));
+            }
         }
-        if best_any.is_none_or(|best| used > best.0) {
-            best_any = Some((used, n_ctx, slot_id));
+        if is_processing && fallback_busy.is_none_or(|best| n_ctx > best.0) {
+            fallback_busy = Some((n_ctx, slot_id));
+        }
+        if fallback_any.is_none_or(|best| n_ctx > best.0) {
+            fallback_any = Some((n_ctx, slot_id));
         }
 
         counters.push(SlotCounter {
@@ -794,10 +811,13 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     stats.busy_slots = busy;
     stats.request_prompt_tokens = request_prompt_tokens;
     stats.request_generated_tokens = request_generated_tokens;
-    let (context_used, context_size, context_slot_id) =
-        best_busy
-            .or(best_any)
-            .unwrap_or((0, stats.context_size, None));
+    let (context_used, context_size, context_slot_id) = match best_busy.or(best_any) {
+        Some((used, n_ctx, slot_id)) => (Some(used), n_ctx, slot_id),
+        None => {
+            let (n_ctx, slot_id) = fallback_busy.or(fallback_any).unwrap_or((0, None));
+            (None, n_ctx, slot_id)
+        }
+    };
     stats.context_used = context_used;
     stats.context_slot_id = context_slot_id;
     stats.slot_overview = overview;
@@ -1667,7 +1687,7 @@ mod tests {
         assert_eq!(stats.slot_count, 2);
         assert_eq!(stats.busy_slots, 1);
         assert_eq!(stats.context_size, 196608);
-        assert_eq!(stats.context_used, 38779);
+        assert_eq!(stats.context_used, Some(38779));
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(counters[0].prompt_processed, 12000);
         assert_eq!(counters[0].decoded, 779);
@@ -1725,7 +1745,9 @@ mod tests {
         assert_eq!(stats.busy_slots, 0);
         assert_eq!(stats.request_prompt_tokens, 0);
         assert_eq!(stats.request_generated_tokens, 0);
-        assert_eq!(stats.context_used, 0);
+        // `n_prompt_tokens_processed: 0` + `n_decoded: 0` are present, so a
+        // real 0 is reported here (not unknown).
+        assert_eq!(stats.context_used, Some(0));
         assert_eq!(stats.context_slot_id, Some(0));
     }
 
@@ -1756,7 +1778,7 @@ mod tests {
         }]);
 
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 4250);
+        assert_eq!(stats.context_used, Some(4250));
         // The slot reports no `id`; the display identity stays unknown.
         assert_eq!(stats.context_slot_id, None);
     }
@@ -1773,7 +1795,7 @@ mod tests {
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.busy_slots, 1);
-        assert_eq!(stats.context_used, 5000);
+        assert_eq!(stats.context_used, Some(5000));
         assert_eq!(stats.context_size, 100000);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1787,7 +1809,7 @@ mod tests {
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.busy_slots, 0);
-        assert_eq!(stats.context_used, 9000);
+        assert_eq!(stats.context_used, Some(9000));
         assert_eq!(stats.context_size, 200000);
         assert_eq!(stats.context_slot_id, Some(1));
     }
@@ -1801,7 +1823,7 @@ mod tests {
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.busy_slots, 2);
-        assert_eq!(stats.context_used, 4000);
+        assert_eq!(stats.context_used, Some(4000));
         assert_eq!(stats.context_size, 150000);
         assert_eq!(stats.request_prompt_tokens, 6000);
         assert_eq!(stats.context_slot_id, Some(1));
@@ -1817,7 +1839,7 @@ mod tests {
             { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 70143);
+        assert_eq!(stats.context_used, Some(70143));
         assert_eq!(stats.context_size, 70144);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1833,7 +1855,7 @@ mod tests {
             { "id": 1, "id_task": 42, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 37943 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 1022);
+        assert_eq!(stats.context_used, Some(1022));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1848,7 +1870,7 @@ mod tests {
             { "id": 7, "n_ctx": 150000, "is_processing": true, "n_prompt_tokens": 2000 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 2000);
+        assert_eq!(stats.context_used, Some(2000));
         assert_eq!(stats.context_size, 150000);
         assert_eq!(stats.context_slot_id, Some(7));
     }
@@ -1863,7 +1885,7 @@ mod tests {
             { "n_ctx": 200000, "is_processing": false, "n_prompt_tokens": 9000 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 5000);
+        assert_eq!(stats.context_used, Some(5000));
         assert_eq!(stats.context_size, 100000);
         assert_eq!(stats.context_slot_id, None);
     }
@@ -1875,7 +1897,7 @@ mod tests {
             json!([{ "id": 0, "n_ctx": 115200, "is_processing": true, "n_prompt_tokens": 28851 }]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.slot_count, 1);
-        assert_eq!(stats.context_used, 28851);
+        assert_eq!(stats.context_used, Some(28851));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1888,9 +1910,26 @@ mod tests {
         };
         apply_slots_json(&mut stats, &json!([])).unwrap();
         assert_eq!(stats.slot_count, 0);
-        assert_eq!(stats.context_used, 0);
+        assert_eq!(stats.context_used, None);
         assert_eq!(stats.context_size, 4096);
         assert_eq!(stats.context_slot_id, None);
+    }
+
+    #[test]
+    fn slot_without_usage_reports_unknown_context_used_not_zero() {
+        let mut stats = LlmStats {
+            context_size: 4096,
+            ..Default::default()
+        };
+        let slots = json!([{ "id": 0, "n_ctx": 8192, "is_processing": true }]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        // No usable occupancy: the pair keeps the real capacity but the used
+        // count is unknown (-), never a fabricated 0.
+        assert_eq!(stats.context_used, None);
+        assert_eq!(stats.context_size, 8192);
+        assert_eq!(stats.context_slot_id, Some(0));
+        assert_eq!(stats.slot_overview[0].context_used, None);
+        assert_eq!(stats.slot_overview[0].context_size, Some(8192));
     }
 
     #[test]
@@ -1901,7 +1940,7 @@ mod tests {
         };
         let slots = json!([{ "id": 0, "n_prompt_tokens": 512, "is_processing": true }]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 512);
+        assert_eq!(stats.context_used, Some(512));
         assert_eq!(stats.context_size, 4096);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1932,7 +1971,7 @@ mod tests {
             ]
         );
         // The main CTX pair must not be the sum of the slots.
-        assert_eq!(stats.context_used, 58745);
+        assert_eq!(stats.context_used, Some(58745));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1987,7 +2026,7 @@ mod tests {
         assert_eq!(stats.slot_overview[0].context_size, Some(115200));
         assert_eq!(stats.slot_overview[1].context_size, Some(70144));
         // The main pair still comes from a single slot.
-        assert_eq!(stats.context_used, 58745);
+        assert_eq!(stats.context_used, Some(58745));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -2034,7 +2073,7 @@ mod tests {
             { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 37943);
+        assert_eq!(stats.context_used, Some(37943));
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(stats.slot_overview[0].context_used, Some(37943));
         assert_eq!(stats.slot_overview[1].context_used, Some(100));

@@ -323,6 +323,9 @@ fn connected_probe_report(stats: &LlmStats) -> String {
     } else {
         "—".to_string()
     };
+    let used = stats
+        .context_used
+        .map_or_else(|| "—".to_string(), |value| value.to_string());
     let mut lines = vec![
         "  status     : connected".to_string(),
         format!("  model      : {model}"),
@@ -335,8 +338,8 @@ fn connected_probe_report(stats: &LlmStats) -> String {
             }
         ),
         format!(
-            "  context    : {}/{} (watermark {watermark})",
-            stats.context_used, stats.context_size
+            "  context    : {used}/{} (watermark {watermark})",
+            stats.context_size
         ),
         format!(
             "  slots      : {} busy / {} total",
@@ -634,7 +637,7 @@ mod tests {
         let stats = LlmStats {
             connected: true,
             metrics_available: false,
-            context_used: 1000,
+            context_used: Some(1000),
             context_size: 4096,
             slot_count: 1,
             busy_slots: 0,
@@ -653,7 +656,7 @@ mod tests {
         let stats = LlmStats {
             connected: true,
             metrics_available: true,
-            context_used: 1000,
+            context_used: Some(1000),
             context_size: 4096,
             context_high_watermark: 2048,
             prompt_tps: 12.5,

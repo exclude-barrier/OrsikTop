@@ -1395,12 +1395,11 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
-        llm.context_high_watermark
+        Some(llm.context_high_watermark)
     };
-    let context_pct = if llm.context_size > 0 {
-        context_used as f64 / llm.context_size as f64 * 100.0
-    } else {
-        0.0
+    let context_pct = match (context_used, llm.context_size) {
+        (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
+        _ => 0.0,
     };
     let context_bar = inner.width.saturating_sub(46).max(8) as usize;
     // Multi-slot servers show which slot supplies the displayed CTX pair,
@@ -1419,14 +1418,12 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
     }
     context_suffix.push(Span::styled(
-        if llm.context_size > 0 {
-            format!(
-                " {} / {} tok",
-                grouped_u64(context_used),
-                grouped_u64(llm.context_size)
-            )
-        } else {
-            " waiting for context".to_string()
+        match (context_used, llm.context_size) {
+            (Some(used), size) if size > 0 => {
+                format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
+            }
+            (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
+            _ => " waiting for context".to_string(),
         },
         Style::default().fg(MUTED),
     ));
@@ -1695,12 +1692,11 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
-        llm.context_high_watermark
+        Some(llm.context_high_watermark)
     };
-    let context_pct = if llm.context_size > 0 {
-        context_used as f64 / llm.context_size as f64 * 100.0
-    } else {
-        0.0
+    let context_pct = match (context_used, llm.context_size) {
+        (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
+        _ => 0.0,
     };
     let context_bar = inner.width.saturating_sub(46).max(8) as usize;
     let context_slot_tag = (llm.slot_count > 1)
@@ -1713,14 +1709,12 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
         context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
     }
     context_suffix.push(Span::styled(
-        if llm.context_size > 0 {
-            format!(
-                " {} / {} tok",
-                grouped_u64(context_used),
-                grouped_u64(llm.context_size)
-            )
-        } else {
-            " waiting for context".to_string()
+        match (context_used, llm.context_size) {
+            (Some(used), size) if size > 0 => {
+                format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
+            }
+            (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
+            _ => " waiting for context".to_string(),
         },
         Style::default().fg(MUTED),
     ));
@@ -6251,7 +6245,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 78800,
+            context_used: Some(78800),
             metrics_available: true,
             slots_available: true,
             slot_count: 2,
@@ -6276,7 +6270,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 28851,
+            context_used: Some(28851),
             metrics_available: true,
             slots_available: true,
             slot_count: 1,
@@ -6297,7 +6291,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 5000,
+            context_used: Some(5000),
             metrics_available: true,
             slots_available: true,
             slot_count: 2,
@@ -6319,7 +6313,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 28851,
+            context_used: Some(28851),
             metrics_available: true,
             slots_available: true,
             slot_count: 2,
@@ -6343,7 +6337,7 @@ mod tests {
             metrics_available: false,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 58745,
+            context_used: Some(58745),
             slots_available: true,
             slot_count: 2,
             busy_slots: 1,
@@ -6440,7 +6434,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 58745,
+            context_used: Some(58745),
             metrics_available: true,
             slots_available: true,
             slot_count: overview.len() as u64,
