@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::io;
 use std::path::Path;
 
 /// One directory entry, with only the properties providers need.
@@ -35,17 +36,8 @@ impl Sys for RealSys {
     }
 
     fn read_dir(&self, path: &Path) -> Option<Vec<SysEntry>> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path).ok()? {
-            let entry = entry.ok()?;
-            let file_type = entry.file_type().ok()?;
-            entries.push(SysEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                is_symlink: file_type.is_symlink(),
-                is_dir: file_type.is_dir(),
-            });
-        }
-        Some(entries)
+        let entries = std::fs::read_dir(path).ok()?;
+        Some(collect_dir_entries(entries.map(classify_entry)))
     }
 
     fn symlink_target(&self, path: &Path) -> Option<String> {
@@ -53,6 +45,24 @@ impl Sys for RealSys {
             .ok()
             .map(|target| target.to_string_lossy().into_owned())
     }
+}
+
+/// Classify one raw directory entry. A single unreadable entry — or one whose
+/// metadata cannot be read — is reported as an error and later dropped, so one
+/// bad entry can never blank the whole listing.
+fn classify_entry(entry: io::Result<std::fs::DirEntry>) -> io::Result<SysEntry> {
+    let entry = entry?;
+    let file_type = entry.file_type()?;
+    Ok(SysEntry {
+        name: entry.file_name().to_string_lossy().into_owned(),
+        is_symlink: file_type.is_symlink(),
+        is_dir: file_type.is_dir(),
+    })
+}
+
+/// Keep the readable entries of a directory scan and drop per-entry failures.
+fn collect_dir_entries<I: Iterator<Item = io::Result<SysEntry>>>(entries: I) -> Vec<SysEntry> {
+    entries.filter_map(Result::ok).collect()
 }
 /// In-memory filesystem for fixture-driven provider tests.
 #[cfg(test)]
@@ -148,5 +158,55 @@ mod tests {
             Some("../../devices/pci0000:00/0000:00:02.0")
         );
         assert_eq!(sys.read_dir(&PathBuf::from("/missing")), None);
+    }
+
+    #[test]
+    fn per_entry_failures_drop_only_the_failed_entries() {
+        // Deterministic simulation of a directory scan where one entry cannot
+        // be read: only that entry is dropped, the readable ones survive.
+        let card = SysEntry {
+            name: "card0".to_string(),
+            is_symlink: true,
+            is_dir: false,
+        };
+        let render = SysEntry {
+            name: "renderD128".to_string(),
+            is_symlink: true,
+            is_dir: false,
+        };
+        let entries = vec![
+            Ok(card.clone()),
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unreadable",
+            )),
+            Ok(render.clone()),
+        ];
+
+        let kept = collect_dir_entries(entries.into_iter());
+        assert_eq!(kept, vec![card, render]);
+    }
+
+    #[test]
+    fn real_read_dir_distinguishes_unreadable_from_empty() {
+        let sys = RealSys;
+        // A missing path is unreadable: `None`, not an empty listing.
+        assert_eq!(
+            sys.read_dir(Path::new("/orsiktop-definitely-missing-directory")),
+            None
+        );
+
+        let dir = std::env::temp_dir().join(format!("orsiktop-readdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A successfully read, empty directory is `Some([])`.
+        assert_eq!(sys.read_dir(&dir), Some(Vec::new()));
+
+        // A regular file is not a readable directory either.
+        let file = dir.join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(sys.read_dir(&file), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

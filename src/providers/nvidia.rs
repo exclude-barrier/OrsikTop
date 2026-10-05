@@ -141,8 +141,8 @@ pub(crate) struct NvidiaGpuProvider {
 /// The enforced power limit and PCIe link speed/width only change on user
 /// action or link retrain, so a 1 Hz refresh is indistinguishable from live
 /// for display purposes while keeping four driver round-trips off the 10 Hz
-/// sampling path. When every lookup fails the last good values are kept and
-/// the refresh is retried on the next sample.
+/// sampling path. A field whose lookup fails keeps its previous value, and
+/// when every lookup fails the refresh is retried on the next sample.
 #[derive(Default)]
 struct SlowProperties {
     power_limit_w: Option<f64>,
@@ -171,10 +171,34 @@ impl SlowProperties {
             // All lookups failed: keep the last good values, retry next cycle.
             return;
         }
-        self.power_limit_w = power_limit_w;
-        self.pcie_link_speed_gts = pcie_link_speed_gts;
-        self.pcie_link_width = pcie_link_width;
-        self.fetched_at = Some(Instant::now());
+        self.apply(
+            power_limit_w,
+            pcie_link_speed_gts,
+            pcie_link_width,
+            Instant::now(),
+        );
+    }
+
+    /// Replace only the fields that were read this cycle. `None` means "not
+    /// read now" and leaves the cached value in place, so a transient failure
+    /// on a single lookup cannot clear a previously good value.
+    fn apply(
+        &mut self,
+        power_limit_w: Option<f64>,
+        pcie_link_speed_gts: Option<f64>,
+        pcie_link_width: Option<u32>,
+        now: Instant,
+    ) {
+        if let Some(value) = power_limit_w {
+            self.power_limit_w = Some(value);
+        }
+        if let Some(value) = pcie_link_speed_gts {
+            self.pcie_link_speed_gts = Some(value);
+        }
+        if let Some(value) = pcie_link_width {
+            self.pcie_link_width = Some(value);
+        }
+        self.fetched_at = Some(now);
     }
 }
 
@@ -595,6 +619,29 @@ mod tests {
         sanitize(&mut stats);
         assert_eq!(stats.pcie_link_speed_gts, None);
         assert_eq!(stats.pcie_link_width, None);
+    }
+
+    #[test]
+    fn slow_properties_keep_last_good_per_field_on_partial_failure() {
+        // Regression: a transient failure of one lookup must not overwrite a
+        // previously good cached value with None while other lookups succeed.
+        let mut slow = SlowProperties {
+            power_limit_w: Some(250.0),
+            pcie_link_speed_gts: Some(16.0),
+            pcie_link_width: Some(16),
+            fetched_at: None,
+        };
+        let now = Instant::now();
+        slow.apply(Some(300.0), None, Some(8), now);
+
+        assert_eq!(slow.power_limit_w, Some(300.0), "read value is adopted");
+        assert_eq!(
+            slow.pcie_link_speed_gts,
+            Some(16.0),
+            "an unread field keeps its last good value"
+        );
+        assert_eq!(slow.pcie_link_width, Some(8));
+        assert_eq!(slow.fetched_at, Some(now));
     }
 
     #[test]

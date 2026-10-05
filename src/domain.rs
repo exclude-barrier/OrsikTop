@@ -173,6 +173,42 @@ pub(crate) fn normalize_pci_bdf(value: &str) -> String {
     value.to_string()
 }
 
+/// Parse and validate a PCI BDF string, returning its canonical form.
+///
+/// Accepts both the 4-digit (`0000:01:00.0`) and the 8-digit
+/// (`00000000:01:00.0`) domain form; the result is put through
+/// [`normalize_pci_bdf`], so a domain below `0x10000` comes back as 4 digits
+/// while a domain at or above it keeps the 8-digit form. The function digit
+/// must be `0`–`7`; anything else returns `None`. This is the single BDF
+/// grammar shared by GPU discovery and process/GPU attribution, so the two
+/// cannot drift apart on which domain forms they accept.
+pub(crate) fn parse_pci_bdf(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let is_hex = |b: u8| b.is_ascii_hexdigit();
+    let valid = match bytes.len() {
+        12 => {
+            (0..4).all(|i| is_hex(bytes[i]))
+                && bytes[4] == b':'
+                && (5..7).all(|i| is_hex(bytes[i]))
+                && bytes[7] == b':'
+                && (8..10).all(|i| is_hex(bytes[i]))
+                && bytes[10] == b'.'
+                && (b'0'..=b'7').contains(&bytes[11])
+        }
+        16 => {
+            (0..8).all(|i| is_hex(bytes[i]))
+                && bytes[8] == b':'
+                && (9..11).all(|i| is_hex(bytes[i]))
+                && bytes[11] == b':'
+                && (12..14).all(|i| is_hex(bytes[i]))
+                && bytes[14] == b'.'
+                && (b'0'..=b'7').contains(&bytes[15])
+        }
+        _ => false,
+    };
+    valid.then(|| normalize_pci_bdf(&text.to_ascii_lowercase()))
+}
+
 /// True when `value` is an NVIDIA MIG device UUID: `MIG-GPU-<parent>-<gi>-<ci>`
 /// — the `MIG-` prefix with a numeric compute-instance id and GPU-instance id
 /// tail. Physical GPU UUIDs (`GPU-...`) are never MIG.
@@ -530,6 +566,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_pci_bdf_accepts_and_normalizes_both_domain_forms() {
+        // Both domain forms are valid input; the canonical form is BDF keyed.
+        assert_eq!(
+            parse_pci_bdf("0000:01:00.0").as_deref(),
+            Some("0000:01:00.0")
+        );
+        assert_eq!(
+            parse_pci_bdf("00000000:01:00.0").as_deref(),
+            Some("0000:01:00.0")
+        );
+        // A domain >= 0x10000 is not representable in 4 digits: keep 8.
+        assert_eq!(
+            parse_pci_bdf("00010000:01:00.0").as_deref(),
+            Some("00010000:01:00.0")
+        );
+        // Input is lowercased.
+        assert_eq!(
+            parse_pci_bdf("0000:AB:CD.0").as_deref(),
+            Some("0000:ab:cd.0")
+        );
+        // Function digit must be 0-7 and the shape must be exact.
+        assert_eq!(parse_pci_bdf("0000:01:00.8"), None);
+        assert_eq!(parse_pci_bdf("00000000:01:00.8"), None);
+        assert_eq!(parse_pci_bdf("0000:01:00"), None);
+        assert_eq!(parse_pci_bdf("0000-01-00-0"), None);
+        assert_eq!(parse_pci_bdf("zzzz:01:00.0"), None);
+        assert_eq!(parse_pci_bdf(""), None);
+    }
+
+    #[test]
     fn device_id_normalizes_eight_digit_bdf_at_ingress() {
         // The same physical GPU must carry one identity regardless of the
         // BDF form its provider reported.
@@ -645,9 +711,12 @@ pub struct SystemStats {
     /// (`energy_uj` is root-only on current kernels).
     pub cpu_power_w: Option<f64>,
     pub io_wait_pct: Option<f64>,
-    pub load_one: f64,
-    pub load_five: f64,
-    pub load_fifteen: f64,
+    /// 1/5/15-minute load averages. `None` when `/proc/loadavg` could not be
+    /// read (unknown, rendered `—`), which is distinct from a real load of
+    /// `Some(0.0)`.
+    pub load_one: Option<f64>,
+    pub load_five: Option<f64>,
+    pub load_fifteen: Option<f64>,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub swap_used_bytes: u64,

@@ -228,8 +228,13 @@ impl UiState {
             }
             self.llm_was_connected = true;
             self.llm_last_fresh_at = Some(now);
-            push_metric_history_at(&mut self.llm_prefill_history, llm.prompt_tps, now);
-            push_metric_history_at(&mut self.llm_decode_history, llm.generation_tps, now);
+            // Only real /metrics samples belong in the rate history. With
+            // /metrics unavailable the throughput is unknown, and pushing the
+            // zeroed fields would draw a fabricated flat line.
+            if llm.metrics_available {
+                push_metric_history_at(&mut self.llm_prefill_history, llm.prompt_tps, now);
+                push_metric_history_at(&mut self.llm_decode_history, llm.generation_tps, now);
+            }
         } else if !llm.connected {
             self.llm_was_connected = false;
             self.llm_connected_since = None;
@@ -1379,6 +1384,14 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         return;
     }
 
+    // Reachable server without /metrics: keep the /slots-derived state (slot
+    // counts, CTX, per-slot overview) visible while every metric-derived
+    // value is shown as unavailable rather than a fabricated zero.
+    if !llm.metrics_available {
+        draw_llm_metrics_unavailable(frame, inner, llm, state);
+        return;
+    }
+
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
@@ -1670,6 +1683,109 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
             ),
             state,
         );
+    }
+}
+
+/// Panel rendered when the server is reachable (`connected`) but `/metrics`
+/// is unavailable or disabled. The `/slots`-derived state — slot counts, the
+/// selected CTX pair and the per-slot overview — stays visible; every
+/// metric-derived value is omitted rather than shown as a fabricated zero,
+/// and the reason is stated explicitly.
+fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, state: &UiState) {
+    let context_used = if llm.slots_available {
+        llm.context_used
+    } else {
+        llm.context_high_watermark
+    };
+    let context_pct = if llm.context_size > 0 {
+        context_used as f64 / llm.context_size as f64 * 100.0
+    } else {
+        0.0
+    };
+    let context_bar = inner.width.saturating_sub(46).max(8) as usize;
+    let context_slot_tag = (llm.slot_count > 1)
+        .then_some(llm.context_slot_id)
+        .flatten()
+        .filter(|_| inner.width >= 54)
+        .map(|id| format!("S{id}"));
+    let mut context_suffix = Vec::new();
+    if let Some(tag) = &context_slot_tag {
+        context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
+    }
+    context_suffix.push(Span::styled(
+        if llm.context_size > 0 {
+            format!(
+                " {} / {} tok",
+                grouped_u64(context_used),
+                grouped_u64(llm.context_size)
+            )
+        } else {
+            " waiting for context".to_string()
+        },
+        Style::default().fg(MUTED),
+    ));
+    let slots = if llm.slots_available {
+        format!("{}/{}", llm.busy_slots, llm.slot_count)
+    } else if llm.props_slot_count > 0 {
+        format!("—/{}", llm.props_slot_count)
+    } else {
+        "—".to_string()
+    };
+    let (link, link_color) = llm_link_status(state, llm);
+
+    let mut lines = vec![
+        Line::from(vec![
+            label_span(" MODEL      "),
+            Span::styled(
+                llm.model.clone(),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            label_span(" LINK       "),
+            value_span(link, link_color),
+            llm_sep(),
+            label_span("UPTIME "),
+            value_span(&llm_uptime_text(state), MUTED),
+            llm_sep(),
+            label_span("POLL "),
+            value_span(&llm_last_sample_text(state, llm), MUTED),
+        ]),
+        Line::from(vec![
+            label_span(" METRICS    "),
+            value_span("UNAVAILABLE", YELLOW),
+            llm_sep(),
+            label_span("SLOTS "),
+            value_span(&slots, CYAN),
+        ]),
+        Line::from(vec![
+            label_span(" LLAMA      "),
+            Span::styled(
+                metrics_unavailable_reason(&llm.error),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        meter_line(
+            "CTX",
+            context_pct,
+            context_bar,
+            context_color(context_pct),
+            format!("{:>5.1}%", context_pct),
+            context_suffix,
+        ),
+    ];
+
+    if llm.slots_available && llm.slot_count > 1 {
+        if let Some(overview) =
+            llm_slot_overview_line(&llm.slot_overview, llm.context_slot_id, inner.width)
+        {
+            lines.push(overview);
+        }
+    }
+
+    lines.truncate(inner.height as usize);
+    if !lines.is_empty() {
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 
@@ -2050,6 +2166,18 @@ fn llm_slot_overview_line(
     Some(Line::from(spans))
 }
 
+/// The `1 / 5 / 15` load-average row. All three come from one `/proc/loadavg`
+/// read, so they are either all known or all unknown; an unknown read renders
+/// `—` rather than three fake zeros.
+fn load_average_text(system: &SystemStats) -> String {
+    match (system.load_one, system.load_five, system.load_fifteen) {
+        (Some(one), Some(five), Some(fifteen)) => {
+            format!("{one:.2} / {five:.2} / {fifteen:.2}")
+        }
+        _ => "—".to_string(),
+    }
+}
+
 fn system_panel_height(system: &SystemStats) -> u16 {
     if system.cpu_topology.is_hybrid() && !system.cpu_topology.physical_core_groups.is_empty() {
         let groups = &system.cpu_topology.physical_core_groups;
@@ -2211,11 +2339,12 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         Line::from(vec![
             label_span(" LOAD "),
             value_span(
-                &format!(
-                    "{:.2} / {:.2} / {:.2}",
-                    system.load_one, system.load_five, system.load_fifteen
-                ),
-                WHITE,
+                &load_average_text(system),
+                if system.load_one.is_some() {
+                    WHITE
+                } else {
+                    MUTED
+                },
             ),
         ]),
         Line::from(vec![
@@ -3684,14 +3813,25 @@ fn is_llm_process(program: &str, command: &str) -> bool {
         || command.contains("orsiktop")
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, state: &UiState) {
-    let status = if !llm.error.is_empty() {
-        friendly_llm_error(&llm.error)
+/// The footer status line. A reachable server whose `/metrics` failed must not
+/// be reported offline just because the error text mentions the connection; a
+/// truly unreachable server still is.
+fn footer_status(llm: &LlmStats, gpu: &GpuStats) -> String {
+    if !llm.error.is_empty() {
+        if llm.connected && !llm.metrics_available {
+            metrics_unavailable_reason(&llm.error)
+        } else {
+            friendly_llm_error(&llm.error)
+        }
     } else if !gpu.error.is_empty() {
         format!("GPU · {}", gpu.error)
     } else {
         "READY · MORE POWER, HAPPIER ORKS".to_string()
-    };
+    }
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, state: &UiState) {
+    let status = footer_status(llm, gpu);
 
     let status_color = if !llm.error.is_empty() || !gpu.error.is_empty() {
         YELLOW
@@ -4498,6 +4638,20 @@ fn llm_metrics_disabled(error: &str) -> bool {
     lower.contains("501") || lower.contains("--metrics") || lower.contains("metrics endpoint")
 }
 
+/// The reason line for the reachable-server-without-`/metrics` panel. Unlike
+/// `friendly_llm_error`, it never claims the server is offline: this panel is
+/// only drawn while another endpoint (`/slots`) is answering.
+fn metrics_unavailable_reason(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if llm_metrics_disabled(error) {
+        "LLAMA METRICS OFF · restart server with --metrics".to_string()
+    } else if lower.contains("cannot reach") {
+        "LLAMA METRICS UNREACHABLE · /slots still live".to_string()
+    } else {
+        format!("LLAMA METRICS · {error}")
+    }
+}
+
 fn friendly_llm_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if llm_metrics_disabled(error) {
@@ -5147,6 +5301,7 @@ mod tests {
         let mut state = UiState::default();
         state.observe_llm_sample(&LlmStats {
             connected: true,
+            metrics_available: true,
             prompt_tps: 1200.0,
             generation_tps: 75.0,
             ..LlmStats::default()
@@ -5165,6 +5320,27 @@ mod tests {
         });
         assert_eq!(state.llm_prefill_history.len(), 1);
         assert_eq!(state.llm_decode_history.len(), 1);
+    }
+
+    #[test]
+    fn llm_history_skips_samples_without_metrics() {
+        // A reachable server whose /metrics is unavailable has unknown
+        // throughput: no point may enter the rate history (that would draw a
+        // fabricated flat line).
+        let mut state = UiState::default();
+        state.observe_llm_sample(&LlmStats {
+            connected: true,
+            metrics_available: false,
+            prompt_tps: 9999.0,
+            generation_tps: 9999.0,
+            ..LlmStats::default()
+        });
+        assert!(state.llm_prefill_history.is_empty());
+        assert!(state.llm_decode_history.is_empty());
+        assert!(
+            state.llm_last_fresh_at.is_some(),
+            "the link is still fresh even without metrics"
+        );
     }
 
     #[test]
@@ -5752,6 +5928,58 @@ mod tests {
     }
 
     #[test]
+    fn system_panel_renders_load_average_unavailable_without_a_reading() {
+        // Regression: an unreadable /proc/loadavg must render `—`, not three
+        // fabricated zeros. A real zero stays a number.
+        let unknown = SystemStats::default();
+        let rows = render_system_rows(&unknown, 70, 13);
+        let load_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("LOAD"))
+            .expect("LOAD row must render");
+        assert!(
+            load_row.contains('—'),
+            "unknown load must render —: {load_row:?}"
+        );
+        assert!(
+            !load_row.contains("0.00"),
+            "unknown load must not fabricate zeros: {load_row:?}"
+        );
+
+        let zero = SystemStats {
+            load_one: Some(0.0),
+            load_five: Some(0.0),
+            load_fifteen: Some(0.0),
+            ..Default::default()
+        };
+        let rows = render_system_rows(&zero, 70, 13);
+        let load_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("LOAD"))
+            .expect("LOAD row must render");
+        assert!(
+            load_row.contains("0.00 / 0.00 / 0.00"),
+            "a real zero load must stay a number: {load_row:?}"
+        );
+
+        let known = SystemStats {
+            load_one: Some(1.25),
+            load_five: Some(0.75),
+            load_fifteen: Some(0.5),
+            ..Default::default()
+        };
+        let rows = render_system_rows(&known, 70, 13);
+        let load_row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with("LOAD"))
+            .expect("LOAD row must render");
+        assert!(
+            load_row.contains("1.25 / 0.75 / 0.50"),
+            "known loads must render as read: {load_row:?}"
+        );
+    }
+
+    #[test]
     fn ram_history_skips_samples_without_total() {
         // The history sparkline must follow the same validity semantics:
         // no total, no sample — never a fabricated zero.
@@ -5989,6 +6217,7 @@ mod tests {
             model: "test-model".to_string(),
             context_size: 115200,
             context_used: 78800,
+            metrics_available: true,
             slots_available: true,
             slot_count: 2,
             busy_slots: 1,
@@ -6013,6 +6242,7 @@ mod tests {
             model: "test-model".to_string(),
             context_size: 115200,
             context_used: 28851,
+            metrics_available: true,
             slots_available: true,
             slot_count: 1,
             context_slot_id: Some(0),
@@ -6033,6 +6263,7 @@ mod tests {
             model: "test-model".to_string(),
             context_size: 115200,
             context_used: 5000,
+            metrics_available: true,
             slots_available: true,
             slot_count: 2,
             busy_slots: 1,
@@ -6054,6 +6285,7 @@ mod tests {
             model: "test-model".to_string(),
             context_size: 115200,
             context_used: 28851,
+            metrics_available: true,
             slots_available: true,
             slot_count: 2,
             busy_slots: 1,
@@ -6065,6 +6297,90 @@ mod tests {
             !text.contains("S0"),
             "below the bar-pin width the tag must be dropped, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn llm_panel_shows_slots_but_marks_metrics_unavailable() {
+        // Reachable server without /metrics: the slot/context state stays
+        // visible, the metric rows are unavailable (absent), never fake zeros.
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: false,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: 58745,
+            slots_available: true,
+            slot_count: 2,
+            busy_slots: 1,
+            context_slot_id: Some(0),
+            slot_overview: overview_slots(),
+            error: "/metrics disabled; start llama.cpp with --metrics".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(text.contains("UNAVAILABLE"), "got:\n{text}");
+        assert!(
+            text.contains("58,745 / 115,200 tok"),
+            "the CTX pair from /slots must stay visible, got:\n{text}"
+        );
+        assert!(
+            text.contains("S0 58.7k*"),
+            "the per-slot overview must stay visible, got:\n{text}"
+        );
+        assert!(
+            !text.contains("tok/s"),
+            "no metric rate may be fabricated without /metrics, got:\n{text}"
+        );
+        // The metric-derived rows are omitted entirely, so no total/avg/
+        // request cell can show a fabricated value.
+        assert!(
+            !text.contains("TOTAL") && !text.contains("AVG") && !text.contains("REQUEST"),
+            "no metric row may be fabricated without /metrics, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_unavailable_panel_never_claims_the_server_is_offline() {
+        // A transient /metrics transport failure while /slots answers must not
+        // render the contradictory pair LINK ONLINE + "LLAMA SERVER OFFLINE".
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: false,
+            model: "test-model".to_string(),
+            error: "cannot reach llama.cpp: connection refused".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(text.contains("METRICS UNREACHABLE"), "got:\n{text}");
+        assert!(
+            !text.contains("SERVER OFFLINE"),
+            "a reachable server must not be reported offline, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn footer_marks_a_reachable_metrics_failure_as_metrics_unreachable() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: false,
+            error: "cannot reach llama.cpp: connection refused".to_string(),
+            ..Default::default()
+        };
+        let status = footer_status(&llm, &GpuStats::default());
+        assert!(status.contains("METRICS UNREACHABLE"), "got: {status}");
+        assert!(!status.contains("SERVER OFFLINE"), "got: {status}");
+    }
+
+    #[test]
+    fn footer_still_reports_an_unreachable_server_as_offline() {
+        let llm = LlmStats {
+            connected: false,
+            metrics_available: false,
+            error: "cannot reach llama.cpp: connection refused".to_string(),
+            ..Default::default()
+        };
+        let status = footer_status(&llm, &GpuStats::default());
+        assert!(status.contains("SERVER OFFLINE"), "got: {status}");
     }
 
     fn overview_slots() -> Vec<LlmSlotInfo> {
@@ -6090,6 +6406,7 @@ mod tests {
             model: "test-model".to_string(),
             context_size: 115200,
             context_used: 58745,
+            metrics_available: true,
             slots_available: true,
             slot_count: overview.len() as u64,
             busy_slots: overview.iter().filter(|slot| slot.busy).count() as u64,
