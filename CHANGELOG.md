@@ -2,6 +2,55 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [Unreleased]
+
+### Added
+
+- `orsiktop diag` now reports whether `/metrics` is available; without it the
+  context watermark prints as `—` and no throughput rate is fabricated.
+
+### Changed
+
+- Configuration is now written atomically: the new content goes to a
+  temporary file in the config directory and is renamed over the config in a
+  single step. A failure before the replace leaves the previous file
+  untouched and the temporary file is removed; the temporary file is created
+  `0600` before the content is written, both it and the directory entry are
+  flushed to disk, an existing config's file mode is preserved (a new config
+  is created `0600`), and a symlinked config keeps being written through to
+  its real target (a symlink loop is refused instead of overwriting a link).
+- A missing config still falls back to the built-in defaults silently. Any
+  other read error (a directory in place of the file, permissions, invalid
+  UTF-8) is now reported understandably and without exposing the file's
+  contents; the existing migrations (`server=`, `gpu_index=`) and CLI
+  overrides are unchanged.
+- NVML slowly-changing properties (power limit, PCIe link speed/width) keep
+  their last good value per field when a single lookup fails; only fields
+  read successfully this cycle are refreshed.
+- `RealSys::read_dir` now drops only an unreadable directory entry instead of
+  failing the whole listing; an unreadable directory is still `None` and a
+  readable, empty directory is still an empty list.
+
+### Fixed
+
+- llama.cpp IPv6 loopback endpoints (`[::1]`) now use the local process
+  SPEC-CLI fallback exactly like IPv4 (`127.0.0.1`).
+- A metrics-disabled or failing llama.cpp server keeps its `/slots` context,
+  slot overview and context usage visible; `/metrics`-derived values are
+  shown as unavailable (`—`) instead of a fabricated zero. The first sample
+  after a `/metrics` outage no longer reports a rate averaged over the whole
+  outage, and an empty `/metrics` body is treated as unavailable rather than
+  as real zeroes.
+- A disappeared llama.cpp slot now forces the aggregated `/metrics`
+  throughput fallback even when the surviving slot's task did not change.
+- An unreadable `/proc/loadavg` is reported as unknown (`—`) instead of a
+  fabricated `0.00 / 0.00 / 0.00`; a real zero load still renders as `0.00`.
+- GPU discovery and process-to-GPU attribution now accept both the 4-digit
+  and 8-digit PCI domain forms and canonicalize them identically, so a device
+  is no longer dropped or mis-keyed on hosts that report an 8-digit domain.
+- A panic in one llama.cpp fetch task no longer kills the LLM worker: the
+  failed endpoint becomes an error outcome and sampling continues.
+
 ## [0.2.6] - 2026-10-01
 
 ### Added

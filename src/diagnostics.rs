@@ -24,7 +24,7 @@ use crate::{
     domain::{GpuEvidence, GpuMapping, GpuSelector},
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
-    llama::LlamaMonitor,
+    llama::{LlamaMonitor, LlmStats},
     providers::nvidia::discover_mig_children,
     redact::{redact_urls, safe_endpoint},
     system::RealSys,
@@ -308,6 +308,50 @@ fn llama_section(
     out.push_str(&format!("  gpu map    : {}\n", describe_mapping(&mapping)));
 }
 
+/// The `connected` section of the live probe, independent of the network so
+/// its unavailable-value handling is fixture-testable. Without `/metrics` the
+/// watermark and rate are unknown and print as `—` / are omitted, never a
+/// fabricated zero.
+fn connected_probe_report(stats: &LlmStats) -> String {
+    let model = if stats.model.is_empty() {
+        "<unnamed>"
+    } else {
+        &stats.model
+    };
+    let watermark = if stats.metrics_available {
+        stats.context_high_watermark.to_string()
+    } else {
+        "—".to_string()
+    };
+    let mut lines = vec![
+        "  status     : connected".to_string(),
+        format!("  model      : {model}"),
+        format!(
+            "  metrics    : {}",
+            if stats.metrics_available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ),
+        format!(
+            "  context    : {}/{} (watermark {watermark})",
+            stats.context_used, stats.context_size
+        ),
+        format!(
+            "  slots      : {} busy / {} total",
+            stats.busy_slots, stats.slot_count
+        ),
+    ];
+    if stats.metrics_available {
+        lines.push(format!(
+            "  rate       : prompt {:.1} tps, generation {:.1} tps",
+            stats.prompt_tps, stats.generation_tps
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Live bounded llama probe (750 ms connect + 1200 ms total, see llama.rs).
 /// Only `run` calls this — `render` stays network-free and fixture-testable.
 fn probe_llama<S: crate::system::Sys>(sys: &S, auto_discovery: bool, server: Option<&str>) {
@@ -317,25 +361,7 @@ fn probe_llama<S: crate::system::Sys>(sys: &S, auto_discovery: bool, server: Opt
         Ok(mut monitor) => {
             let stats = monitor.sample();
             if stats.connected {
-                let model = if stats.model.is_empty() {
-                    "<unnamed>"
-                } else {
-                    &stats.model
-                };
-                println!("  status     : connected");
-                println!("  model      : {model}");
-                println!(
-                    "  context    : {}/{} (watermark {})",
-                    stats.context_used, stats.context_size, stats.context_high_watermark
-                );
-                println!(
-                    "  slots      : {} busy / {} total",
-                    stats.busy_slots, stats.slot_count
-                );
-                println!(
-                    "  rate       : prompt {:.1} tps, generation {:.1} tps",
-                    stats.prompt_tps, stats.generation_tps
-                );
+                println!("{}", connected_probe_report(&stats));
             } else {
                 // reqwest embeds the request URL in its errors; redact any URL
                 // so a credential-bearing endpoint cannot leak through the
@@ -598,5 +624,47 @@ mod tests {
         // The connection-relevant part is still shown, sanitized.
         assert!(out.contains("http://localhost:8080"), "{out}");
         assert!(out.contains("(configured)"), "{out}");
+    }
+
+    #[test]
+    fn probe_report_marks_metrics_unavailable_without_fabricating_a_watermark() {
+        // Regression: with /metrics disabled/failing the probe still shows the
+        // /slots-derived context, but the /metrics-only watermark must be `—`,
+        // not a fabricated 0, and no rate may be printed.
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: false,
+            context_used: 1000,
+            context_size: 4096,
+            slot_count: 1,
+            busy_slots: 0,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(report.contains("metrics    : unavailable"), "{report}");
+        assert!(report.contains("watermark —"), "{report}");
+        assert!(!report.contains("watermark 0"), "{report}");
+        assert!(!report.contains("rate"), "{report}");
+        assert!(report.contains("context    : 1000/4096"), "{report}");
+    }
+
+    #[test]
+    fn probe_report_includes_watermark_and_rate_when_metrics_are_available() {
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            context_used: 1000,
+            context_size: 4096,
+            context_high_watermark: 2048,
+            prompt_tps: 12.5,
+            generation_tps: 34.5,
+            slot_count: 2,
+            busy_slots: 1,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(report.contains("metrics    : available"), "{report}");
+        assert!(report.contains("watermark 2048"), "{report}");
+        assert!(report.contains("prompt 12.5 tps"), "{report}");
     }
 }

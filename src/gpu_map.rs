@@ -25,7 +25,9 @@ use std::path::Path;
 use nvml_wrapper::Nvml;
 
 use crate::discovery::DiscoveredGpu;
-use crate::domain::{normalize_pci_bdf, DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu};
+use crate::domain::{
+    normalize_pci_bdf, parse_pci_bdf, DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu,
+};
 use crate::providers::nvidia::MigChild;
 use crate::system::Sys;
 
@@ -39,39 +41,7 @@ use crate::system::Sys;
 fn bdf_from_by_path_name(name: &str) -> Option<String> {
     let rest = name.strip_prefix("pci-")?;
     let bdf = rest.split('-').next()?;
-    if !is_bdf_bytes(bdf.as_bytes()) {
-        return None;
-    }
-    Some(normalize_pci_bdf(bdf))
-}
-
-/// True when `bytes` is a PCI BDF: a 4- or 8-digit hex domain, 2-digit bus
-/// and slot, and a function digit 0–7.
-fn is_bdf_bytes(bytes: &[u8]) -> bool {
-    let is_hex = |b: u8| b.is_ascii_hexdigit();
-    match bytes.len() {
-        12 => {
-            (0..4).all(|i| is_hex(bytes[i]))
-                && bytes[4] == b':'
-                && (5..7).all(|i| is_hex(bytes[i]))
-                && bytes[7] == b':'
-                && (8..10).all(|i| is_hex(bytes[i]))
-                && bytes[10] == b'.'
-                && bytes[11].is_ascii_digit()
-                && bytes[11] <= b'7'
-        }
-        16 => {
-            (0..8).all(|i| is_hex(bytes[i]))
-                && bytes[8] == b':'
-                && (9..11).all(|i| is_hex(bytes[i]))
-                && bytes[11] == b':'
-                && (12..14).all(|i| is_hex(bytes[i]))
-                && bytes[14] == b'.'
-                && bytes[15].is_ascii_digit()
-                && bytes[15] <= b'7'
-        }
-        _ => false,
-    }
+    parse_pci_bdf(bdf)
 }
 
 /// PCI BDFs of the discovered GPUs that the process has an open DRM render
