@@ -10,3 +10,6 @@ graphify-out/
 .omp/plans/
 .omp/browser-relay/
 .omp/agent/
+# local tooling state (never part of the project)
+.pi/
+/kilo.json

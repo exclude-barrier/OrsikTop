@@ -68,18 +68,34 @@ pub fn discover_processes<S: Sys>(sys: &S) -> Vec<LlamaServerCandidate> {
         let Ok(pid) = entry.name.parse::<u32>() else {
             continue;
         };
-        let Some(cmdline) = sys.read_to_string(&proc_root.join(&entry.name).join("cmdline")) else {
+        // Read the start time before and after the cmdline/stat reads: if they
+        // differ, the PID was reused (or the process changed) mid-read and the
+        // identity would be stale, so the entry is skipped.
+        let start_before = read_process_start_time(sys, pid);
+        // `/proc/<pid>/cmdline` is arbitrary bytes; a non-UTF-8 argument must
+        // not drop an otherwise valid server from discovery.
+        let Some(cmdline) = sys.read_to_string_lossy(&proc_root.join(&entry.name).join("cmdline"))
+        else {
             continue;
         };
         let args = parse_cmdline(&cmdline);
         if !is_llama_server_process(&args) {
             continue;
         }
+        // A server whose `--port` is unparseable yields no trustworthy endpoint
+        // and is skipped rather than assumed to be on 8080.
+        let Some(endpoint) = endpoint_from_args(&args) else {
+            continue;
+        };
+        let start_after = read_process_start_time(sys, pid);
+        if start_before != start_after {
+            continue;
+        }
         candidates.push(LlamaServerCandidate {
-            endpoint: endpoint_from_args(&args),
+            endpoint,
             source: ServerSource::Process { pid },
             command: Some(args.join(" ")),
-            start_time: read_process_start_time(sys, pid),
+            start_time: start_after,
         });
     }
 
@@ -175,7 +191,9 @@ pub fn selected_endpoint_server(
 /// Read a process's start time (`/proc/<pid>/stat` field 22, clock ticks
 /// since boot). `None` when the file is missing/unreadable or malformed.
 pub fn read_process_start_time<S: Sys>(sys: &S, pid: u32) -> Option<u64> {
-    let stat = sys.read_to_string(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
+    // `comm` inside stat is arbitrary bytes; read lossily so a valid process
+    // keeps its start time (and therefore its PID-reuse-safe identity).
+    let stat = sys.read_to_string_lossy(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
     parse_start_time(&stat)
 }
 
@@ -210,13 +228,16 @@ fn is_llama_server_process(args: &[String]) -> bool {
         || (executable == "llama" && args.get(1).is_some_and(|arg| arg == "serve"))
 }
 
-fn endpoint_from_args(args: &[String]) -> String {
+fn endpoint_from_args(args: &[String]) -> Option<String> {
     let host = cli_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = cli_value(args, "--port")
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(8080);
+    // A missing `--port` uses llama.cpp's default; a present-but-unparseable one
+    // is not silently turned into 8080 (that could name a different server).
+    let port = match cli_value(args, "--port") {
+        Some(value) => value.parse::<u16>().ok()?,
+        None => 8080,
+    };
     let host = connect_host(&host);
-    format!("http://{host}:{port}")
+    Some(format!("http://{host}:{port}"))
 }
 
 fn connect_host(host: &str) -> String {
@@ -284,7 +305,19 @@ mod tests {
             "8081".to_string(),
         ];
 
-        assert_eq!(endpoint_from_args(&args), "http://127.0.0.1:8081");
+        assert_eq!(
+            endpoint_from_args(&args),
+            Some("http://127.0.0.1:8081".to_string())
+        );
+    }
+
+    #[test]
+    fn unparseable_port_is_not_silently_treated_as_8080() {
+        let args = vec![
+            "/usr/bin/llama-server".to_string(),
+            "--port=not-a-number".to_string(),
+        ];
+        assert_eq!(endpoint_from_args(&args), None);
     }
 
     #[test]
@@ -295,7 +328,10 @@ mod tests {
             "--port=9090".to_string(),
         ];
 
-        assert_eq!(endpoint_from_args(&args), "http://127.0.0.1:9090");
+        assert_eq!(
+            endpoint_from_args(&args),
+            Some("http://127.0.0.1:9090".to_string())
+        );
     }
 
     /// A synthetic `/proc/<pid>/stat` line with `starttime` (field 22) set.

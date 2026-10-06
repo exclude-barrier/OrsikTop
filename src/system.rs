@@ -21,6 +21,12 @@ pub struct SysEntry {
 pub trait Sys {
     /// Read a text file. `None` if the file is missing or unreadable.
     fn read_to_string(&self, path: &Path) -> Option<String>;
+    /// Read a text file, replacing invalid UTF-8 instead of failing. `/proc`
+    /// `cmdline`/`comm` are arbitrary bytes, not guaranteed UTF-8, so process
+    /// discovery must not drop a valid process over an encoding error.
+    fn read_to_string_lossy(&self, path: &Path) -> Option<String> {
+        self.read_to_string(path)
+    }
     /// List a directory. `None` if the directory is missing or unreadable.
     fn read_dir(&self, path: &Path) -> Option<Vec<SysEntry>>;
     /// Direct symlink target (not resolved). `None` if not a symlink or
@@ -33,6 +39,12 @@ pub struct RealSys;
 impl Sys for RealSys {
     fn read_to_string(&self, path: &Path) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    fn read_to_string_lossy(&self, path: &Path) -> Option<String> {
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn read_dir(&self, path: &Path) -> Option<Vec<SysEntry>> {

@@ -24,6 +24,10 @@ const SPEC_REFRESH: Duration = Duration::from_secs(30);
 const LLM_CONNECT_TIMEOUT_MS: u64 = 750;
 /// Total (connect + response) timeout for a single llama.cpp request.
 const LLM_REQUEST_TIMEOUT_MS: u64 = 1200;
+/// Upper bound on a telemetry response body. `/metrics` on a busy server is
+/// tens of KB; this cap keeps a hostile or broken endpoint from exhausting
+/// memory while leaving ample headroom.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
@@ -38,7 +42,10 @@ pub struct LlmStats {
     pub reconnecting: bool,
     pub model: String,
     pub context_size: u64,
-    pub context_used: u64,
+    /// Tokens the selected slot is using, or the `/metrics` high-water mark
+    /// without `/slots`. `None` when `/slots` reports no usable occupancy:
+    /// unknown, rendered `—`, never a fabricated `0`.
+    pub context_used: Option<u64>,
     pub context_high_watermark: u64,
     /// ID of the slot the displayed (context_used, context_size) pair comes
     /// from, per the slot's own `id` field in /slots. `None` when /slots is
@@ -171,6 +178,9 @@ impl LlamaMonitor {
         let client = Client::builder()
             .connect_timeout(Duration::from_millis(LLM_CONNECT_TIMEOUT_MS))
             .timeout(Duration::from_millis(LLM_REQUEST_TIMEOUT_MS))
+            // Monitor exactly the configured endpoint: never silently follow
+            // a redirect to another host/port.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -199,12 +209,13 @@ impl LlamaMonitor {
             let client = &self.client;
             let base = &self.base;
             let props_handle = if fetch_props {
-                Some(scope.spawn(move || fetch_json(client, format!("{base}/props"))))
+                Some(scope.spawn(move || fetch_json(client, endpoint_url(base, "props"))))
             } else {
                 None
             };
-            let metrics_handle = scope.spawn(move || fetch_raw(client, format!("{base}/metrics")));
-            let slots_handle = scope.spawn(move || fetch_json(client, format!("{base}/slots")));
+            let metrics_handle =
+                scope.spawn(move || fetch_raw(client, endpoint_url(base, "metrics")));
+            let slots_handle = scope.spawn(move || fetch_json(client, endpoint_url(base, "slots")));
 
             (
                 props_handle.map(|handle| {
@@ -613,6 +624,22 @@ fn join_or<T>(handle: std::thread::ScopedJoinHandle<'_, T>, on_panic: T) -> T {
     handle.join().unwrap_or(on_panic)
 }
 
+/// Build an API endpoint URL from the configured base, appending `segment`
+/// (`metrics`/`props`/`slots`) to the base *path* and preserving any query
+/// (e.g. a token). A plain `format!("{base}/{segment}")` would fold the segment
+/// into a base query (`?token=x/metrics`) or a path segment (`/v1/metrics`)
+/// instead, so `/metrics` was never actually requested.
+fn endpoint_url(base: &str, segment: &str) -> String {
+    match reqwest::Url::parse(base) {
+        Ok(mut url) => {
+            let path = url.path().trim_end_matches('/');
+            url.set_path(&format!("{path}/{segment}"));
+            url.to_string()
+        }
+        Err(_) => format!("{}/{segment}", base.trim_end_matches('/')),
+    }
+}
+
 /// Fetches a raw text endpoint (currently only /metrics).
 fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     let response = match client.get(url).send() {
@@ -625,10 +652,26 @@ fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     if !status.is_success() {
         return MetricsOutcome::Http(status);
     }
-    match response.text() {
+    match read_body_limited(response, MAX_RESPONSE_BYTES) {
         Ok(body) => MetricsOutcome::Ok(body),
-        Err(err) => MetricsOutcome::Body(crate::redact::describe_reqwest_error(err)),
+        Err(err) => MetricsOutcome::Body(err),
     }
+}
+
+/// Read a response body up to `limit` bytes, refusing an oversized one instead
+/// of allocating without bound. The error carries no request URL, so it is safe
+/// to surface.
+fn read_body_limited(response: reqwest::blocking::Response, limit: u64) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut buffer = Vec::new();
+    response
+        .take(limit + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|err| err.to_string())?;
+    if buffer.len() as u64 > limit {
+        return Err(format!("response body exceeded {limit} bytes"));
+    }
+    String::from_utf8(buffer).map_err(|err| err.to_string())
 }
 
 /// Fetches a JSON endpoint (/props, /slots).
@@ -641,9 +684,12 @@ fn fetch_json(client: &Client, url: String) -> JsonOutcome {
     if !status.is_success() {
         return JsonOutcome::Http(status);
     }
-    match response.json::<Value>() {
-        Ok(value) => JsonOutcome::Ok(value),
-        Err(err) => JsonOutcome::Invalid(crate::redact::describe_reqwest_error(err)),
+    match read_body_limited(response, MAX_RESPONSE_BYTES) {
+        Ok(body) => match serde_json::from_str::<Value>(&body) {
+            Ok(value) => JsonOutcome::Ok(value),
+            Err(err) => JsonOutcome::Invalid(err.to_string()),
+        },
+        Err(err) => JsonOutcome::Invalid(err),
     }
 }
 
@@ -663,6 +709,11 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     // capacities differ.
     let mut best_busy: Option<(u64, u64, Option<u64>)> = None;
     let mut best_any: Option<(u64, u64, Option<u64>)> = None;
+    // Carries (n_ctx, slot id) for the size/id when no slot reports a usable
+    // occupancy, so the pair still has a real capacity while the used count
+    // stays unknown.
+    let mut fallback_busy: Option<(u64, Option<u64>)> = None;
+    let mut fallback_any: Option<(u64, Option<u64>)> = None;
     let mut busy = 0u64;
     let mut request_prompt_tokens = 0u64;
     let mut request_generated_tokens = 0u64;
@@ -720,12 +771,21 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
                 (None, None) => None,
             },
         };
-        let used = used_opt.unwrap_or(0);
-        if is_processing && best_busy.is_none_or(|best| used > best.0) {
-            best_busy = Some((used, n_ctx, slot_id));
+        // Only a known occupancy may win the CTX row; an unknown slot can at
+        // most supply the capacity/id via `fallback_*`.
+        if let Some(used) = used_opt {
+            if is_processing && best_busy.is_none_or(|best| used > best.0) {
+                best_busy = Some((used, n_ctx, slot_id));
+            }
+            if best_any.is_none_or(|best| used > best.0) {
+                best_any = Some((used, n_ctx, slot_id));
+            }
         }
-        if best_any.is_none_or(|best| used > best.0) {
-            best_any = Some((used, n_ctx, slot_id));
+        if is_processing && fallback_busy.is_none_or(|best| n_ctx > best.0) {
+            fallback_busy = Some((n_ctx, slot_id));
+        }
+        if fallback_any.is_none_or(|best| n_ctx > best.0) {
+            fallback_any = Some((n_ctx, slot_id));
         }
 
         counters.push(SlotCounter {
@@ -751,10 +811,13 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     stats.busy_slots = busy;
     stats.request_prompt_tokens = request_prompt_tokens;
     stats.request_generated_tokens = request_generated_tokens;
-    let (context_used, context_size, context_slot_id) =
-        best_busy
-            .or(best_any)
-            .unwrap_or((0, stats.context_size, None));
+    let (context_used, context_size, context_slot_id) = match best_busy.or(best_any) {
+        Some((used, n_ctx, slot_id)) => (Some(used), n_ctx, slot_id),
+        None => {
+            let (n_ctx, slot_id) = fallback_busy.or(fallback_any).unwrap_or((0, None));
+            (None, n_ctx, slot_id)
+        }
+    };
     stats.context_used = context_used;
     stats.context_slot_id = context_slot_id;
     stats.slot_overview = overview;
@@ -1174,6 +1237,28 @@ fn model_display_name(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn endpoint_url_appends_to_the_path_and_keeps_the_query() {
+        assert_eq!(
+            endpoint_url("http://127.0.0.1:8080", "metrics"),
+            "http://127.0.0.1:8080/metrics"
+        );
+        assert_eq!(
+            endpoint_url("http://127.0.0.1:8080/", "slots"),
+            "http://127.0.0.1:8080/slots"
+        );
+        // A configured base path is preserved.
+        assert_eq!(
+            endpoint_url("http://h:8080/v1", "props"),
+            "http://h:8080/v1/props"
+        );
+        // A query token stays a query; it must not absorb the segment.
+        assert_eq!(
+            endpoint_url("http://h:8080/v1?token=abc", "metrics"),
+            "http://h:8080/v1/metrics?token=abc"
+        );
+    }
 
     #[test]
     fn a_panicking_fetch_task_is_turned_into_an_outcome() {
@@ -1602,7 +1687,7 @@ mod tests {
         assert_eq!(stats.slot_count, 2);
         assert_eq!(stats.busy_slots, 1);
         assert_eq!(stats.context_size, 196608);
-        assert_eq!(stats.context_used, 38779);
+        assert_eq!(stats.context_used, Some(38779));
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(counters[0].prompt_processed, 12000);
         assert_eq!(counters[0].decoded, 779);
@@ -1660,7 +1745,9 @@ mod tests {
         assert_eq!(stats.busy_slots, 0);
         assert_eq!(stats.request_prompt_tokens, 0);
         assert_eq!(stats.request_generated_tokens, 0);
-        assert_eq!(stats.context_used, 0);
+        // `n_prompt_tokens_processed: 0` + `n_decoded: 0` are present, so a
+        // real 0 is reported here (not unknown).
+        assert_eq!(stats.context_used, Some(0));
         assert_eq!(stats.context_slot_id, Some(0));
     }
 
@@ -1691,7 +1778,7 @@ mod tests {
         }]);
 
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 4250);
+        assert_eq!(stats.context_used, Some(4250));
         // The slot reports no `id`; the display identity stays unknown.
         assert_eq!(stats.context_slot_id, None);
     }
@@ -1708,7 +1795,7 @@ mod tests {
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.busy_slots, 1);
-        assert_eq!(stats.context_used, 5000);
+        assert_eq!(stats.context_used, Some(5000));
         assert_eq!(stats.context_size, 100000);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1722,7 +1809,7 @@ mod tests {
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.busy_slots, 0);
-        assert_eq!(stats.context_used, 9000);
+        assert_eq!(stats.context_used, Some(9000));
         assert_eq!(stats.context_size, 200000);
         assert_eq!(stats.context_slot_id, Some(1));
     }
@@ -1736,7 +1823,7 @@ mod tests {
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.busy_slots, 2);
-        assert_eq!(stats.context_used, 4000);
+        assert_eq!(stats.context_used, Some(4000));
         assert_eq!(stats.context_size, 150000);
         assert_eq!(stats.request_prompt_tokens, 6000);
         assert_eq!(stats.context_slot_id, Some(1));
@@ -1752,7 +1839,7 @@ mod tests {
             { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 70143);
+        assert_eq!(stats.context_used, Some(70143));
         assert_eq!(stats.context_size, 70144);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1768,7 +1855,7 @@ mod tests {
             { "id": 1, "id_task": 42, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 37943 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 1022);
+        assert_eq!(stats.context_used, Some(1022));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1783,7 +1870,7 @@ mod tests {
             { "id": 7, "n_ctx": 150000, "is_processing": true, "n_prompt_tokens": 2000 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 2000);
+        assert_eq!(stats.context_used, Some(2000));
         assert_eq!(stats.context_size, 150000);
         assert_eq!(stats.context_slot_id, Some(7));
     }
@@ -1798,7 +1885,7 @@ mod tests {
             { "n_ctx": 200000, "is_processing": false, "n_prompt_tokens": 9000 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 5000);
+        assert_eq!(stats.context_used, Some(5000));
         assert_eq!(stats.context_size, 100000);
         assert_eq!(stats.context_slot_id, None);
     }
@@ -1810,7 +1897,7 @@ mod tests {
             json!([{ "id": 0, "n_ctx": 115200, "is_processing": true, "n_prompt_tokens": 28851 }]);
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.slot_count, 1);
-        assert_eq!(stats.context_used, 28851);
+        assert_eq!(stats.context_used, Some(28851));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1823,9 +1910,26 @@ mod tests {
         };
         apply_slots_json(&mut stats, &json!([])).unwrap();
         assert_eq!(stats.slot_count, 0);
-        assert_eq!(stats.context_used, 0);
+        assert_eq!(stats.context_used, None);
         assert_eq!(stats.context_size, 4096);
         assert_eq!(stats.context_slot_id, None);
+    }
+
+    #[test]
+    fn slot_without_usage_reports_unknown_context_used_not_zero() {
+        let mut stats = LlmStats {
+            context_size: 4096,
+            ..Default::default()
+        };
+        let slots = json!([{ "id": 0, "n_ctx": 8192, "is_processing": true }]);
+        apply_slots_json(&mut stats, &slots).unwrap();
+        // No usable occupancy: the pair keeps the real capacity but the used
+        // count is unknown (-), never a fabricated 0.
+        assert_eq!(stats.context_used, None);
+        assert_eq!(stats.context_size, 8192);
+        assert_eq!(stats.context_slot_id, Some(0));
+        assert_eq!(stats.slot_overview[0].context_used, None);
+        assert_eq!(stats.slot_overview[0].context_size, Some(8192));
     }
 
     #[test]
@@ -1836,7 +1940,7 @@ mod tests {
         };
         let slots = json!([{ "id": 0, "n_prompt_tokens": 512, "is_processing": true }]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 512);
+        assert_eq!(stats.context_used, Some(512));
         assert_eq!(stats.context_size, 4096);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1867,7 +1971,7 @@ mod tests {
             ]
         );
         // The main CTX pair must not be the sum of the slots.
-        assert_eq!(stats.context_used, 58745);
+        assert_eq!(stats.context_used, Some(58745));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1922,7 +2026,7 @@ mod tests {
         assert_eq!(stats.slot_overview[0].context_size, Some(115200));
         assert_eq!(stats.slot_overview[1].context_size, Some(70144));
         // The main pair still comes from a single slot.
-        assert_eq!(stats.context_used, 58745);
+        assert_eq!(stats.context_used, Some(58745));
         assert_eq!(stats.context_size, 115200);
         assert_eq!(stats.context_slot_id, Some(0));
     }
@@ -1969,7 +2073,7 @@ mod tests {
             { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, 37943);
+        assert_eq!(stats.context_used, Some(37943));
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(stats.slot_overview[0].context_used, Some(37943));
         assert_eq!(stats.slot_overview[1].context_used, Some(100));

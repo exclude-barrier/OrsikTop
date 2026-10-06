@@ -61,9 +61,12 @@ pub fn run(settings: &config::AppConfig) -> Result<(), Box<dyn std::error::Error
 
 /// Build the diagnostics report as a string (testable without a TTY).
 ///
-/// Pure with respect to the filesystem: every read goes through `sys`, so a
-/// `FixtureSys` yields a deterministic report. The llama section prints
-/// discovery + the mapping decision, not live connection state.
+/// The CPU, sensor and llama/discovery/mapping sections read only through
+/// `sys`, so a `FixtureSys` makes them deterministic. The GPU provider sample
+/// (`provider_section`) and the NVML mapping query run against live hardware —
+/// NVML cannot be injected — so those parts stay host-dependent even under a
+/// fixture. The llama section prints discovery + the mapping decision, not live
+/// connection state.
 pub fn render<S: crate::system::Sys>(
     sys: &S,
     logical: usize,
@@ -323,6 +326,9 @@ fn connected_probe_report(stats: &LlmStats) -> String {
     } else {
         "—".to_string()
     };
+    let used = stats
+        .context_used
+        .map_or_else(|| "—".to_string(), |value| value.to_string());
     let mut lines = vec![
         "  status     : connected".to_string(),
         format!("  model      : {model}"),
@@ -335,8 +341,8 @@ fn connected_probe_report(stats: &LlmStats) -> String {
             }
         ),
         format!(
-            "  context    : {}/{} (watermark {watermark})",
-            stats.context_used, stats.context_size
+            "  context    : {used}/{} (watermark {watermark})",
+            stats.context_size
         ),
         format!(
             "  slots      : {} busy / {} total",
@@ -634,7 +640,7 @@ mod tests {
         let stats = LlmStats {
             connected: true,
             metrics_available: false,
-            context_used: 1000,
+            context_used: Some(1000),
             context_size: 4096,
             slot_count: 1,
             busy_slots: 0,
@@ -653,7 +659,7 @@ mod tests {
         let stats = LlmStats {
             connected: true,
             metrics_available: true,
-            context_used: 1000,
+            context_used: Some(1000),
             context_size: 4096,
             context_high_watermark: 2048,
             prompt_tps: 12.5,

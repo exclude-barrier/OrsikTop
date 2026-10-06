@@ -140,8 +140,9 @@ impl CpuSensors {
     /// CPU package power in watts from the RAPL package zone: two `energy_uj`
     /// reads a short bounded window apart. `None` when no package zone is
     /// readable — `energy_uj` is root-only on current kernels, so a non-root
-    /// OrsikTop reports no power. A counter that reads lower than the first
-    /// read (kernel reset) clamps to 0 W.
+    /// OrsikTop reports no power — and also when the counter read a lower value
+    /// than the baseline (kernel reset) or the measurement window is zero. An
+    /// unmeasurable window is unavailable, never a fabricated `0.0 W`.
     pub fn sample_power_w<S: Sys>(&self, sys: &S) -> Option<f64> {
         let layout = self.layout()?;
         for zone in &layout.power_zones {
@@ -152,7 +153,9 @@ impl CpuSensors {
             let Some(e1) = read_u64_file(sys, &zone.dir.join("energy_uj")) else {
                 continue;
             };
-            return Some(rapl_watts(e0, e1, zone.window_us));
+            if let Some(watts) = rapl_watts(e0, e1, zone.window_us) {
+                return Some(watts);
+            }
         }
         None
     }
@@ -160,12 +163,13 @@ impl CpuSensors {
 
 /// RAPL power from an energy delta over a measurement window. The µJ and µs
 /// factors cancel, so `watts == delta_uj / window_us`. A negative delta
-/// (counter wrap/reset within the short window) clamps to 0 W.
-fn rapl_watts(previous_uj: u64, energy_uj: u64, window_us: u64) -> f64 {
+/// (counter wrap/reset within the short window) or a zero window is
+/// unmeasurable: `None`, not a fabricated `0.0 W`.
+fn rapl_watts(previous_uj: u64, energy_uj: u64, window_us: u64) -> Option<f64> {
     if window_us == 0 || energy_uj < previous_uj {
-        return 0.0;
+        return None;
     }
-    (energy_uj - previous_uj) as f64 / window_us as f64
+    Some((energy_uj - previous_uj) as f64 / window_us as f64)
 }
 
 /// True for entries that name a directory we can walk: a real directory or a
@@ -423,13 +427,14 @@ mod tests {
     }
 
     #[test]
-    fn rapl_watts_delta_math_and_reset_clamp() {
+    fn rapl_watts_delta_math_and_unmeasurable_windows() {
         // 250_000 µJ over 50_000 µs (50 ms) = 5 W.
-        assert!((rapl_watts(1_000_000, 1_250_000, 50_000) - 5.0).abs() < 0.001);
-        // Counter reset (read lower than baseline) clamps to 0 W.
-        assert_eq!(rapl_watts(1_000_000, 100, 50_000), 0.0);
-        // Zero window guards against divide-by-zero.
-        assert_eq!(rapl_watts(1_000_000, 1_250_000, 0), 0.0);
+        let watts = rapl_watts(1_000_000, 1_250_000, 50_000).expect("measurable window");
+        assert!((watts - 5.0).abs() < 0.001);
+        // Counter reset (read lower than baseline) is unmeasurable, not 0 W.
+        assert_eq!(rapl_watts(1_000_000, 100, 50_000), None);
+        // Zero window guards against divide-by-zero and is also unavailable.
+        assert_eq!(rapl_watts(1_000_000, 1_250_000, 0), None);
     }
 
     fn rapl_fixture() -> FixtureSys {

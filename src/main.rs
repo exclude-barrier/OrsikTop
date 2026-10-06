@@ -86,7 +86,11 @@ struct Args {
     gpu: Option<String>,
 
     /// Legacy NVIDIA GPU index. Prefer `--gpu`.
-    #[arg(long, conflicts_with = "gpu", env = "ORSIKTOP_GPU_INDEX")]
+    ///
+    /// Not `conflicts_with("gpu")`: clap treats env-provided values as present,
+    /// so setting both `ORSIKTOP_GPU` and `ORSIKTOP_GPU_INDEX` would make every
+    /// invocation fail. `--gpu` simply takes precedence below.
+    #[arg(long, env = "ORSIKTOP_GPU_INDEX")]
     gpu_index: Option<u32>,
 }
 

@@ -146,14 +146,16 @@ impl DeviceId {
     }
 }
 
-/// Normalize a PCI BDF string to the canonical 4-digit domain form
+/// Normalize a PCI BDF string to the canonical 4-digit domain lower-case form
 /// (`0000:01:00.0`). Some vendor APIs (NVML) report an 8-digit domain
-/// (`00000000:01:00.0`) for the same physical device; normalizing at the
-/// ingress point keeps identity matching consistent across providers and
-/// against `lspci` output. 12-character BDFs are already canonical and pass
-/// through unchanged, as do domains of `0x10000` or higher (not
-/// representable in 4 digits) and strings that are not BDFs.
+/// (`00000000:01:00.0`) and callers may supply upper-case hex; lower-casing and
+/// collapsing the domain at the ingress point keeps identity matching
+/// consistent across providers, against `lspci` output and for user-supplied
+/// selectors. 12-character BDFs are already canonical except for case, as are
+/// domains of `0x10000` or higher (not representable in 4 digits) and strings
+/// that are not BDFs.
 pub(crate) fn normalize_pci_bdf(value: &str) -> String {
+    let value = value.to_ascii_lowercase();
     let bytes = value.as_bytes();
     if bytes.len() == 16
         && bytes[8] == b':'
@@ -170,7 +172,7 @@ pub(crate) fn normalize_pci_bdf(value: &str) -> String {
             }
         }
     }
-    value.to_string()
+    value
 }
 
 /// Parse and validate a PCI BDF string, returning its canonical form.
@@ -563,6 +565,18 @@ mod tests {
         assert_eq!(normalize_pci_bdf("000000000:01:00.0"), "000000000:01:00.0");
         assert_eq!(normalize_pci_bdf("not-a-bdf"), "not-a-bdf");
         assert_eq!(normalize_pci_bdf(""), "");
+    }
+
+    #[test]
+    fn normalize_pci_bdf_lowercases_uppercase_hex() {
+        // A user-supplied selector in upper case must reach the same identity
+        // as the lower-case sysfs key.
+        assert_eq!(normalize_pci_bdf("0000:AB:CD.0"), "0000:ab:cd.0");
+        assert_eq!(normalize_pci_bdf("0000:AB:CD.E"), "0000:ab:cd.e");
+        assert_eq!(
+            DeviceId::new(Some("0000:AB:CD.0".into()), None).key(),
+            DeviceId::new(Some("0000:ab:cd.0".into()), None).key()
+        );
     }
 
     #[test]
