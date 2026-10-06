@@ -1395,12 +1395,11 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
-        llm.context_high_watermark
+        Some(llm.context_high_watermark)
     };
-    let context_pct = if llm.context_size > 0 {
-        context_used as f64 / llm.context_size as f64 * 100.0
-    } else {
-        0.0
+    let context_pct = match (context_used, llm.context_size) {
+        (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
+        _ => 0.0,
     };
     let context_bar = inner.width.saturating_sub(46).max(8) as usize;
     // Multi-slot servers show which slot supplies the displayed CTX pair,
@@ -1419,14 +1418,12 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
     }
     context_suffix.push(Span::styled(
-        if llm.context_size > 0 {
-            format!(
-                " {} / {} tok",
-                grouped_u64(context_used),
-                grouped_u64(llm.context_size)
-            )
-        } else {
-            " waiting for context".to_string()
+        match (context_used, llm.context_size) {
+            (Some(used), size) if size > 0 => {
+                format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
+            }
+            (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
+            _ => " waiting for context".to_string(),
         },
         Style::default().fg(MUTED),
     ));
@@ -1695,12 +1692,11 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
-        llm.context_high_watermark
+        Some(llm.context_high_watermark)
     };
-    let context_pct = if llm.context_size > 0 {
-        context_used as f64 / llm.context_size as f64 * 100.0
-    } else {
-        0.0
+    let context_pct = match (context_used, llm.context_size) {
+        (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
+        _ => 0.0,
     };
     let context_bar = inner.width.saturating_sub(46).max(8) as usize;
     let context_slot_tag = (llm.slot_count > 1)
@@ -1713,14 +1709,12 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
         context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
     }
     context_suffix.push(Span::styled(
-        if llm.context_size > 0 {
-            format!(
-                " {} / {} tok",
-                grouped_u64(context_used),
-                grouped_u64(llm.context_size)
-            )
-        } else {
-            " waiting for context".to_string()
+        match (context_used, llm.context_size) {
+            (Some(used), size) if size > 0 => {
+                format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
+            }
+            (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
+            _ => " waiting for context".to_string(),
         },
         Style::default().fg(MUTED),
     ));
@@ -2140,7 +2134,12 @@ fn llm_slot_overview_line(
     // entries (none after the padded label), and the remainder suffix.
     let fits = |kept: usize| {
         let hidden = entries.len() - kept;
-        let text: usize = entries[..kept].iter().map(|(text, _)| text.len()).sum();
+        // Measure display cells, not UTF-8 bytes: `—` is three bytes but one
+        // cell, so a byte count would hide slots that actually fit.
+        let text: usize = entries[..kept]
+            .iter()
+            .map(|(text, _)| text.chars().count())
+            .sum();
         LABEL_LEN + text + ENTRY_GAP * (kept - 1) + suffix_len(hidden) <= width as usize
     };
 
@@ -4014,8 +4013,11 @@ fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         ])
     };
 
-    let preview = build_endpoint(&state.settings_host, &state.settings_port)
-        .unwrap_or_else(|_| "http://…".to_string());
+    // Preview the endpoint that would actually be saved, so an `https` (or
+    // custom-scheme) URL is not misrepresented as `http`.
+    let preview = state
+        .settings_endpoint()
+        .unwrap_or_else(|_| "…".to_string());
     let auto = if state.settings_auto_discovery {
         "ON"
     } else {
@@ -4186,10 +4188,20 @@ pub fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 }
 
 fn compact_endpoint(server: &str) -> String {
-    server
-        .trim_start_matches("http://")
+    // Never paint a credential, path or query token: reuse the diagnostics
+    // redactor, then drop the scheme for the compact header.
+    let safe = crate::redact::safe_endpoint(server);
+    if safe == crate::redact::UNPARSEABLE_ENDPOINT {
+        // A legacy scheme-less `host:port` with no userinfo/path/query/fragment
+        // is safe to show; anything else stays hidden.
+        let trimmed = server.trim();
+        if !trimmed.is_empty() && !trimmed.contains(['@', '/', '?', '#', ' ']) {
+            return trimmed.to_string();
+        }
+        return safe;
+    }
+    safe.trim_start_matches("http://")
         .trim_start_matches("https://")
-        .trim_end_matches('/')
         .to_string()
 }
 
@@ -5349,6 +5361,23 @@ mod tests {
     }
 
     #[test]
+    fn compact_endpoint_never_shows_credentials_path_or_query() {
+        // Regression: the header used to paint the endpoint verbatim.
+        assert_eq!(
+            compact_endpoint("http://demo-user:demo-password@10.0.0.7:8080/v1?token=demo_secret"),
+            "10.0.0.7:8080/…?…"
+        );
+        assert!(!compact_endpoint("https://user:s3cret@host:8443/x").contains("s3cret"));
+        // A legacy scheme-less host:port stays readable.
+        assert_eq!(compact_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
+        // Anything ambiguous is hidden, never echoed.
+        assert_eq!(
+            compact_endpoint("localhost:8080?token=demo_secret"),
+            crate::redact::UNPARSEABLE_ENDPOINT
+        );
+    }
+
+    #[test]
     fn settings_endpoint_parses_and_rebuilds_ipv4() {
         assert_eq!(
             endpoint_parts("http://10.0.0.7:9090"),
@@ -6216,7 +6245,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 78800,
+            context_used: Some(78800),
             metrics_available: true,
             slots_available: true,
             slot_count: 2,
@@ -6241,7 +6270,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 28851,
+            context_used: Some(28851),
             metrics_available: true,
             slots_available: true,
             slot_count: 1,
@@ -6262,7 +6291,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 5000,
+            context_used: Some(5000),
             metrics_available: true,
             slots_available: true,
             slot_count: 2,
@@ -6284,7 +6313,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 28851,
+            context_used: Some(28851),
             metrics_available: true,
             slots_available: true,
             slot_count: 2,
@@ -6308,7 +6337,7 @@ mod tests {
             metrics_available: false,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 58745,
+            context_used: Some(58745),
             slots_available: true,
             slot_count: 2,
             busy_slots: 1,
@@ -6405,7 +6434,7 @@ mod tests {
             connected: true,
             model: "test-model".to_string(),
             context_size: 115200,
-            context_used: 58745,
+            context_used: Some(58745),
             metrics_available: true,
             slots_available: true,
             slot_count: overview.len() as u64,

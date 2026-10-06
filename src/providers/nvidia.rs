@@ -230,11 +230,14 @@ impl NvidiaGpuProvider {
                 let mut mig_children = Vec::new();
                 for index in 0..count {
                     if let Ok(device) = nvml.device_by_index(index) {
-                        let uuid = device.uuid().ok();
+                        // An empty-but-present NVML string would key the device
+                        // as "" and bypass the uuid fallback; treat it as absent.
+                        let uuid = device.uuid().ok().filter(|value| !value.is_empty());
                         let bus_id = device
                             .pci_info()
                             .ok()
-                            .map(|pci| normalize_pci_bdf(&pci.bus_id));
+                            .map(|pci| normalize_pci_bdf(&pci.bus_id))
+                            .filter(|value| !value.is_empty());
                         let device_id = DeviceId::new(bus_id.clone(), uuid.clone());
                         mig_children.extend(mig_children_of(index, &device, &device_id));
                         devices.push((index, uuid, bus_id));
