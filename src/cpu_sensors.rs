@@ -137,14 +137,16 @@ impl CpuSensors {
             .or_else(|| fallback.into_iter().reduce(f64::max))
     }
 
-    /// CPU package power in watts from the RAPL package zone: two `energy_uj`
-    /// reads a short bounded window apart. `None` when no package zone is
-    /// readable — `energy_uj` is root-only on current kernels, so a non-root
-    /// OrsikTop reports no power — and also when the counter read a lower value
-    /// than the baseline (kernel reset) or the measurement window is zero. An
-    /// unmeasurable window is unavailable, never a fabricated `0.0 W`.
+    /// CPU package power in watts from the RAPL package zones: two `energy_uj`
+    /// reads a short bounded window apart, summed over every readable package
+    /// zone so a multi-socket host reports the total. `None` when no package
+    /// zone is measurable — `energy_uj` is root-only on current kernels, so a
+    /// non-root OrsikTop reports no power — and a zone whose counter read a
+    /// lower value than the baseline (kernel reset) or whose window is zero is
+    /// skipped, never contributed as a fabricated `0.0 W`.
     pub fn sample_power_w<S: Sys>(&self, sys: &S) -> Option<f64> {
         let layout = self.layout()?;
+        let mut samples = Vec::with_capacity(layout.power_zones.len());
         for zone in &layout.power_zones {
             let Some(e0) = read_u64_file(sys, &zone.dir.join("energy_uj")) else {
                 continue;
@@ -153,12 +155,24 @@ impl CpuSensors {
             let Some(e1) = read_u64_file(sys, &zone.dir.join("energy_uj")) else {
                 continue;
             };
-            if let Some(watts) = rapl_watts(e0, e1, zone.window_us) {
-                return Some(watts);
-            }
+            samples.push((e0, e1, zone.window_us));
         }
-        None
+        sum_rapl_watts(&samples)
     }
+}
+
+/// Sum the measurable package zones. `None` when none is measurable; a reset or
+/// zero-window zone is skipped rather than counted as 0 W.
+fn sum_rapl_watts(samples: &[(u64, u64, u64)]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut measured = false;
+    for &(previous_uj, energy_uj, window_us) in samples {
+        if let Some(watts) = rapl_watts(previous_uj, energy_uj, window_us) {
+            total += watts;
+            measured = true;
+        }
+    }
+    measured.then_some(total)
 }
 
 /// RAPL power from an energy delta over a measurement window. The µJ and µs
@@ -435,6 +449,30 @@ mod tests {
         assert_eq!(rapl_watts(1_000_000, 100, 50_000), None);
         // Zero window guards against divide-by-zero and is also unavailable.
         assert_eq!(rapl_watts(1_000_000, 1_250_000, 0), None);
+    }
+
+    #[test]
+    fn rapl_sums_every_measurable_package_zone() {
+        // One socket: 250_000 µJ / 50_000 µs = 5 W.
+        let single = sum_rapl_watts(&[(1_000_000, 1_250_000, 50_000)]).expect("measurable");
+        assert!((single - 5.0).abs() < 0.001);
+
+        // Two sockets: 5 W + 2 W = 7 W.
+        let dual = sum_rapl_watts(&[
+            (1_000_000, 1_250_000, 50_000),
+            (2_000_000, 2_100_000, 50_000),
+        ])
+        .expect("measurable");
+        assert!((dual - 7.0).abs() < 0.001);
+
+        // A reset zone is skipped; the other still counts.
+        let partial = sum_rapl_watts(&[(1_000_000, 100, 50_000), (2_000_000, 2_100_000, 50_000)])
+            .expect("the healthy zone is measurable");
+        assert!((partial - 2.0).abs() < 0.001);
+
+        // No measurable zone at all -> unavailable, not 0 W.
+        assert_eq!(sum_rapl_watts(&[(1_000_000, 100, 50_000), (1, 1, 0)]), None);
+        assert_eq!(sum_rapl_watts(&[]), None);
     }
 
     fn rapl_fixture() -> FixtureSys {
