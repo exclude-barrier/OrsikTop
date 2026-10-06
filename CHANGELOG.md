@@ -2,6 +2,43 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [0.2.8] - 2026-10-06
+
+### Changed
+
+- The TUI header now redacts the monitored endpoint (credentials, path and
+  query are never shown); the settings preview reflects the endpoint's real
+  scheme.
+- The main CTX pair is optional: a `/slots` entry with no usable occupancy
+  shows `—` instead of a fabricated `0`, and the CTX percentage is clamped.
+- CPU topology is derived from the kernel's online CPU set, so affinity,
+  cpusets and offline CPUs classify the right cores.
+- RAPL package power is summed across all readable package zones
+  (multi-socket hosts report the total).
+- GitHub Actions are pinned to commit SHAs.
+
+### Fixed
+
+- CPU frequency weighting now accepts the kernel's space-separated
+  `affected_cpus` format, not only the cpumask form.
+- llama.cpp endpoint URLs are built from origin plus path, so a base with a
+  path or query no longer corrupts `/metrics`, `/props` and `/slots`.
+- Duplicated DRM file descriptors of one client are counted once (no double
+  memory/engine attribution).
+- An unmeasurable RAPL window (counter reset or zero window) is reported as
+  unavailable instead of `0 W`.
+- Intel `limit_reason` is `—` when the underlying source is unreadable.
+- PCI BDFs are lower-cased at ingress, so `--gpu 0000:AB:CD.0` matches.
+- Process program/command metadata refreshes across `execve`.
+- `/proc` reads tolerate a non-UTF-8 `cmdline`/`stat`.
+- llama.cpp responses are size-bounded and redirects are disabled.
+- GPU temperatures keep their sign (sub-ambient readings are real).
+- An unparseable llama-server `--port` is no longer silently treated as 8080;
+  process discovery guards PID reuse; `--gpu`/`--gpu_index` no longer conflict
+  via environment variables.
+- Additional regression tests for config persistence (cross-process save
+  races, dangling symlinks).
+
 ## [0.2.7] - 2026-10-05
 
 ### Added
