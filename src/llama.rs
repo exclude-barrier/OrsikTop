@@ -121,8 +121,12 @@ struct SlotCounter {
     /// provide one. Deliberately not the array position: order is not identity.
     slot_id: Option<u64>,
     task_id: Option<i64>,
-    prompt_processed: u64,
-    decoded: u64,
+    /// Cumulative prompt/decode counters for this slot. `None` when the slot
+    /// did not expose that counter in this sample, so a temporary absence is
+    /// never stored as a `0` baseline (which would fabricate a catch-up spike
+    /// when the counter returns). The two dimensions are independent.
+    prompt_processed: Option<u64>,
+    decoded: Option<u64>,
 }
 
 #[derive(Default)]
@@ -398,14 +402,15 @@ impl LlamaMonitor {
                 // A formally successful /slots array is not enough: if its
                 // entries cannot be paired by a verified identity, the
                 // aggregated /metrics counters are used instead of fabricating
-                // per-slot deltas.
-                let slot_live = self.update_live_slot_throughput(&mut stats, slots);
+                // per-slot deltas. A dimension the slot path cannot derive falls
+                // back to the aggregate counter for that dimension only.
+                let slot_live = self.update_live_slot_throughput(slots);
                 (stats.prompt_tps, stats.generation_tps) =
                     choose_live_throughput(slot_live, metric_live);
             }
             None => {
                 (stats.prompt_tps, stats.generation_tps) =
-                    choose_live_throughput(None, metric_live);
+                    choose_live_throughput((None, None), metric_live);
                 self.previous_slots = PreviousSlotCounters::default();
             }
         }
@@ -572,27 +577,22 @@ impl LlamaMonitor {
         live
     }
 
-    /// Update the slot-derived live throughput. Returns the values on success,
-    /// or `None` when the slots could not be paired safely; the caller then
-    /// uses the aggregated `/metrics` counters.
+    /// Update the slot-counter baseline and return the verified per-dimension
+    /// live throughput `(prompt_tps, generation_tps)`. Each element is `None`
+    /// when it cannot be derived safely; the caller then uses the aggregated
+    /// `/metrics` value for that dimension.
     fn update_live_slot_throughput(
         &mut self,
-        stats: &mut LlmStats,
         slots: Vec<SlotCounter>,
-    ) -> Option<(f64, f64)> {
+    ) -> (Option<f64>, Option<f64>) {
         let now = Instant::now();
-        let mut live = None;
-
-        if let Some(previous_at) = self.previous_slots.at {
-            let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
-            if let Some((prompt_tps, generation_tps)) =
+        let live = match self.previous_slots.at {
+            Some(previous_at) => {
+                let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
                 slot_delta_tps(&self.previous_slots.slots, &slots, seconds)
-            {
-                stats.prompt_tps = Some(prompt_tps);
-                stats.generation_tps = Some(generation_tps);
-                live = Some((prompt_tps, generation_tps));
             }
-        }
+            None => (None, None),
+        };
 
         self.previous_slots.at = Some(now);
         self.previous_slots.slots = slots;
@@ -750,6 +750,11 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     let mut busy = 0u64;
     let mut request_prompt_tokens: Option<u64> = None;
     let mut request_generated_tokens: Option<u64> = None;
+    // A busy slot that lacks a counter makes that total incomplete, not a
+    // smaller number: the aggregate must then be unavailable rather than a
+    // silent partial sum.
+    let mut request_prompt_complete = true;
+    let mut request_generated_complete = true;
     let mut counters = Vec::with_capacity(slots.len());
     let mut overview = Vec::with_capacity(slots.len());
 
@@ -785,14 +790,20 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
 
         if is_processing {
             // Only a reported count contributes; a busy slot that reports no
-            // prompt/decoded count leaves the field unknown (—), not 0.
-            if let Some(value) = prompt_processed {
-                request_prompt_tokens =
-                    Some(request_prompt_tokens.unwrap_or(0).saturating_add(value));
+            // prompt/decoded count makes that total incomplete (None), not 0.
+            match prompt_processed {
+                Some(value) => {
+                    request_prompt_tokens =
+                        Some(request_prompt_tokens.unwrap_or(0).saturating_add(value));
+                }
+                None => request_prompt_complete = false,
             }
-            if let Some(value) = decoded {
-                request_generated_tokens =
-                    Some(request_generated_tokens.unwrap_or(0).saturating_add(value));
+            match decoded {
+                Some(value) => {
+                    request_generated_tokens =
+                        Some(request_generated_tokens.unwrap_or(0).saturating_add(value));
+                }
+                None => request_generated_complete = false,
             }
         }
 
@@ -832,8 +843,9 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             // id has no trustworthy identity (see `slot_delta_tps`).
             slot_id,
             task_id: slot.get("id_task").and_then(Value::as_i64),
-            prompt_processed: prompt_processed.unwrap_or(0),
-            decoded: decoded.unwrap_or(0),
+            // Preserve absence per dimension rather than defaulting to 0.
+            prompt_processed,
+            decoded,
         });
         if let Some(id) = slot_id {
             overview.push(LlmSlotInfo {
@@ -848,8 +860,14 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     overview.sort_by_key(|slot| slot.id);
 
     stats.busy_slots = busy;
-    stats.request_prompt_tokens = request_prompt_tokens;
-    stats.request_generated_tokens = request_generated_tokens;
+    // A complete sum only when every busy slot reported the counter; otherwise
+    // the total is unknown (None), never a silent partial sum.
+    stats.request_prompt_tokens = request_prompt_complete
+        .then_some(request_prompt_tokens)
+        .flatten();
+    stats.request_generated_tokens = request_generated_complete
+        .then_some(request_generated_tokens)
+        .flatten();
     let (context_used, context_size, context_slot_id) = match best_busy.or(best_any) {
         Some((used, n_ctx, slot_id)) => (Some(used), n_ctx, slot_id),
         None => {
@@ -1083,27 +1101,37 @@ fn env_value(env_bytes: Option<&[u8]>, key: &str) -> Option<String> {
 /// slot-delta path abstains and the caller falls back to the aggregated
 /// `/metrics` counters, so reordered or changed slots cannot fabricate
 /// activity.
+/// Verified per-slot prompt/decode deltas as `(prompt_tps, generation_tps)`.
+/// Each dimension is `None` when it cannot be derived safely (a missing or
+/// reset counter on any paired slot); the two dimensions are independent. Any
+/// identity problem (missing/duplicate slot id, disappeared slot, task change)
+/// makes both dimensions unavailable, preserving the existing safeguards.
 fn slot_delta_tps(
     previous: &[SlotCounter],
     current: &[SlotCounter],
     seconds: f64,
-) -> Option<(f64, f64)> {
+) -> (Option<f64>, Option<f64>) {
+    let unavailable = (None, None);
     if !seconds.is_finite() || seconds <= 0.0 || current.is_empty() {
-        return None;
+        return unavailable;
     }
 
     let mut prompt_delta = 0u64;
     let mut decoded_delta = 0u64;
+    let mut prompt_known = true;
+    let mut decoded_known = true;
 
     for current_slot in current {
-        let slot_id = current_slot.slot_id?;
+        let Some(slot_id) = current_slot.slot_id else {
+            return unavailable;
+        };
         if current
             .iter()
             .filter(|slot| slot.slot_id == Some(slot_id))
             .count()
             != 1
         {
-            return None;
+            return unavailable;
         }
         if previous
             .iter()
@@ -1111,20 +1139,39 @@ fn slot_delta_tps(
             .count()
             != 1
         {
-            return None;
+            return unavailable;
         }
-        let previous_slot = previous.iter().find(|slot| slot.slot_id == Some(slot_id))?;
+        let Some(previous_slot) = previous.iter().find(|slot| slot.slot_id == Some(slot_id)) else {
+            return unavailable;
+        };
         if !task_ids_match(previous_slot.task_id, current_slot.task_id) {
-            return None;
+            return unavailable;
         }
 
-        prompt_delta = prompt_delta.saturating_add(
-            current_slot
-                .prompt_processed
-                .saturating_sub(previous_slot.prompt_processed),
-        );
-        decoded_delta = decoded_delta
-            .saturating_add(current_slot.decoded.saturating_sub(previous_slot.decoded));
+        // A dimension is usable when both samples reported it and it did not
+        // decrease (reset). A counter missing on exactly one side is a real gap
+        // while the slot is active, so that dimension becomes unavailable (no
+        // catch-up spike); a counter missing on BOTH sides carries no
+        // information and contributes nothing (e.g. an idle slot that omits the
+        // field), so it must not invalidate the dimension. The two dimensions
+        // are independent.
+        match (
+            current_slot.prompt_processed,
+            previous_slot.prompt_processed,
+        ) {
+            (Some(now), Some(before)) if now >= before => {
+                prompt_delta = prompt_delta.saturating_add(now - before);
+            }
+            (None, None) => {}
+            _ => prompt_known = false,
+        }
+        match (current_slot.decoded, previous_slot.decoded) {
+            (Some(now), Some(before)) if now >= before => {
+                decoded_delta = decoded_delta.saturating_add(now - before);
+            }
+            (None, None) => {}
+            _ => decoded_known = false,
+        }
     }
 
     // The loop above only verifies that every *current* slot can be paired.
@@ -1134,36 +1181,35 @@ fn slot_delta_tps(
     // activity. A previous slot without an `id` cannot be verified either, so
     // it abstains for the same reason.
     for previous_slot in previous {
-        let slot_id = previous_slot.slot_id?;
+        let Some(slot_id) = previous_slot.slot_id else {
+            return unavailable;
+        };
         if current
             .iter()
             .filter(|slot| slot.slot_id == Some(slot_id))
             .count()
             != 1
         {
-            return None;
+            return unavailable;
         }
     }
 
-    Some((
-        prompt_delta as f64 / seconds,
-        decoded_delta as f64 / seconds,
-    ))
+    (
+        prompt_known.then(|| prompt_delta as f64 / seconds),
+        decoded_known.then(|| decoded_delta as f64 / seconds),
+    )
 }
 
-/// Prefer trustworthy per-slot deltas; otherwise fall back to the aggregated
-/// `/metrics` counters. Never a fabricated per-slot value.
-/// Live throughput, preferring the verified slot delta and otherwise the
-/// aggregate `/metrics` counter delta. `None` means unavailable (no verified
-/// slot pairing and no usable aggregate counters) — never a fabricated zero.
+/// Live throughput, preferring the verified per-slot delta and otherwise the
+/// aggregate `/metrics` counter delta, per dimension. `None` means unavailable
+/// — never a fabricated zero.
 fn choose_live_throughput(
-    slot_live: Option<(f64, f64)>,
+    slot_live: (Option<f64>, Option<f64>),
     metric_live: (Option<f64>, Option<f64>),
 ) -> (Option<f64>, Option<f64>) {
-    match slot_live {
-        Some((prompt, generation)) => (Some(prompt), Some(generation)),
-        None => metric_live,
-    }
+    // Per dimension: the verified slot delta wins; otherwise the aggregate
+    // metric; otherwise unavailable. Never a fabricated zero.
+    (slot_live.0.or(metric_live.0), slot_live.1.or(metric_live.1))
 }
 
 fn task_ids_match(previous: Option<i64>, current: Option<i64>) -> bool {
@@ -1827,8 +1873,8 @@ mod tests {
         assert_eq!(stats.context_size, 196608);
         assert_eq!(stats.context_used, Some(38779));
         assert_eq!(stats.context_slot_id, Some(0));
-        assert_eq!(counters[0].prompt_processed, 12000);
-        assert_eq!(counters[0].decoded, 779);
+        assert_eq!(counters[0].prompt_processed, Some(12000));
+        assert_eq!(counters[0].decoded, Some(779));
         assert_eq!(stats.request_prompt_tokens, Some(12000));
         assert_eq!(stats.request_generated_tokens, Some(779));
     }
@@ -1838,19 +1884,19 @@ mod tests {
         let previous = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(42),
-            prompt_processed: 1000,
-            decoded: 100,
+            prompt_processed: Some(1000),
+            decoded: Some(100),
         }];
         let current = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(42),
-            prompt_processed: 1250,
-            decoded: 130,
+            prompt_processed: Some(1250),
+            decoded: Some(130),
         }];
 
-        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 0.5).unwrap();
-        assert_eq!(prompt_tps, 500.0);
-        assert_eq!(generation_tps, 60.0);
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 0.5);
+        assert_eq!(prompt_tps, Some(500.0));
+        assert_eq!(generation_tps, Some(60.0));
     }
 
     #[test]
@@ -1858,19 +1904,19 @@ mod tests {
         let previous = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(42),
-            prompt_processed: 1000,
-            decoded: 500,
+            prompt_processed: Some(1000),
+            decoded: Some(500),
         }];
         let current = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(43),
-            prompt_processed: 100,
-            decoded: 5,
+            prompt_processed: Some(100),
+            decoded: Some(5),
         }];
 
         // A task switch makes the pair unverifiable: abstain (the caller falls
         // back to the aggregated counters) rather than emit a fake spike.
-        assert_eq!(slot_delta_tps(&previous, &current, 0.5), None);
+        assert_eq!(slot_delta_tps(&previous, &current, 0.5), (None, None));
     }
 
     #[test]
@@ -2232,34 +2278,34 @@ mod tests {
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1000,
-                decoded: 100,
+                prompt_processed: Some(1000),
+                decoded: Some(100),
             },
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(2),
-                prompt_processed: 2000,
-                decoded: 200,
+                prompt_processed: Some(2000),
+                decoded: Some(200),
             },
         ];
         let current = vec![
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1100,
-                decoded: 150,
+                prompt_processed: Some(1100),
+                decoded: Some(150),
             },
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(2),
-                prompt_processed: 2200,
-                decoded: 300,
+                prompt_processed: Some(2200),
+                decoded: Some(300),
             },
         ];
 
-        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0).unwrap();
-        assert_eq!(prompt_tps, 150.0);
-        assert_eq!(generation_tps, 75.0);
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0);
+        assert_eq!(prompt_tps, Some(150.0));
+        assert_eq!(generation_tps, Some(75.0));
     }
 
     #[test]
@@ -2268,14 +2314,14 @@ mod tests {
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1000,
-                decoded: 500,
+                prompt_processed: Some(1000),
+                decoded: Some(500),
             },
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(2),
-                prompt_processed: 2000,
-                decoded: 300,
+                prompt_processed: Some(2000),
+                decoded: Some(300),
             },
         ];
         // Slot 0 disappeared; slot 1's task finished and a new task started
@@ -2283,11 +2329,11 @@ mod tests {
         let current = vec![SlotCounter {
             slot_id: Some(1),
             task_id: Some(3),
-            prompt_processed: 50,
-            decoded: 5,
+            prompt_processed: Some(50),
+            decoded: Some(5),
         }];
 
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (None, None));
     }
 
     #[test]
@@ -2299,26 +2345,26 @@ mod tests {
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(7),
-                prompt_processed: 1000,
-                decoded: 500,
+                prompt_processed: Some(1000),
+                decoded: Some(500),
             },
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(8),
-                prompt_processed: 2000,
-                decoded: 300,
+                prompt_processed: Some(2000),
+                decoded: Some(300),
             },
         ];
         let current = vec![SlotCounter {
             slot_id: Some(1),
             task_id: Some(8),
-            prompt_processed: 2100,
-            decoded: 400,
+            prompt_processed: Some(2100),
+            decoded: Some(400),
         }];
 
         assert_eq!(
             slot_delta_tps(&previous, &current, 1.0),
-            None,
+            (None, None),
             "a disappeared slot must abstain even when the survivor's task is unchanged"
         );
     }
@@ -2331,42 +2377,229 @@ mod tests {
             SlotCounter {
                 slot_id: Some(0),
                 task_id: None,
-                prompt_processed: 1000,
-                decoded: 500,
+                prompt_processed: Some(1000),
+                decoded: Some(500),
             },
             SlotCounter {
                 slot_id: None,
                 task_id: None,
-                prompt_processed: 2000,
-                decoded: 300,
+                prompt_processed: Some(2000),
+                decoded: Some(300),
             },
         ];
         let current = vec![SlotCounter {
             slot_id: Some(0),
             task_id: None,
-            prompt_processed: 1100,
-            decoded: 550,
+            prompt_processed: Some(1100),
+            decoded: Some(550),
         }];
 
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (None, None));
     }
 
     #[test]
-    fn slot_delta_tps_clamps_counter_decrease_to_zero() {
+    fn slot_delta_tps_counter_decrease_is_unavailable() {
         let previous = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(1),
-            prompt_processed: 1000,
-            decoded: 900,
+            prompt_processed: Some(1000),
+            decoded: Some(900),
         }];
         let current = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(1),
-            prompt_processed: 900,
-            decoded: 100,
+            prompt_processed: Some(900),
+            decoded: Some(100),
         }];
 
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), Some((0.0, 0.0)));
+        // A decrease in either counter (reset) makes that dimension
+        // unavailable; it is never reported as a fabricated 0.
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (None, None));
+    }
+
+    #[test]
+    fn missing_prompt_counter_invalidates_only_prompt() {
+        // Same verified id+task; the prompt counter is absent this sample while
+        // decoded stays present. Prompt TPS is unavailable; decode TPS stays.
+        let previous = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: Some(100),
+            decoded: Some(20),
+        }];
+        let current = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: None,
+            decoded: Some(25),
+        }];
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (None, Some(5.0)));
+    }
+
+    #[test]
+    fn missing_decoded_counter_invalidates_only_decode() {
+        let previous = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: Some(100),
+            decoded: Some(20),
+        }];
+        let current = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: Some(150),
+            decoded: None,
+        }];
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (Some(50.0), None));
+    }
+
+    #[test]
+    fn reappearing_prompt_counter_does_not_spike() {
+        // B has no prompt counter, C brings it back; pairing B->C must abstain
+        // for prompt (no `150 - 0` catch-up spike), while decode still works.
+        let b = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: None,
+            decoded: Some(25),
+        }];
+        let c = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: Some(150),
+            decoded: Some(30),
+        }];
+        assert_eq!(slot_delta_tps(&b, &c, 1.0), (None, Some(5.0)));
+    }
+
+    #[test]
+    fn explicit_zero_slot_counter_is_a_real_zero() {
+        // An unchanged explicit zero is a genuine 0/s, not unavailable.
+        let previous = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: Some(0),
+            decoded: Some(0),
+        }];
+        let current = vec![SlotCounter {
+            slot_id: Some(0),
+            task_id: Some(1),
+            prompt_processed: Some(0),
+            decoded: Some(0),
+        }];
+        assert_eq!(
+            slot_delta_tps(&previous, &current, 1.0),
+            (Some(0.0), Some(0.0))
+        );
+    }
+
+    #[test]
+    fn idle_slot_missing_counter_does_not_invalidate_the_dimension() {
+        // Slot 1 is idle and omits both counters; slot 0 stays fully valid.
+        // The idle gap must not clear either dimension.
+        let previous = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: Some(100),
+                decoded: Some(20),
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: None,
+                prompt_processed: None,
+                decoded: None,
+            },
+        ];
+        let current = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: Some(150),
+                decoded: Some(25),
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: None,
+                prompt_processed: None,
+                decoded: None,
+            },
+        ];
+        assert_eq!(
+            slot_delta_tps(&previous, &current, 1.0),
+            (Some(50.0), Some(5.0))
+        );
+    }
+
+    #[test]
+    fn request_totals_require_all_busy_slots_to_report() {
+        // One busy slot lacks the prompt counter: the prompt total is
+        // incomplete (None), while the decode total (all present) is Some.
+        let mut stats = LlmStats::default();
+        apply_slots_json(
+            &mut stats,
+            &json!([
+                {"id": 0, "is_processing": true, "n_prompt_tokens_processed": 100, "next_token": {"n_decoded": 20}},
+                {"id": 1, "is_processing": true, "next_token": {"n_decoded": 10}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(stats.request_generated_tokens, Some(30));
+
+        // Mirror case: one busy slot lacks decoded.
+        let mut stats = LlmStats::default();
+        apply_slots_json(
+            &mut stats,
+            &json!([
+                {"id": 0, "is_processing": true, "n_prompt_tokens_processed": 100, "next_token": {"n_decoded": 20}},
+                {"id": 1, "is_processing": true, "n_prompt_tokens_processed": 50}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(stats.request_prompt_tokens, Some(150));
+        assert_eq!(stats.request_generated_tokens, None);
+    }
+
+    #[test]
+    fn request_totals_sum_complete_busy_slots_and_ignore_idle_gaps() {
+        // All busy slots report (including a real zero) -> exact sum.
+        let mut stats = LlmStats::default();
+        apply_slots_json(
+            &mut stats,
+            &json!([
+                {"id": 0, "is_processing": true, "n_prompt_tokens_processed": 0, "next_token": {"n_decoded": 0}},
+                {"id": 1, "is_processing": true, "n_prompt_tokens_processed": 5, "next_token": {"n_decoded": 3}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(stats.request_prompt_tokens, Some(5));
+        assert_eq!(stats.request_generated_tokens, Some(3));
+
+        // An idle slot with missing counters must not poison the busy total.
+        let mut stats = LlmStats::default();
+        apply_slots_json(
+            &mut stats,
+            &json!([
+                {"id": 0, "is_processing": true, "n_prompt_tokens_processed": 100, "next_token": {"n_decoded": 20}},
+                {"id": 1, "is_processing": false}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(stats.request_prompt_tokens, Some(100));
+        assert_eq!(stats.request_generated_tokens, Some(20));
+
+        // No busy slot -> inactive, no request total.
+        let mut stats = LlmStats::default();
+        apply_slots_json(
+            &mut stats,
+            &json!([
+                {"id": 0, "is_processing": false, "n_prompt_tokens_processed": 100, "next_token": {"n_decoded": 20}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(stats.request_generated_tokens, None);
     }
 
     #[test]
@@ -2392,7 +2625,7 @@ mod tests {
         assert!(previous.iter().all(|slot| slot.slot_id.is_none()));
 
         let slot_live = slot_delta_tps(&previous, &current, 1.0);
-        assert_eq!(slot_live, None, "no identity → no per-slot delta");
+        assert_eq!(slot_live, (None, None), "no identity → no per-slot delta");
         // The decision must fall back to the aggregated metrics, never to the
         // fabricated 900/90 the old index-as-id behavior produced.
         assert_eq!(
@@ -2407,14 +2640,14 @@ mod tests {
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1000,
-                decoded: 100,
+                prompt_processed: Some(1000),
+                decoded: Some(100),
             },
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(2),
-                prompt_processed: 2000,
-                decoded: 200,
+                prompt_processed: Some(2000),
+                decoded: Some(200),
             },
         ];
         // Same slots, reordered, each advanced by its own amount.
@@ -2422,19 +2655,19 @@ mod tests {
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(2),
-                prompt_processed: 2200,
-                decoded: 300,
+                prompt_processed: Some(2200),
+                decoded: Some(300),
             },
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1100,
-                decoded: 150,
+                prompt_processed: Some(1100),
+                decoded: Some(150),
             },
         ];
         assert_eq!(
             slot_delta_tps(&previous, &current, 2.0),
-            Some((150.0, 75.0))
+            (Some(150.0), Some(75.0))
         );
     }
 
@@ -2443,24 +2676,24 @@ mod tests {
         let previous = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(1),
-            prompt_processed: 1000,
-            decoded: 100,
+            prompt_processed: Some(1000),
+            decoded: Some(100),
         }];
         let current = vec![
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1100,
-                decoded: 150,
+                prompt_processed: Some(1100),
+                decoded: Some(150),
             },
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1200,
-                decoded: 160,
+                prompt_processed: Some(1200),
+                decoded: Some(160),
             },
         ];
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (None, None));
     }
 
     #[test]
@@ -2470,24 +2703,24 @@ mod tests {
         let previous = vec![SlotCounter {
             slot_id: Some(0),
             task_id: Some(1),
-            prompt_processed: 1000,
-            decoded: 100,
+            prompt_processed: Some(1000),
+            decoded: Some(100),
         }];
         let current = vec![
             SlotCounter {
                 slot_id: Some(0),
                 task_id: Some(1),
-                prompt_processed: 1100,
-                decoded: 150,
+                prompt_processed: Some(1100),
+                decoded: Some(150),
             },
             SlotCounter {
                 slot_id: Some(1),
                 task_id: Some(2),
-                prompt_processed: 5,
-                decoded: 1,
+                prompt_processed: Some(5),
+                decoded: Some(1),
             },
         ];
-        assert_eq!(slot_delta_tps(&previous, &current, 1.0), None);
+        assert_eq!(slot_delta_tps(&previous, &current, 1.0), (None, None));
     }
 
     #[test]

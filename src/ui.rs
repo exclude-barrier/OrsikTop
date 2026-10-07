@@ -6568,6 +6568,31 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_request_totals_render_unavailable_not_zero() {
+        // A busy slot whose prompt total is incomplete (None) renders —, while
+        // an independent real zero decode total still renders 0 tok.
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            busy_slots: 1,
+            request_prompt_tokens: None,
+            request_generated_tokens: Some(0),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 100, 14);
+        assert!(text.contains("REQUEST"), "request row must render:\n{text}");
+        assert!(
+            text.contains("— tok"),
+            "incomplete total must be —:\n{text}"
+        );
+        assert!(
+            text.contains("0 tok"),
+            "a real zero request count must render 0:\n{text}"
+        );
+    }
+
+    #[test]
     fn metrics_unavailable_panel_with_slots_keeps_context_unknown() {
         let llm = LlmStats {
             connected: true,
