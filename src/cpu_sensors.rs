@@ -11,14 +11,15 @@
 //! - Temperature: hwmon `temp*_input` (millidegrees) from CPU thermal drivers
 //!   (`coretemp`, `k10temp`, `zenpower`, `x86_pkg`, …), preferring package/Tctl
 //!   sensors over per-core readings.
-//! - Power: RAPL `intel-rapl` package zone. Two `energy_uj` reads a short bounded
-//!   window apart; a counter that reads lower (kernel reset) clamps to 0 W.
-//!   `energy_uj` is root-only on current kernels, so a non-root OrsikTop reads
-//!   `None` — the path is still implemented and fixture-tested.
+//! - Power: RAPL `intel-rapl` package zones. All baselines are read, then one
+//!   bounded window elapses, then all zones are read again and summed; an
+//!   unmeasurable window (counter reset or zero) yields `None`, never a fake
+//!   `0 W`. `energy_uj` is root-only on current kernels, so a non-root OrsikTop
+//!   reads `None` — the path is still implemented and fixture-tested.
 
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::system::Sys;
@@ -146,16 +147,41 @@ impl CpuSensors {
     /// skipped, never contributed as a fabricated `0.0 W`.
     pub fn sample_power_w<S: Sys>(&self, sys: &S) -> Option<f64> {
         let layout = self.layout()?;
+        if layout.power_zones.is_empty() {
+            return None;
+        }
+        // Read every zone's baseline, sleep once, then read every zone again, so
+        // an N-socket host blocks for one window instead of N. Each zone is
+        // divided by the actual elapsed interval, not the requested sleep.
+        let baselines: Vec<Option<u64>> = layout
+            .power_zones
+            .iter()
+            .map(|zone| read_u64_file(sys, &zone.dir.join("energy_uj")))
+            .collect();
+        // One window for all zones; the shortest keeps every zone within its
+        // own no-wrap bound.
+        let window_us = layout
+            .power_zones
+            .iter()
+            .map(|zone| zone.window_us)
+            .min()
+            .unwrap_or(0);
+        if window_us == 0 {
+            return None;
+        }
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_micros(window_us));
+        let elapsed_us = started.elapsed().as_micros().max(1) as u64;
+
         let mut samples = Vec::with_capacity(layout.power_zones.len());
-        for zone in &layout.power_zones {
-            let Some(e0) = read_u64_file(sys, &zone.dir.join("energy_uj")) else {
+        for (zone, baseline) in layout.power_zones.iter().zip(baselines) {
+            let Some(previous_uj) = baseline else {
                 continue;
             };
-            std::thread::sleep(Duration::from_micros(zone.window_us));
-            let Some(e1) = read_u64_file(sys, &zone.dir.join("energy_uj")) else {
+            let Some(energy_uj) = read_u64_file(sys, &zone.dir.join("energy_uj")) else {
                 continue;
             };
-            samples.push((e0, e1, zone.window_us));
+            samples.push((previous_uj, energy_uj, elapsed_us));
         }
         sum_rapl_watts(&samples)
     }
