@@ -423,93 +423,9 @@ impl GpuSelector {
     }
 }
 
-/// Explicit availability of a single metric value.
-///
-/// `None` fields that used to mean "unavailable" are replaced by this so
-/// the UI can distinguish a real zero from a sensor that does not exist.
-#[derive(Clone, Debug, PartialEq, Default)]
-#[allow(dead_code)]
-pub enum Metric<T> {
-    Available(T),
-    /// The device/driver does not expose this metric at all.
-    #[default]
-    Unsupported,
-    /// Exposed, but not readable right now (reset, transient driver state).
-    Unavailable,
-    /// Not readable with the current user's permissions.
-    PermissionDenied,
-    /// Last known value, kept after the source started failing.
-    Stale(T),
-    /// The source returned an explicit error.
-    Error(String),
-}
-
-#[allow(dead_code)]
-impl<T> Metric<T> {
-    pub fn available(value: T) -> Self {
-        Self::Available(value)
-    }
-
-    pub const fn unsupported() -> Self {
-        Self::Unsupported
-    }
-
-    pub const fn unavailable() -> Self {
-        Self::Unavailable
-    }
-
-    pub const fn permission_denied() -> Self {
-        Self::PermissionDenied
-    }
-
-    pub fn stale(value: T) -> Self {
-        Self::Stale(value)
-    }
-
-    pub fn error(message: impl Into<String>) -> Self {
-        Self::Error(message.into())
-    }
-
-    /// The value when the metric carries one (available or stale).
-    pub fn value(&self) -> Option<&T> {
-        match self {
-            Self::Available(value) | Self::Stale(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    /// True when the metric has a usable value right now (not stale/error).
-    pub fn is_live(&self) -> bool {
-        matches!(self, Self::Available(_))
-    }
-
-    pub fn is_unavailable(&self) -> bool {
-        !matches!(self, Self::Available(_))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn metric_distinguishes_available_from_unavailable_states() {
-        assert_eq!(Metric::available(42).value(), Some(&42));
-        assert!(Metric::available(0).is_live());
-        assert_eq!(Metric::<f64>::stale(1.5).value(), Some(&1.5));
-        assert!(!Metric::<f64>::stale(1.5).is_live());
-
-        for metric in [
-            Metric::<u8>::unsupported(),
-            Metric::<u8>::unavailable(),
-            Metric::<u8>::permission_denied(),
-            Metric::<u8>::error("no such sensor".to_string()),
-        ] {
-            assert!(metric.is_unavailable());
-            assert_eq!(metric.value(), None);
-        }
-        assert_eq!(Metric::default(), Metric::<u8>::unsupported());
-    }
 
     #[test]
     fn device_id_prefers_bdf_over_uuid() {
