@@ -2,6 +2,41 @@
 
 All notable changes to OrsikTop will be documented here.
 
+## [Unreleased]
+
+### Changed
+
+- NVIDIA MIG identity is handled honestly: a modern opaque `MIG-<uuid>` and the
+  legacy `MIG-<GPU-UUID>/<GI>/<CI>` form are both recognized, `MIG-…` parses to
+  a UUID selector (never a PCI BDF) and resolves through the parent's MIG
+  device. GI/CI are read only from the legacy encoding; an opaque UUID never
+  fabricates them, and process→child attribution degrades to the physical
+  parent rather than guessing.
+- CPU topology and per-CPU usage are aligned by kernel CPU id, so affinity,
+  cpusets and offline holes no longer shift the heatmap; capacity/SMT
+  classification and physical-core grouping tolerate offline holes.
+- RAPL package power reads all zone baselines, waits one measurement window and
+  divides by the actual elapsed interval.
+
+### Fixed
+
+- An unknown context occupancy renders the CTX meter as unavailable (`—`),
+  never a fabricated `0.0%`; a missing `/metrics` watermark is `None` so it
+  cannot look like a real zero.
+- A DRM engine counter reset (busy ns or cycles reading lower) is unavailable
+  for that sample instead of a fabricated `0%`; the baseline is updated so the
+  next sample recovers.
+- Server-controlled model strings are sanitized for the TUI and `orsiktop diag`
+  (control characters removed, length bounded); the networking endpoint is
+  unaffected.
+- `--gpu` help no longer implies NVIDIA-only selection; `gpu-…`/`mig-…` prefixes
+  are canonicalized to their NVML case.
+
+### Removed
+
+- The unused `Metric<T>` domain abstraction (never referenced outside its own
+  definition).
+
 ## [0.2.8] - 2026-10-06
 
 ### Changed
