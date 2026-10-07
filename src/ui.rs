@@ -232,8 +232,14 @@ impl UiState {
             // /metrics unavailable the throughput is unknown, and pushing the
             // zeroed fields would draw a fabricated flat line.
             if llm.metrics_available {
-                push_metric_history_at(&mut self.llm_prefill_history, llm.prompt_tps, now);
-                push_metric_history_at(&mut self.llm_decode_history, llm.generation_tps, now);
+                // Only a present rate belongs in the history; a missing metric
+                // must not append a fabricated 0 that distorts the graph.
+                if let Some(value) = llm.prompt_tps {
+                    push_metric_history_at(&mut self.llm_prefill_history, value, now);
+                }
+                if let Some(value) = llm.generation_tps {
+                    push_metric_history_at(&mut self.llm_decode_history, value, now);
+                }
             }
         } else if !llm.connected {
             self.llm_was_connected = false;
@@ -1467,42 +1473,63 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
     };
     let (phase, phase_color) = llm_phase(llm);
 
-    let live_pp = if llm.prompt_tps > 0.05 {
-        format!("{:.1} tok/s", llm.prompt_tps)
-    } else {
-        "— tok/s".to_string()
+    let live_pp = llm.prompt_tps.map_or_else(
+        || "— tok/s".to_string(),
+        |value| format!("{value:.1} tok/s"),
+    );
+    let live_tg = llm.generation_tps.map_or_else(
+        || "— tok/s".to_string(),
+        |value| format!("{value:.1} tok/s"),
+    );
+    let request_pp = match (llm.busy_slots > 0, llm.request_prompt_tokens) {
+        (true, Some(tokens)) => format!("{} tok", grouped_u64(tokens)),
+        _ => "— tok".to_string(),
     };
-    let live_tg = if llm.generation_tps > 0.05 {
-        format!("{:.1} tok/s", llm.generation_tps)
-    } else {
-        "— tok/s".to_string()
+    let request_tg = match (llm.busy_slots > 0, llm.request_generated_tokens) {
+        (true, Some(tokens)) => format!("{} tok", grouped_u64(tokens)),
+        _ => "— tok".to_string(),
     };
-    let request_pp = if llm.busy_slots > 0 {
-        format!("{} tok", grouped_u64(llm.request_prompt_tokens))
-    } else {
-        "— tok".to_string()
-    };
-    let request_tg = if llm.busy_slots > 0 {
-        format!("{} tok", grouped_u64(llm.request_generated_tokens))
-    } else {
-        "— tok".to_string()
-    };
-    let total_pp = format!("{} tok", grouped_f64(llm.prompt_total));
-    let total_tg = format!("{} tok", grouped_f64(llm.generated_total));
-    let cache_available = llm.prompt_cached_total.is_some();
+    let total_pp = llm.prompt_total.map_or_else(
+        || "— tok".to_string(),
+        |value| format!("{} tok", grouped_f64(value)),
+    );
+    let total_tg = llm.generated_total.map_or_else(
+        || "— tok".to_string(),
+        |value| format!("{} tok", grouped_f64(value)),
+    );
     let cache = llm
         .prompt_cached_total
         .map(grouped_f64)
         .unwrap_or_else(|| "—".to_string());
-    let cache_color = if cache_available { CYAN } else { MUTED };
-    let cache_share = llm.prompt_cached_total.and_then(|cached| {
-        (llm.prompt_total > 0.0).then_some((cached / llm.prompt_total * 100.0).clamp(0.0, 100.0))
-    });
-    let spec_total_acceptance = (llm.spec_draft_tokens > 0.0)
-        .then_some((llm.spec_accepted_tokens / llm.spec_draft_tokens * 100.0).clamp(0.0, 100.0));
+    let cache_color = if llm.prompt_cached_total.is_some() {
+        CYAN
+    } else {
+        MUTED
+    };
+    let cache_share = llm
+        .prompt_cached_total
+        .zip(llm.prompt_total)
+        .and_then(|(cached, total)| {
+            (total > 0.0).then_some((cached / total * 100.0).clamp(0.0, 100.0))
+        });
+    let spec_total_acceptance = llm
+        .spec_draft_tokens
+        .zip(llm.spec_accepted_tokens)
+        .and_then(|(draft, accepted)| {
+            (draft > 0.0).then_some((accepted / draft * 100.0).clamp(0.0, 100.0))
+        });
+    let req = match (llm.active_requests, llm.deferred_requests) {
+        (Some(active), Some(deferred)) => format!("{active:.0}/{deferred:.0}"),
+        _ => "—".to_string(),
+    };
+    let req_color = if llm.active_requests.is_some() && llm.deferred_requests.is_some() {
+        WHITE
+    } else {
+        MUTED
+    };
 
-    let pp_active = llm.prompt_tps > 0.05;
-    let tg_active = llm.generation_tps > 0.05;
+    let pp_active = llm.prompt_tps.is_some_and(|value| value > 0.05);
+    let tg_active = llm.generation_tps.is_some_and(|value| value > 0.05);
     let pp_header_color = if pp_active { CYAN } else { MUTED };
     let tg_header_color = if tg_active { ORK_GREEN } else { MUTED };
     let pp_live_color = if pp_active { CYAN } else { MUTED };
@@ -1518,10 +1545,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         value_span(&slots, CYAN),
         llm_sep(),
         label_span("REQ "),
-        value_span(
-            &format!("{:.0}/{:.0}", llm.active_requests, llm.deferred_requests),
-            WHITE,
-        ),
+        value_span(&req, req_color),
         llm_sep(),
         value_span(&mtp, mtp_color),
         llm_sep(),
@@ -1595,13 +1619,19 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         Line::from(vec![
             label_span(" AVG (LIFE) "),
             llm_metric_cell(
-                &format!("{:.1} tok/s", llm.prompt_avg_tps),
+                &llm.prompt_avg_tps.map_or_else(
+                    || "— tok/s".to_string(),
+                    |value| format!("{value:.1} tok/s"),
+                ),
                 metric_width,
                 MUTED,
                 false,
             ),
             llm_metric_cell(
-                &format!("{:.1} tok/s", llm.generation_avg_tps),
+                &llm.generation_avg_tps.map_or_else(
+                    || "— tok/s".to_string(),
+                    |value| format!("{value:.1} tok/s"),
+                ),
                 metric_width,
                 MUTED,
                 false,
@@ -1652,13 +1682,15 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         lines.push(Line::from(vec![
             label_span(" TIME       "),
             llm_metric_cell(
-                &format!("{:.1} s", llm.prompt_seconds_total),
+                &llm.prompt_seconds_total
+                    .map_or_else(|| "— s".to_string(), |value| format!("{value:.1} s")),
                 metric_width,
                 MUTED,
                 false,
             ),
             llm_metric_cell(
-                &format!("{:.1} s", llm.generation_seconds_total),
+                &llm.generation_seconds_total
+                    .map_or_else(|| "— s".to_string(), |value| format!("{value:.1} s")),
                 metric_width,
                 MUTED,
                 false,
@@ -1986,9 +2018,9 @@ fn llm_spec_row(
     if !llm.spec_enabled {
         return Line::from(vec![label_span(" SPEC       "), value_span("OFF", MUTED)]);
     }
-    if llm.spec_drafts_total == 0.0
-        && llm.spec_draft_tokens == 0.0
-        && llm.spec_accepted_tokens == 0.0
+    if llm.spec_drafts_total.is_none()
+        && llm.spec_draft_tokens.is_none()
+        && llm.spec_accepted_tokens.is_none()
     {
         // The server reports speculative decoding as enabled but exposes no
         // draft/accept counters (older builds, or an idle server). Say so
@@ -1999,13 +2031,16 @@ fn llm_spec_row(
             llm_metric_cell("—", metric_width, MUTED, false),
         ]);
     }
-    let draft = format!("{} draft", grouped_f64(llm.spec_draft_tokens));
-    let accepted = match spec_total_acceptance {
-        Some(rate) => format!(
-            "{} accepted · {rate:.1}%",
-            grouped_f64(llm.spec_accepted_tokens)
-        ),
-        None => format!("{} accepted", grouped_f64(llm.spec_accepted_tokens)),
+    let draft = llm.spec_draft_tokens.map_or_else(
+        || "— draft".to_string(),
+        |value| format!("{} draft", grouped_f64(value)),
+    );
+    let accepted = match (spec_total_acceptance, llm.spec_accepted_tokens) {
+        (Some(rate), Some(accepted)) => {
+            format!("{} accepted · {rate:.1}%", grouped_f64(accepted))
+        }
+        (None, Some(accepted)) => format!("{} accepted", grouped_f64(accepted)),
+        (_, None) => "— accepted".to_string(),
     };
     Line::from(vec![
         label_span(" SPEC TOK   "),
@@ -2049,13 +2084,13 @@ fn grouped_f64(value: f64) -> String {
 fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     if llm.reconnecting {
         ("RECONNECTING", YELLOW)
-    } else if llm.generation_tps > 0.05 {
+    } else if llm.generation_tps.is_some_and(|value| value > 0.05) {
         ("GENERATING", ORK_GREEN)
-    } else if llm.prompt_tps > 0.05 {
+    } else if llm.prompt_tps.is_some_and(|value| value > 0.05) {
         ("PREFILL", CYAN)
-    } else if llm.busy_slots > 0 || llm.active_requests > 0.0 {
+    } else if llm.busy_slots > 0 || llm.active_requests.is_some_and(|value| value > 0.0) {
         ("PROCESSING", YELLOW)
-    } else if llm.deferred_requests > 0.0 {
+    } else if llm.deferred_requests.is_some_and(|value| value > 0.0) {
         ("QUEUED", YELLOW)
     } else {
         ("IDLE", MUTED)
@@ -5399,8 +5434,8 @@ mod tests {
         state.observe_llm_sample(&LlmStats {
             connected: true,
             metrics_available: true,
-            prompt_tps: 1200.0,
-            generation_tps: 75.0,
+            prompt_tps: Some(1200.0),
+            generation_tps: Some(75.0),
             ..LlmStats::default()
         });
         assert_eq!(state.llm_prefill_history.len(), 1);
@@ -5411,8 +5446,8 @@ mod tests {
         state.observe_llm_sample(&LlmStats {
             connected: true,
             reconnecting: true,
-            prompt_tps: 9999.0,
-            generation_tps: 9999.0,
+            prompt_tps: Some(9999.0),
+            generation_tps: Some(9999.0),
             ..LlmStats::default()
         });
         assert_eq!(state.llm_prefill_history.len(), 1);
@@ -5428,8 +5463,8 @@ mod tests {
         state.observe_llm_sample(&LlmStats {
             connected: true,
             metrics_available: false,
-            prompt_tps: 9999.0,
-            generation_tps: 9999.0,
+            prompt_tps: Some(9999.0),
+            generation_tps: Some(9999.0),
             ..LlmStats::default()
         });
         assert!(state.llm_prefill_history.is_empty());
@@ -5710,9 +5745,9 @@ mod tests {
     fn spec_row_shows_values_when_any_counter_reported() {
         let llm = LlmStats {
             spec_enabled: true,
-            spec_drafts_total: 3.0,
-            spec_draft_tokens: 12.0,
-            spec_accepted_tokens: 9.0,
+            spec_drafts_total: Some(3.0),
+            spec_draft_tokens: Some(12.0),
+            spec_accepted_tokens: Some(9.0),
             ..LlmStats::default()
         };
         let row = llm_spec_row(&llm, 24, Some(75.0));
@@ -6507,6 +6542,29 @@ mod tests {
             !text.contains("0.0%"),
             "no capacity means the percentage is unknown:\n{text}"
         );
+    }
+
+    #[test]
+    fn absent_metrics_render_as_unavailable_not_zero() {
+        // Reachable server, but every /metrics-derived metric is absent: the
+        // panel must show `—`, never a fabricated 0 / 0.0 / 0 tok/s.
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            context_size: 4096,
+            context_used: Some(100),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 100, 14);
+        assert!(!text.contains("0 tok"), "no fabricated total: {text}");
+        assert!(!text.contains("0.0 tok/s"), "no fabricated rate: {text}");
+        assert!(!text.contains("0.0 s"), "no fabricated time: {text}");
+        assert!(
+            !text.contains("0/0"),
+            "no fabricated request counts: {text}"
+        );
+        assert!(text.contains('—'), "unavailable values must render —");
     }
 
     #[test]

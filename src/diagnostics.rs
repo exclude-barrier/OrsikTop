@@ -348,13 +348,19 @@ fn connected_probe_report(stats: &LlmStats) -> String {
             stats.busy_slots, stats.slot_count
         ),
     ];
-    if stats.metrics_available {
+    if stats.metrics_available && (stats.prompt_tps.is_some() || stats.generation_tps.is_some()) {
         lines.push(format!(
-            "  rate       : prompt {:.1} tps, generation {:.1} tps",
-            stats.prompt_tps, stats.generation_tps
+            "  rate       : prompt {} tps, generation {} tps",
+            tps_text(stats.prompt_tps),
+            tps_text(stats.generation_tps)
         ));
     }
     lines.join("\n")
+}
+
+/// A live throughput value, or `—` when it is unavailable (never 0.0).
+fn tps_text(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".to_string(), |value| format!("{value:.1}"))
 }
 
 /// Live bounded llama probe (750 ms connect + 1200 ms total, see llama.rs).
@@ -654,6 +660,38 @@ mod tests {
     }
 
     #[test]
+    fn probe_report_omits_rate_when_throughput_is_absent() {
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            prompt_tps: None,
+            generation_tps: None,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(
+            !report.contains("rate"),
+            "absent throughput must not print a rate: {report}"
+        );
+    }
+
+    #[test]
+    fn probe_report_marks_a_missing_rate_side_unavailable() {
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            prompt_tps: Some(12.5),
+            generation_tps: None,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(
+            report.contains("prompt 12.5 tps, generation — tps"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
     fn probe_report_includes_watermark_and_rate_when_metrics_are_available() {
         let stats = LlmStats {
             connected: true,
@@ -661,8 +699,8 @@ mod tests {
             context_used: Some(1000),
             context_size: 4096,
             context_high_watermark: Some(2048),
-            prompt_tps: 12.5,
-            generation_tps: 34.5,
+            prompt_tps: Some(12.5),
+            generation_tps: Some(34.5),
             slot_count: 2,
             busy_slots: 1,
             ..Default::default()
