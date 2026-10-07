@@ -80,8 +80,11 @@ struct Args {
     )]
     interval_ms: Option<u64>,
 
-    /// NVIDIA GPU to monitor: a PCI bus ID (`0000:41:00.0`), a vendor UUID
-    /// (`GPU-…`), or a legacy NVML index. Overrides the saved setting.
+    /// GPU to monitor: a PCI bus ID (`0000:41:00.0`), a vendor UUID (`GPU-…`
+    /// or a MIG `MIG-…`), or a legacy index. Resolves through the shared
+    /// vendor-neutral selector; the index is the n-th NVIDIA device on a
+    /// machine that has one, else the n-th device overall. Overrides the saved
+    /// setting.
     #[arg(long, env = "ORSIKTOP_GPU")]
     gpu: Option<String>,
 

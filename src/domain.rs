@@ -352,7 +352,16 @@ impl GpuSelector {
         if let Ok(index) = value.parse::<u32>() {
             return Self::Index(index);
         }
-        if value.starts_with("GPU-") || value.starts_with("gpu-") || is_mig_uuid(value) {
+        // Canonicalize only the case of the vendor prefix; the UUID body is
+        // left as typed (NVML emits upper-case hex, and silently lower-casing
+        // every byte could match a different, non-existent identity).
+        if let Some(rest) = value.strip_prefix("gpu-") {
+            return Self::Uuid(format!("GPU-{rest}"));
+        }
+        if let Some(rest) = value.strip_prefix("mig-") {
+            return Self::Uuid(format!("MIG-{rest}"));
+        }
+        if value.starts_with("GPU-") || is_mig_uuid(value) {
             return Self::Uuid(value.to_string());
         }
         Self::PciBusId(value.to_string())
@@ -741,6 +750,18 @@ mod tests {
         assert_eq!(
             GpuSelector::parse("MIG-GPU-111/1/0"),
             GpuSelector::Uuid("MIG-GPU-111/1/0".to_string())
+        );
+    }
+
+    #[test]
+    fn selector_parse_canonicalizes_only_the_vendor_prefix_case() {
+        assert_eq!(
+            GpuSelector::parse("gpu-abc"),
+            GpuSelector::Uuid("GPU-abc".to_string())
+        );
+        assert_eq!(
+            GpuSelector::parse("mig-1a2b3c4d5e6f7890abcdef0123456789"),
+            GpuSelector::Uuid("MIG-1a2b3c4d5e6f7890abcdef0123456789".to_string())
         );
     }
 }
