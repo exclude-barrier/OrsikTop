@@ -108,36 +108,31 @@ impl DeviceId {
             .unwrap_or("")
     }
 
-    /// `(gpu_instance_id, compute_instance_id)` when this is a MIG child
-    /// whose UUID carries them (`MIG-GPU-<parent>-<gi>-<ci>`). Synthetic
-    /// fallback keys carry no instance ids, so this is `None` for them.
+    /// `(gpu_instance_id, compute_instance_id)` when this is a MIG child whose
+    /// UUID encodes them in the older NVIDIA slash form
+    /// `MIG-<GPU-UUID>/<GI>/<CI>`. A modern opaque `MIG-<uuid>` does not encode
+    /// the ids, so this is `None` there — and for the synthetic
+    /// `<parent>#mig-<slot>` fallback — never a fabricated pair.
     pub fn mig_instance(&self) -> Option<(u32, u32)> {
-        let value = self.uuid.as_deref()?;
-        if !is_mig_uuid(value) {
-            return None;
-        }
-        let parts: Vec<&str> = value.rsplit('-').take(2).collect();
-        let ci = parts[0].parse::<u32>().ok()?;
-        let gi = parts[1].parse::<u32>().ok()?;
-        Some((gi, ci))
+        self.uuid.as_deref().and_then(mig_instance_of_mig_uuid)
     }
 
-    /// The physical parent's GPU UUID when this is a MIG child. For a real
-    /// MIG UUID (`MIG-GPU-<parent>-<gi>-<ci>`) this strips the `MIG-`
-    /// prefix and the instance ids; for a synthetic fallback key
-    /// (`<parent-uuid>#mig-<slot>`) it strips the suffix.
+    /// The physical parent's GPU UUID when this is a MIG child. For the older
+    /// slash form `MIG-<GPU-UUID>/<GI>/<CI>` this strips the `MIG-` prefix and
+    /// the instance fields; for a synthetic fallback key
+    /// (`<parent-uuid>#mig-<slot>`) it strips the suffix. A modern opaque
+    /// `MIG-<uuid>` does not encode its parent, so this is `None`; the parent
+    /// association comes from the NVML device topology, not the UUID string.
     pub fn mig_parent_uuid(&self) -> Option<String> {
         let value = self.uuid.as_deref()?;
         if let Some(stripped) = value.strip_prefix("MIG-") {
-            let parent = stripped
-                .rsplit('-')
-                .skip(2)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("-");
-            return (!parent.is_empty()).then_some(parent);
+            // `MIG-<parent>/<GI>/<CI>`: parent is everything before the final
+            // two slash-separated NUMERIC fields; anything else (e.g. a modern
+            // opaque UUID that happens to contain a slash) encodes no parent.
+            let (without_ci, ci) = stripped.rsplit_once('/')?;
+            let (parent, gi) = without_ci.rsplit_once('/')?;
+            let numeric = gi.parse::<u32>().is_ok() && ci.parse::<u32>().is_ok();
+            return (numeric && !parent.is_empty()).then(|| parent.to_string());
         }
         value
             .rfind("#mig-")
@@ -211,19 +206,32 @@ pub(crate) fn parse_pci_bdf(text: &str) -> Option<String> {
     valid.then(|| normalize_pci_bdf(&text.to_ascii_lowercase()))
 }
 
-/// True when `value` is an NVIDIA MIG device UUID: `MIG-GPU-<parent>-<gi>-<ci>`
-/// — the `MIG-` prefix with a numeric compute-instance id and GPU-instance id
-/// tail. Physical GPU UUIDs (`GPU-...`) are never MIG.
+/// True when `value` is an NVIDIA MIG device UUID.
+///
+/// The `MIG-` prefix is the only universal marker: modern drivers return
+/// opaque `MIG-<uuid>` identities (which do not encode the GPU/compute
+/// instance ids), and older drivers used `MIG-<GPU-UUID>/<GI>/<CI>`. Physical
+/// GPU UUIDs (`GPU-...`) are never MIG, and a bare `MIG-` is not an identity.
 pub(crate) fn is_mig_uuid(value: &str) -> bool {
-    if !value.starts_with("MIG-") {
-        return false;
+    value
+        .strip_prefix("MIG-")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Extract `(gpu_instance_id, compute_instance_id)` from a MIG UUID, but only
+/// when it carries them in the older NVIDIA slash form
+/// `MIG-<GPU-UUID>/<GI>/<CI>`. A modern opaque `MIG-<uuid>` yields `None`: the
+/// ids are not encoded, and inventing them would mis-attribute processes.
+pub(crate) fn mig_instance_of_mig_uuid(value: &str) -> Option<(u32, u32)> {
+    let rest = value.strip_prefix("MIG-")?;
+    let (without_ci, ci) = rest.rsplit_once('/')?;
+    let (parent, gi) = without_ci.rsplit_once('/')?;
+    if parent.is_empty() || gi.is_empty() || ci.is_empty() {
+        return None;
     }
-    let parts: Vec<&str> = value.rsplit('-').take(2).collect();
-    parts.len() == 2
-        && parts[0].chars().all(|c| c.is_ascii_digit())
-        && !parts[0].is_empty()
-        && parts[1].chars().all(|c| c.is_ascii_digit())
-        && !parts[1].is_empty()
+    let gi = gi.parse::<u32>().ok()?;
+    let ci = ci.parse::<u32>().ok()?;
+    Some((gi, ci))
 }
 
 /// Vendor family of a discovered GPU, independent of the provider backend.
@@ -670,29 +678,42 @@ mod tests {
 
     #[test]
     fn mig_uuid_detection() {
+        // Modern opaque MIG identity: the `MIG-` prefix is the only marker.
+        assert!(is_mig_uuid("MIG-1a2b3c4d5e6f7890abcdef0123456789"));
+        assert!(is_mig_uuid("MIG-1a2b3c4d-5e6f-7890-abcd-ef0123456789"));
+        // Legacy slash form is also a MIG identity.
         assert!(is_mig_uuid(
-            "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2"
+            "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789/1/2"
         ));
+        // Physical GPU is never MIG; a bare prefix is not an identity.
         assert!(!is_mig_uuid("GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789"));
-        assert!(!is_mig_uuid(
-            "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1"
-        ));
-        assert!(!is_mig_uuid("MIG-GPU-1a2b3c4d-x-2"));
         assert!(!is_mig_uuid("MIG-"));
+        assert!(!is_mig_uuid("MIG"));
+        assert!(!is_mig_uuid(""));
     }
 
     #[test]
-    fn mig_uuid_parses_instance_and_parent() {
-        let id = DeviceId::new(
-            None,
-            Some("MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2".into()),
-        );
-        assert_eq!(id.mig_instance(), Some((1, 2)));
-        assert_eq!(
-            id.mig_parent_uuid().as_deref(),
-            Some("GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789")
-        );
-        assert_eq!(id.key(), "MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2");
+    fn mig_instance_and_parent_come_only_from_the_legacy_slash_form() {
+        let legacy = DeviceId::new(None, Some("MIG-GPU-parent/1/2".into()));
+        assert_eq!(legacy.mig_instance(), Some((1, 2)));
+        assert_eq!(legacy.mig_parent_uuid().as_deref(), Some("GPU-parent"));
+        assert_eq!(legacy.key(), "MIG-GPU-parent/1/2");
+
+        // A modern opaque MIG UUID must not fabricate GI/CI or a parent.
+        let opaque = DeviceId::new(None, Some("MIG-1a2b3c4d5e6f7890abcdef0123456789".into()));
+        assert!(is_mig_uuid(opaque.key()));
+        assert_eq!(opaque.mig_instance(), None);
+        assert_eq!(opaque.mig_parent_uuid(), None);
+
+        // The synthetic fallback keeps its parent and carries no instance ids.
+        let synthetic = DeviceId::new(None, Some("GPU-parent#mig-3".into()));
+        assert_eq!(synthetic.mig_instance(), None);
+        assert_eq!(synthetic.mig_parent_uuid().as_deref(), Some("GPU-parent"));
+
+        // A non-numeric slash tail is not a legacy instance tuple: no parent.
+        let bogus = DeviceId::new(None, Some("MIG-a/b/c".into()));
+        assert_eq!(bogus.mig_instance(), None);
+        assert_eq!(bogus.mig_parent_uuid(), None);
     }
 
     #[test]
@@ -707,9 +728,19 @@ mod tests {
 
     #[test]
     fn selector_parse_mig_uuid_is_uuid() {
+        // A modern opaque MIG UUID is a UUID selector, never a PCI BDF.
         assert_eq!(
-            GpuSelector::parse("MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2"),
-            GpuSelector::Uuid("MIG-GPU-1a2b3c4d-5e6f-7890-abcd-ef0123456789-1-2".to_string())
+            GpuSelector::parse("MIG-1a2b3c4d5e6f7890abcdef0123456789"),
+            GpuSelector::Uuid("MIG-1a2b3c4d5e6f7890abcdef0123456789".to_string())
+        );
+        assert!(matches!(
+            GpuSelector::parse("MIG-1a2b3c4d5e6f7890abcdef0123456789"),
+            GpuSelector::Uuid(_)
+        ));
+        // Legacy slash form too.
+        assert_eq!(
+            GpuSelector::parse("MIG-GPU-111/1/0"),
+            GpuSelector::Uuid("MIG-GPU-111/1/0".to_string())
         );
     }
 }

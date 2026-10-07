@@ -68,9 +68,11 @@ pub(crate) fn mig_children_of(
 }
 
 /// Stable key for a MIG child: the MIG UUID the driver reports for the
-/// child handle, else `<parent-uuid>#mig-<slot>` (parent BDF when the
-/// parent has no UUID). A driver UUID that is not MIG-shaped is treated as
-/// absent.
+/// child handle (modern opaque `MIG-<uuid>` or legacy
+/// `MIG-<GPU-UUID>/<GI>/<CI>`), else `<parent-uuid>#mig-<slot>` (parent BDF
+/// when the parent has no UUID). A driver UUID that does not carry the `MIG-`
+/// prefix is treated as absent. A modern opaque MIG UUID is preserved even
+/// though it does not encode the instance ids.
 fn mig_child_key(mig_uuid: Option<&str>, parent: &DeviceId, slot: u32) -> String {
     match mig_uuid {
         Some(uuid) if !uuid.is_empty() && is_mig_uuid(uuid) => uuid.to_string(),
@@ -651,8 +653,19 @@ mod tests {
     fn mig_child_key_prefers_driver_uuid() {
         let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
         assert_eq!(
-            mig_child_key(Some("MIG-GPU-parent-1-0"), &parent, 0),
-            "MIG-GPU-parent-1-0"
+            mig_child_key(Some("MIG-GPU-parent/1/0"), &parent, 0),
+            "MIG-GPU-parent/1/0"
+        );
+    }
+
+    #[test]
+    fn mig_child_key_preserves_a_modern_opaque_mig_uuid() {
+        // A modern driver UUID must not be discarded just because it does not
+        // encode the GPU/compute instance ids.
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        assert_eq!(
+            mig_child_key(Some("MIG-1a2b3c4d5e6f7890abcdef0123456789"), &parent, 0),
+            "MIG-1a2b3c4d5e6f7890abcdef0123456789"
         );
     }
 

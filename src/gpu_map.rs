@@ -616,17 +616,28 @@ mod tests {
     #[test]
     fn attribute_mig_child_when_instance_evidence_matches() {
         let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
-        let children = vec![("MIG-GPU-parent-1-0".to_string(), Some((1, 0)))];
+        let children = vec![("MIG-GPU-parent/1/0".to_string(), Some((1, 0)))];
         let keys = attribute_process_keys(&parent, &children, &[(Some(1), Some(0))]);
         assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].key(), "MIG-GPU-parent-1-0");
+        assert_eq!(keys[0].key(), "MIG-GPU-parent/1/0");
     }
 
     #[test]
     fn attribute_degrades_to_parent_when_no_child_matches() {
         let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
-        let children = vec![("MIG-GPU-parent-1-0".to_string(), Some((1, 0)))];
+        let children = vec![("MIG-GPU-parent/1/0".to_string(), Some((1, 0)))];
         let keys = attribute_process_keys(&parent, &children, &[(Some(2), Some(0))]);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key(), "0000:41:00.0");
+    }
+
+    #[test]
+    fn opaque_mig_child_without_instance_evidence_never_matches() {
+        // A modern opaque MIG child carries no GI/CI, so a placement with
+        // instance ids must not be attributed to it (it degrades to parent).
+        let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
+        let children = vec![("MIG-1a2b3c4d5e6f7890abcdef0123456789".to_string(), None)];
+        let keys = attribute_process_keys(&parent, &children, &[(Some(1), Some(0))]);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key(), "0000:41:00.0");
     }
@@ -643,8 +654,8 @@ mod tests {
     fn attribute_multiple_mig_placements_yield_each_child() {
         let parent = DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into()));
         let children = vec![
-            ("MIG-GPU-parent-1-0".to_string(), Some((1, 0))),
-            ("MIG-GPU-parent-2-0".to_string(), Some((2, 0))),
+            ("MIG-GPU-parent/1/0".to_string(), Some((1, 0))),
+            ("MIG-GPU-parent/2/0".to_string(), Some((2, 0))),
         ];
         let keys = attribute_process_keys(
             &parent,
@@ -652,19 +663,19 @@ mod tests {
             &[(Some(1), Some(0)), (Some(2), Some(0))],
         );
         assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].key(), "MIG-GPU-parent-1-0");
-        assert_eq!(keys[1].key(), "MIG-GPU-parent-2-0");
+        assert_eq!(keys[0].key(), "MIG-GPU-parent/1/0");
+        assert_eq!(keys[1].key(), "MIG-GPU-parent/2/0");
     }
 
     #[test]
     fn mig_child_evidence_maps_to_single_child() {
         let gpus = gpu_list(&["0000:41:00.0"]);
-        let nvml = vec![DeviceId::new(None, Some("MIG-GPU-parent-1-0".into()))];
+        let nvml = vec![DeviceId::new(None, Some("MIG-GPU-parent/1/0".into()))];
         let mapping = map_server_gpus(true, vec![], nvml, &gpus);
         let GpuMapping::Single(device) = mapping else {
             panic!("expected Single, got {mapping:?}");
         };
-        assert_eq!(device.key(), "MIG-GPU-parent-1-0");
+        assert_eq!(device.key(), "MIG-GPU-parent/1/0");
         assert_eq!(device.evidence, GpuEvidence::NvmlCompute);
         // MIG children are not DRM-discovered: name stays empty, vendor unknown.
         assert_eq!(device.name, "");
@@ -678,7 +689,7 @@ mod tests {
         // combiner must still keep both identities distinct.
         let nvml = vec![
             DeviceId::new(Some("0000:41:00.0".into()), Some("GPU-parent".into())),
-            DeviceId::new(None, Some("MIG-GPU-parent-1-0".into())),
+            DeviceId::new(None, Some("MIG-GPU-parent/1/0".into())),
         ];
         let mapping = map_server_gpus(true, vec![], nvml, &gpus);
         let GpuMapping::Multi(devices) = mapping else {
@@ -686,6 +697,6 @@ mod tests {
         };
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].key(), "0000:41:00.0");
-        assert_eq!(devices[1].key(), "MIG-GPU-parent-1-0");
+        assert_eq!(devices[1].key(), "MIG-GPU-parent/1/0");
     }
 }
