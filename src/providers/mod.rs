@@ -73,8 +73,16 @@ pub(crate) fn find_hwmon_for_bdf<S: Sys>(
         {
             score += 1;
         }
-        // Strictly greater only: ties keep the first candidate in dir order.
-        if best.as_ref().is_none_or(|(s, _)| score > *s) {
+        // A higher score wins; on a tie the lexicographically smaller hwmon
+        // name wins, so selection never depends on `read_dir` enumeration
+        // order (which is not a stable contract).
+        let better = match &best {
+            None => true,
+            Some((best_score, best_name)) => {
+                score > *best_score || (score == *best_score && entry.name < *best_name)
+            }
+        };
+        if better {
             best = Some((score, entry.name.clone()));
         }
     }
@@ -196,10 +204,12 @@ mod tests {
     }
 
     #[test]
-    fn hwmon_match_keeps_directory_order_for_identical_candidates() {
+    fn hwmon_match_ties_break_on_hwmon_name_not_directory_order() {
+        // Identical scores: the lexicographically smaller hwmon name wins, so
+        // the result never depends on read_dir enumeration order.
         let mut sys = FixtureSys::default();
-        add_hwmon(&mut sys, "hwmon0", "0000:01:00.0", Some("xe"), true);
         add_hwmon(&mut sys, "hwmon1", "0000:01:00.0", Some("xe"), true);
+        add_hwmon(&mut sys, "hwmon0", "0000:01:00.0", Some("xe"), true);
 
         assert_eq!(
             find_hwmon_for_bdf(&sys, "0000:01:00.0", &["i915", "xe"]),
