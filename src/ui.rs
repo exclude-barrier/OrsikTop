@@ -2362,6 +2362,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
     if system.cpu_topology.is_hybrid() && !system.cpu_topology.physical_core_groups.is_empty() {
         lines.extend(physical_core_minibar_rows(
             &system.per_cpu_usage,
+            &system.cpu_topology.online,
             &system.cpu_topology.physical_core_groups,
             inner.width,
         ));
@@ -2369,6 +2370,7 @@ fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         lines.extend(core_heatmap_rows(
             &system.per_cpu_usage,
             &system.cpu_topology.core_kinds,
+            &system.cpu_topology.online,
             inner.width,
             busiest,
             system.cpu_topology.is_hybrid(),
@@ -2499,6 +2501,7 @@ fn truncate_title(title: &str, max_len: usize) -> String {
 
 fn physical_core_minibar_rows(
     usages: &[f64],
+    online: &[bool],
     cores: &[CpuPhysicalCore],
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -2533,7 +2536,7 @@ fn physical_core_minibar_rows(
         let mut spans = Vec::new();
 
         if let Some(core) = performance.get(row) {
-            let usage = physical_core_average(core, usages);
+            let usage = physical_core_average(core, usages, online);
             let color = physical_core_color(usage, ORK_GREEN);
             spans.push(Span::styled(
                 format!(" P{row}  "),
@@ -2557,7 +2560,7 @@ fn physical_core_minibar_rows(
         }
 
         if let Some(core) = efficiency.get(row) {
-            let usage = physical_core_average(core, usages);
+            let usage = physical_core_average(core, usages, online);
             let color = physical_core_color(usage, CYAN);
             spans.push(Span::styled(
                 format!("E{row}  "),
@@ -2576,10 +2579,15 @@ fn physical_core_minibar_rows(
     lines
 }
 
-fn physical_core_average(core: &CpuPhysicalCore, usages: &[f64]) -> f64 {
+fn physical_core_average(core: &CpuPhysicalCore, usages: &[f64], online: &[bool]) -> f64 {
     let mut sum = 0.0;
     let mut count = 0usize;
     for &cpu in &core.logical_cpus {
+        // Skip offline SMT siblings: their usage slot is a placeholder 0.0 and
+        // would otherwise halve the core's average.
+        if !online.get(cpu).copied().unwrap_or(true) {
+            continue;
+        }
         if let Some(usage) = usages.get(cpu).copied() {
             sum += usage;
             count += 1;
@@ -2634,6 +2642,7 @@ fn mini_core_bar_spans(percent: f64, width: usize, color: Color) -> Vec<Span<'st
 fn core_heatmap_rows(
     usages: &[f64],
     kinds: &[CpuCoreKind],
+    online: &[bool],
     width: u16,
     busiest: Option<usize>,
     show_kind: bool,
@@ -2660,6 +2669,7 @@ fn core_heatmap_rows(
                 core_heatmap_numbered_line(
                     usages,
                     kinds,
+                    online,
                     row * cols,
                     ((row + 1) * cols).min(usages.len()),
                     busiest,
@@ -2670,12 +2680,16 @@ fn core_heatmap_rows(
             .collect();
     }
 
-    compact_core_heatmap_rows(usages, busiest, max_rows, digits)
+    compact_core_heatmap_rows(usages, online, busiest, max_rows, digits)
 }
 
+// A rendering helper with explicit layout parameters; grouping them into a
+// struct would not read better.
+#[allow(clippy::too_many_arguments)]
 fn core_heatmap_numbered_line(
     usages: &[f64],
     kinds: &[CpuCoreKind],
+    online: &[bool],
     start: usize,
     end: usize,
     busiest: Option<usize>,
@@ -2700,6 +2714,18 @@ fn core_heatmap_numbered_line(
         } else {
             ""
         };
+        // An offline hole is not an idle 0% core: show a muted dash.
+        if !online.get(index).copied().unwrap_or(true) {
+            spans.push(Span::styled(
+                format!("{index:0digits$}{suffix}"),
+                Style::default().fg(MUTED),
+            ));
+            spans.push(Span::styled(
+                "\u{2014}".to_string(),
+                Style::default().fg(MUTED),
+            ));
+            continue;
+        }
         let mut label_style = Style::default().fg(MUTED);
         let mut heat_style = Style::default().fg(core_usage_color(usage));
         if busiest == Some(index) {
@@ -2722,6 +2748,7 @@ fn core_heatmap_numbered_line(
 
 fn compact_core_heatmap_rows(
     usages: &[f64],
+    online: &[bool],
     busiest: Option<usize>,
     max_rows: usize,
     digits: usize,
@@ -2742,6 +2769,13 @@ fn compact_core_heatmap_rows(
             Style::default().fg(MUTED),
         )];
         for (index, usage) in usages.iter().copied().enumerate().take(end).skip(start) {
+            if !online.get(index).copied().unwrap_or(true) {
+                spans.push(Span::styled(
+                    "\u{2014}".to_string(),
+                    Style::default().fg(MUTED),
+                ));
+                continue;
+            }
             let mut style = Style::default().fg(core_usage_color(usage));
             if busiest == Some(index) {
                 style = style.add_modifier(Modifier::BOLD);
@@ -5217,7 +5251,44 @@ mod tests {
             kind: CpuCoreKind::Performance,
             logical_cpus: vec![0, 1],
         };
-        assert_eq!(physical_core_average(&core, &[80.0, 20.0]), 50.0);
+        assert_eq!(
+            physical_core_average(&core, &[80.0, 20.0], &[true, true]),
+            50.0
+        );
+    }
+
+    #[test]
+    fn core_heatmap_marks_offline_holes_instead_of_a_zero_percent_core() {
+        let usages = [10.0, 0.0, 30.0, 40.0];
+        let kinds = [
+            CpuCoreKind::Performance,
+            CpuCoreKind::Unknown,
+            CpuCoreKind::Efficiency,
+            CpuCoreKind::Efficiency,
+        ];
+        let online = [true, false, true, true];
+        let rows = core_heatmap_rows(&usages, &kinds, &online, 80, Some(0), true, 4);
+        let text: String = rows
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("01?") && text.contains('—'),
+            "offline hole must render as a muted dash, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn physical_core_average_skips_offline_smt_siblings() {
+        // Thread 1 offline: its 0.0 placeholder must not halve the average.
+        let core = CpuPhysicalCore {
+            kind: CpuCoreKind::Performance,
+            logical_cpus: vec![0, 1],
+        };
+        assert_eq!(
+            physical_core_average(&core, &[80.0, 0.0], &[true, false]),
+            80.0
+        );
     }
 
     #[test]

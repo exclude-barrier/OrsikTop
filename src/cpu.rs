@@ -52,6 +52,10 @@ pub struct CpuTopology {
     pub low_power_cores: Option<usize>,
     pub core_kinds: Vec<CpuCoreKind>,
     pub physical_core_groups: Vec<CpuPhysicalCore>,
+    /// Which CPU ids are actually online, indexed by kernel CPU id (same length
+    /// as `core_kinds`). Offline holes are `false` so the UI never renders them
+    /// as idle 0% cores.
+    pub online: Vec<bool>,
 }
 
 impl CpuTopology {
@@ -98,6 +102,12 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
     // left as `Unknown`.
     let indices = online_cpu_indices(logical_cpus, sys);
     let span = indices.iter().copied().max().map_or(0, |max| max + 1);
+    let mut online = vec![false; span];
+    for &cpu in &indices {
+        if let Some(slot) = online.get_mut(cpu) {
+            *slot = true;
+        }
+    }
 
     let core_groups = read_core_groups(&indices, span, sys);
     let physical_cores = count_unique_groups(&core_groups);
@@ -141,6 +151,7 @@ pub fn detect_topology<S: Sys>(logical_cpus: usize, sys: &S) -> CpuTopology {
         low_power_cores,
         core_kinds,
         physical_core_groups,
+        online,
     }
 }
 
@@ -244,16 +255,14 @@ fn detect_capacity_classes<S: Sys>(
 }
 
 fn classify_capacity_values(capacities: &[Option<u64>]) -> Option<Vec<CpuCoreKind>> {
-    if capacities.is_empty() || capacities.iter().any(Option::is_none) {
-        return None;
-    }
-
-    let values = capacities
+    // Classify only over the CPUs that reported a capacity; an offline hole
+    // (`None`) is left `Unknown` instead of disabling the whole fallback.
+    let present = capacities
         .iter()
-        .map(|value| value.unwrap_or_default())
+        .filter_map(|value| *value)
         .collect::<Vec<_>>();
-    let min = *values.iter().min()?;
-    let max = *values.iter().max()?;
+    let min = *present.iter().min()?;
+    let max = *present.iter().max()?;
 
     // Ignore tiny differences. Scheduler capacities are static capabilities,
     // but a 5% floor keeps this from turning minor calibration differences into
@@ -263,14 +272,12 @@ fn classify_capacity_values(capacities: &[Option<u64>]) -> Option<Vec<CpuCoreKin
     }
 
     let split = min.saturating_add(max).div_ceil(2);
-    let kinds = values
-        .into_iter()
-        .map(|value| {
-            if value >= split {
-                CpuCoreKind::Performance
-            } else {
-                CpuCoreKind::Efficiency
-            }
+    let kinds = capacities
+        .iter()
+        .map(|value| match value {
+            Some(value) if *value >= split => CpuCoreKind::Performance,
+            Some(_) => CpuCoreKind::Efficiency,
+            None => CpuCoreKind::Unknown,
         })
         .collect::<Vec<_>>();
 
@@ -293,38 +300,30 @@ fn detect_smt_classes<S: Sys>(indices: &[usize], span: usize, sys: &S) -> Option
 }
 
 fn classify_sibling_counts(counts: &[Option<usize>]) -> Option<Vec<CpuCoreKind>> {
-    if counts.is_empty() || counts.iter().any(Option::is_none) {
-        return None;
-    }
-
-    let values = counts
-        .iter()
-        .map(|value| value.unwrap_or_default())
-        .collect::<Vec<_>>();
-    let min = *values.iter().min()?;
-    let max = *values.iter().max()?;
+    // Classify only over the CPUs that reported sibling counts; an offline hole
+    // stays `Unknown` and does not disable the fallback.
+    let present = counts.iter().filter_map(|value| *value).collect::<Vec<_>>();
+    let min = *present.iter().min()?;
+    let max = *present.iter().max()?;
     if min == 0 || min == max {
         return None;
     }
 
-    let kinds = values
-        .into_iter()
-        .map(|value| {
-            if value == max {
-                CpuCoreKind::Performance
-            } else if value == min {
-                CpuCoreKind::Efficiency
-            } else {
+    let mut in_between = false;
+    let kinds = counts
+        .iter()
+        .map(|value| match value {
+            Some(value) if *value == max => CpuCoreKind::Performance,
+            Some(value) if *value == min => CpuCoreKind::Efficiency,
+            Some(_) => {
+                in_between = true;
                 CpuCoreKind::Unknown
             }
+            None => CpuCoreKind::Unknown,
         })
         .collect::<Vec<_>>();
 
-    (!kinds
-        .iter()
-        .any(|kind| matches!(kind, CpuCoreKind::Unknown))
-        && has_both_core_kinds(&kinds))
-    .then_some(kinds)
+    (!in_between && has_both_core_kinds(&kinds)).then_some(kinds)
 }
 
 fn read_core_groups<S: Sys>(indices: &[usize], span: usize, sys: &S) -> Vec<Option<String>> {
@@ -363,14 +362,16 @@ fn build_physical_core_groups(
     groups: &[Option<String>],
     kinds: &[CpuCoreKind],
 ) -> Vec<CpuPhysicalCore> {
-    if groups.len() != kinds.len() || groups.is_empty() || groups.iter().any(Option::is_none) {
+    if groups.len() != kinds.len() || groups.is_empty() {
         return Vec::new();
     }
 
     let mut keyed = Vec::<(String, CpuPhysicalCore)>::new();
     for (logical_cpu, (group, kind)) in groups.iter().zip(kinds).enumerate() {
+        // An offline hole has no group; skip it rather than dropping the whole
+        // grouping.
         let Some(key) = group.as_ref() else {
-            return Vec::new();
+            continue;
         };
 
         if let Some((_, core)) = keyed.iter_mut().find(|(existing, _)| existing == key) {
@@ -399,16 +400,13 @@ fn build_physical_core_groups(
 }
 
 fn count_unique_groups(groups: &[Option<String>]) -> Option<usize> {
-    if groups.is_empty() || groups.iter().any(Option::is_none) {
+    // Count the distinct groups of the online CPUs; offline holes are ignored.
+    // No group at all means the physical-core count is unknown, not zero.
+    let present = groups.iter().filter_map(Option::as_ref).collect::<Vec<_>>();
+    if present.is_empty() {
         return None;
     }
-    Some(
-        groups
-            .iter()
-            .filter_map(Option::as_ref)
-            .collect::<HashSet<_>>()
-            .len(),
-    )
+    Some(present.into_iter().collect::<HashSet<_>>().len())
 }
 
 fn count_kind_groups(
@@ -678,6 +676,36 @@ mod fixture_tests {
         assert_eq!(topology.core_kinds[5], CpuCoreKind::Performance);
         assert_eq!(topology.core_kinds[6], CpuCoreKind::Efficiency);
         assert!(topology.is_hybrid());
+    }
+
+    #[test]
+    fn capacity_fallback_and_core_grouping_tolerate_offline_holes() {
+        // Online 0,2-3 (cpu1 offline): capacity classification and physical-core
+        // grouping must resolve over the online CPUs; the hole stays Unknown.
+        let mut fixture = FixtureSys::default();
+        fixture.file(
+            "/proc/cpuinfo",
+            "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: Ryzen 9\n",
+        );
+        fixture.file("/sys/devices/system/cpu/online", "0,2-3\n");
+        for (cpu, capacity) in [(0u32, "1024"), (2, "512"), (3, "512")] {
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"),
+                capacity,
+            );
+            fixture.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"),
+                cpu.to_string(),
+            );
+        }
+
+        let topology = detect_topology(4, &fixture);
+        assert_eq!(topology.logical_cpus, 3);
+        assert_eq!(topology.core_kinds[0], CpuCoreKind::Performance);
+        assert_eq!(topology.core_kinds[1], CpuCoreKind::Unknown, "offline hole");
+        assert_eq!(topology.core_kinds[2], CpuCoreKind::Efficiency);
+        assert_eq!(topology.core_kinds[3], CpuCoreKind::Efficiency);
+        assert_eq!(topology.physical_cores, Some(3));
     }
 
     #[test]
