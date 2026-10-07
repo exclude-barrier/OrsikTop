@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-10-08
+
 ### Fixed
 
 - A reachable `/metrics` endpoint no longer turns an individually missing metric
