@@ -4,6 +4,21 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A reachable `/metrics` endpoint no longer turns an individually missing metric
+  into a fabricated `0`: every metric-derived value is now optional, and an
+  absent metric renders as `—` in the TUI and `orsiktop diag`, while a metric
+  that was genuinely reported as `0` still shows `0`.
+- Live and lifetime throughput become `—` when the aggregate counters are
+  absent instead of reporting a confident `0 tok/s`; a missing counter is never
+  stored as the delta baseline, so a reappearing counter cannot produce a
+  spurious throughput spike.
+- Speculative acceptance requires both a present draft delta and a present
+  accepted delta; a missing accepted counter is unknown, not `0 accepted`.
+- GPU hwmon selection breaks equal-score ties by hwmon name rather than raw
+  directory enumeration order.
+
 ## [0.2.9] - 2026-10-07
 
 ### Changed
