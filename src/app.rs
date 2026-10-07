@@ -658,11 +658,12 @@ fn spawn_fast_worker(
                 // Unknown when /proc/loadavg is unreadable: kept as `None`
                 // and rendered `—`, never silently turned into a fake zero.
                 let load_average = read_load_average();
-                let per_cpu_usage = system
+                let per_cpu_pairs = system
                     .cpus()
                     .iter()
-                    .map(|cpu| cpu.cpu_usage() as f64)
+                    .map(|cpu| (cpu.name(), cpu.cpu_usage()))
                     .collect::<Vec<_>>();
+                let per_cpu_usage = per_cpu_usage_by_id(&per_cpu_pairs);
                 let topology = cpu_topology
                     .get_or_insert_with(|| detect_cpu_topology(per_cpu_usage.len()))
                     .clone();
@@ -763,6 +764,33 @@ impl ProcessCache {
     fn retain(&mut self, live: impl Iterator<Item = ProcessIdentity>) {
         let live: std::collections::HashSet<_> = live.collect();
         self.entries.retain(|identity, _| live.contains(identity));
+    }
+}
+
+/// Per-CPU usage indexed by kernel CPU id (matching the id-indexed topology
+/// vectors), so a non-prefix online set does not misalign the heatmap. sysinfo
+/// only reports the online CPUs; offline holes stay `0.0`. When the ids are
+/// not recoverable from the names the compact order is kept.
+fn per_cpu_usage_by_id(cpus: &[(&str, f32)]) -> Vec<f64> {
+    let ids: Option<Vec<usize>> = cpus
+        .iter()
+        .map(|(name, _)| {
+            name.strip_prefix("cpu")
+                .and_then(|id| id.parse::<usize>().ok())
+        })
+        .collect();
+    match ids {
+        Some(ids) => {
+            let span = ids.iter().copied().max().map_or(0, |max| max + 1);
+            let mut usage = vec![0.0; span];
+            for ((_, value), id) in cpus.iter().zip(ids) {
+                if let Some(slot) = usage.get_mut(id) {
+                    *slot = *value as f64;
+                }
+            }
+            usage
+        }
+        None => cpus.iter().map(|(_, value)| *value as f64).collect(),
     }
 }
 
@@ -1058,6 +1086,21 @@ fn sleep_until_next_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_cpu_usage_is_indexed_by_kernel_cpu_id_with_holes() {
+        // Online set 0,2-3 (cpu1 offline): usage lands at its ids, hole stays 0.
+        let usage = per_cpu_usage_by_id(&[("cpu0", 10.0), ("cpu2", 30.0), ("cpu3", 40.0)]);
+        assert_eq!(usage, vec![10.0, 0.0, 30.0, 40.0]);
+
+        // Non-prefix start (cpuset/isolcpus): ids preserved, holes zeroed.
+        let usage = per_cpu_usage_by_id(&[("cpu4", 4.0), ("cpu5", 5.0)]);
+        assert_eq!(usage, vec![0.0, 0.0, 0.0, 0.0, 4.0, 5.0]);
+
+        // Unparseable names fall back to compact order.
+        let usage = per_cpu_usage_by_id(&[("weird", 1.0), ("other", 2.0)]);
+        assert_eq!(usage, vec![1.0, 2.0]);
+    }
 
     #[test]
     fn cache_reuses_stable_metadata_for_same_identity() {
