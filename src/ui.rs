@@ -6073,7 +6073,7 @@ mod tests {
             ..Default::default()
         };
         let child = GpuStats {
-            device: DeviceId::new(None, Some(format!("MIG-{parent_uuid}-1-0"))),
+            device: DeviceId::new(None, Some(format!("MIG-{parent_uuid}/1/0"))),
             ..Default::default()
         };
         let parent_mapped = MappedGpu {
@@ -6104,7 +6104,7 @@ mod tests {
         ));
         // A child of a different physical GPU never matches.
         let foreign = GpuStats {
-            device: DeviceId::new(None, Some("MIG-GPU-other-1-0".into())),
+            device: DeviceId::new(None, Some("MIG-GPU-other/1/0".into())),
             ..Default::default()
         };
         assert!(!gpu_in_mapping(&foreign, &GpuMapping::Single(child_mapped)));
