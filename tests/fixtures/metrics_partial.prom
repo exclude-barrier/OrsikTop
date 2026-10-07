@@ -1,0 +1,7 @@
+# A reachable /metrics payload that omits most metrics.
+# `prompt_tokens_total` is present with a value; `requests_processing` is
+# present with a *real* zero. Everything else (generated counters, seconds
+# counters, deferred requests, n_tokens_max, speculative counters) is absent
+# and must stay unavailable rather than becoming a fabricated zero.
+llamacpp:prompt_tokens_total 5000
+llamacpp:requests_processing 0

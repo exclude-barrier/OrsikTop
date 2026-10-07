@@ -1241,7 +1241,7 @@ mod tests {
         let mut last_good = None;
         let good = LlmStats {
             connected: true,
-            prompt_tps: 123.0,
+            prompt_tps: Some(123.0),
             ..LlmStats::default()
         };
         let fresh = stabilize_llm_sample(good, &mut last_good, now, Duration::from_millis(2500));
@@ -1260,7 +1260,7 @@ mod tests {
         );
         assert!(held.connected);
         assert!(held.reconnecting);
-        assert_eq!(held.prompt_tps, 123.0);
+        assert_eq!(held.prompt_tps, Some(123.0));
     }
 
     #[test]
@@ -1925,6 +1925,71 @@ mod tests {
         (addr, stop, handle)
     }
 
+    /// A mock whose `/metrics` returns 200 with the given body; `/slots` is 501.
+    fn spawn_body_metrics_server(
+        body: &'static str,
+    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(path) = read_request_path(&mut stream) else {
+                            continue;
+                        };
+                        if path.contains("/metrics") {
+                            write_http(&mut stream, body, "text/plain");
+                        } else if path.contains("/props") {
+                            let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
+                            write_http(&mut stream, &body, content_type);
+                        } else {
+                            write_http_status(&mut stream, "501 Not Implemented", "no slots");
+                        }
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    #[test]
+    fn partial_metrics_payload_keeps_absent_metrics_unavailable_not_zero() {
+        // Reachable /metrics with only a prompt counter and an explicit zero
+        // request counter; every other metric must stay unavailable, not 0.
+        let body = include_str!("../tests/fixtures/metrics_partial.prom");
+        let (addr, stop, handle) = spawn_body_metrics_server(body);
+        let mut monitor = crate::llama::LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+        let stats = monitor.sample();
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert!(
+            stats.metrics_available,
+            "a partial payload is still available"
+        );
+        // Present metric -> real value; present zero -> real zero.
+        assert_eq!(stats.prompt_total, Some(5000.0));
+        assert_eq!(stats.active_requests, Some(0.0));
+        // Absent metrics -> unavailable, never a fabricated zero.
+        assert_eq!(stats.generated_total, None);
+        assert_eq!(stats.prompt_seconds_total, None);
+        assert_eq!(stats.prompt_avg_tps, None);
+        assert_eq!(stats.generation_avg_tps, None);
+        assert_eq!(stats.deferred_requests, None);
+        assert_eq!(stats.context_high_watermark, None);
+        assert_eq!(stats.spec_drafts_total, None);
+        // No slot pairing and no aggregate counters -> live throughput —.
+        assert_eq!((stats.prompt_tps, stats.generation_tps), (None, None));
+    }
+
     #[test]
     fn metrics_disabled_still_exposes_slot_state() {
         // Regression: a 501 on /metrics must not discard a healthy /slots
@@ -1972,7 +2037,7 @@ mod tests {
             "an empty /metrics body carries no metric data"
         );
         assert!(stats.slots_available);
-        assert_eq!(stats.prompt_total, 0.0);
+        assert_eq!(stats.prompt_total, None);
         assert!(
             stats.error.contains("no metrics"),
             "the reason must be stated, got: {:?}",
@@ -1990,7 +2055,8 @@ mod tests {
 
         let first = monitor.sample();
         assert!(first.metrics_available);
-        assert_eq!((first.prompt_tps, first.generation_tps), (0.0, 0.0));
+        // First sample establishes the baseline: no fabricated rate yet.
+        assert_eq!((first.prompt_tps, first.generation_tps), (None, None));
 
         let outage = monitor.sample();
         assert!(!outage.metrics_available, "second /metrics request is 501");
@@ -2005,7 +2071,7 @@ mod tests {
         assert!(recovered.metrics_available);
         assert_eq!(
             (recovered.prompt_tps, recovered.generation_tps),
-            (0.0, 0.0),
+            (None, None),
             "the first sample after an outage must not average the delta over the outage"
         );
 

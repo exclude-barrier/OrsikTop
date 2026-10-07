@@ -66,22 +66,28 @@ pub struct LlmStats {
     /// never a fake zero. Empty when /slots is unavailable.
     pub slot_overview: Vec<LlmSlotInfo>,
     pub slots_error: String,
-    pub prompt_total: f64,
+    /// Monotonic `/metrics` counters and derived rates. Each is `None` when the
+    /// underlying metric was absent from an otherwise reachable `/metrics`
+    /// payload, so a missing metric is never shown as a real `0`. A reported
+    /// `Some(0.0)` is a genuine measured zero.
+    pub prompt_total: Option<f64>,
     pub prompt_cached_total: Option<f64>,
-    pub generated_total: f64,
-    pub request_prompt_tokens: u64,
-    pub request_generated_tokens: u64,
-    pub prompt_seconds_total: f64,
-    pub generation_seconds_total: f64,
-    pub prompt_tps: f64,
-    pub generation_tps: f64,
-    pub prompt_avg_tps: f64,
-    pub generation_avg_tps: f64,
-    pub active_requests: f64,
-    pub deferred_requests: f64,
-    pub spec_drafts_total: f64,
-    pub spec_draft_tokens: f64,
-    pub spec_accepted_tokens: f64,
+    pub generated_total: Option<f64>,
+    /// Per-request token counts from the selected `/slots` entry. `None` when
+    /// `/slots` is unavailable, so an absent slot is never shown as `0`.
+    pub request_prompt_tokens: Option<u64>,
+    pub request_generated_tokens: Option<u64>,
+    pub prompt_seconds_total: Option<f64>,
+    pub generation_seconds_total: Option<f64>,
+    pub prompt_tps: Option<f64>,
+    pub generation_tps: Option<f64>,
+    pub prompt_avg_tps: Option<f64>,
+    pub generation_avg_tps: Option<f64>,
+    pub active_requests: Option<f64>,
+    pub deferred_requests: Option<f64>,
+    pub spec_drafts_total: Option<f64>,
+    pub spec_draft_tokens: Option<f64>,
+    pub spec_accepted_tokens: Option<f64>,
     pub spec_enabled: bool,
     pub spec_is_mtp: bool,
     pub spec_n_max: Option<u64>,
@@ -103,10 +109,10 @@ pub struct LlmSlotInfo {
 #[derive(Default)]
 struct PreviousMetricCounters {
     at: Option<Instant>,
-    prompt_total: f64,
-    generated_total: f64,
-    draft_total: f64,
-    accepted_total: f64,
+    prompt_total: Option<f64>,
+    generated_total: Option<f64>,
+    draft_total: Option<f64>,
+    accepted_total: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,7 +299,7 @@ impl LlamaMonitor {
         stats.connected = stats.metrics_available || stats.slots_available;
 
         // Current llama.cpp names first, older names retained as compatibility fallbacks.
-        stats.prompt_total = pick_metric(
+        stats.prompt_total = pick_metric_opt(
             &metrics,
             &[
                 "llamacpp:prompt_tokens_total",
@@ -304,7 +310,7 @@ impl LlamaMonitor {
         );
         stats.prompt_cached_total =
             pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_cached_total"]);
-        stats.generated_total = pick_metric(
+        stats.generated_total = pick_metric_opt(
             &metrics,
             &[
                 "llamacpp:tokens_predicted_total",
@@ -312,15 +318,16 @@ impl LlamaMonitor {
                 "predicted_tokens_total",
             ],
         );
-        stats.prompt_seconds_total = pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]);
+        stats.prompt_seconds_total = pick_metric_opt(&metrics, &["llamacpp:prompt_seconds_total"]);
         stats.generation_seconds_total =
-            pick_metric(&metrics, &["llamacpp:tokens_predicted_seconds_total"]);
+            pick_metric_opt(&metrics, &["llamacpp:tokens_predicted_seconds_total"]);
 
-        // Prefer monotonic token/time counters. The legacy throughput gauges have had
-        // upstream regressions where they report 0 while inference is active.
-        stats.prompt_avg_tps = safe_ratio(stats.prompt_total, stats.prompt_seconds_total)
-            .unwrap_or_else(|| {
-                pick_metric(
+        // Prefer monotonic token/time counters. The legacy throughput gauges have
+        // had upstream regressions where they report 0 while inference is active,
+        // so they are only a fallback when the counters are absent.
+        stats.prompt_avg_tps = average_over_seconds(stats.prompt_total, stats.prompt_seconds_total)
+            .or_else(|| {
+                pick_metric_opt(
                     &metrics,
                     &[
                         "llamacpp:prompt_tokens_seconds",
@@ -329,9 +336,9 @@ impl LlamaMonitor {
                 )
             });
         stats.generation_avg_tps =
-            safe_ratio(stats.generated_total, stats.generation_seconds_total).unwrap_or_else(
+            average_over_seconds(stats.generated_total, stats.generation_seconds_total).or_else(
                 || {
-                    pick_metric(
+                    pick_metric_opt(
                         &metrics,
                         &[
                             "llamacpp:predicted_tokens_seconds",
@@ -340,7 +347,7 @@ impl LlamaMonitor {
                     )
                 },
             );
-        stats.active_requests = pick_metric(
+        stats.active_requests = pick_metric_opt(
             &metrics,
             &[
                 "llamacpp:requests_processing",
@@ -348,7 +355,7 @@ impl LlamaMonitor {
                 "requests_processing",
             ],
         );
-        stats.deferred_requests = pick_metric(
+        stats.deferred_requests = pick_metric_opt(
             &metrics,
             &[
                 "llamacpp:requests_deferred",
@@ -361,16 +368,17 @@ impl LlamaMonitor {
             &["llamacpp:n_tokens_max", "llamacpp_n_tokens_max"],
         )
         .map(|value| value as u64);
-        stats.spec_drafts_total = pick_metric(&metrics, &["llamacpp:spec_decode_num_drafts_total"]);
+        stats.spec_drafts_total =
+            pick_metric_opt(&metrics, &["llamacpp:spec_decode_num_drafts_total"]);
         stats.spec_draft_tokens =
-            pick_metric(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]);
-        stats.spec_accepted_tokens = pick_metric(
+            pick_metric_opt(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]);
+        stats.spec_accepted_tokens = pick_metric_opt(
             &metrics,
             &["llamacpp:spec_decode_num_accepted_tokens_total"],
         );
-        if stats.spec_drafts_total > 0.0
-            || stats.spec_draft_tokens > 0.0
-            || stats.spec_accepted_tokens > 0.0
+        if stats.spec_drafts_total.is_some_and(|value| value > 0.0)
+            || stats.spec_draft_tokens.is_some_and(|value| value > 0.0)
+            || stats.spec_accepted_tokens.is_some_and(|value| value > 0.0)
         {
             stats.spec_enabled = true;
         }
@@ -383,7 +391,7 @@ impl LlamaMonitor {
             // counter baseline so the first sample after recovery cannot
             // report a delta averaged over the whole outage.
             self.previous_metrics = PreviousMetricCounters::default();
-            (0.0, 0.0)
+            (None, None)
         };
         match slots_outcome {
             Some(slots) => {
@@ -501,27 +509,46 @@ impl LlamaMonitor {
         }
     }
 
-    fn update_metric_counters(&mut self, stats: &mut LlmStats) -> (f64, f64) {
+    fn update_metric_counters(&mut self, stats: &mut LlmStats) -> (Option<f64>, Option<f64>) {
         let now = Instant::now();
-        let mut live = (0.0, 0.0);
+        let mut live = (None, None);
 
         if let Some(previous_at) = self.previous_metrics.at {
             let seconds = now.saturating_duration_since(previous_at).as_secs_f64();
             if seconds > 0.0 {
-                live.0 =
-                    counter_delta(stats.prompt_total, self.previous_metrics.prompt_total) / seconds;
-                live.1 =
-                    counter_delta(stats.generated_total, self.previous_metrics.generated_total)
-                        / seconds;
+                live.0 = counter_rate(
+                    stats.prompt_total,
+                    self.previous_metrics.prompt_total,
+                    seconds,
+                );
+                live.1 = counter_rate(
+                    stats.generated_total,
+                    self.previous_metrics.generated_total,
+                    seconds,
+                );
             }
 
-            let draft_delta =
-                counter_delta(stats.spec_draft_tokens, self.previous_metrics.draft_total);
-            if draft_delta > 0.0 {
-                let accepted_delta = counter_delta(
-                    stats.spec_accepted_tokens,
-                    self.previous_metrics.accepted_total,
-                );
+            // Acceptance needs an identified draft delta from present counters.
+            // Otherwise (absent counters, reset, or no progress) the last value
+            // is held briefly, then dropped — never fabricated as 0.
+            let draft_delta = match (stats.spec_draft_tokens, self.previous_metrics.draft_total) {
+                (Some(now_drafts), Some(previous_drafts)) => {
+                    counter_delta_opt(now_drafts, previous_drafts).filter(|delta| *delta > 0.0)
+                }
+                _ => None,
+            };
+            // Acceptance needs a *present* draft delta AND a *present* accepted
+            // delta; a missing accepted counter is unknown, not "0 accepted".
+            let accepted_delta = match (
+                stats.spec_accepted_tokens,
+                self.previous_metrics.accepted_total,
+            ) {
+                (Some(now_accepted), Some(previous_accepted)) => {
+                    counter_delta_opt(now_accepted, previous_accepted)
+                }
+                _ => None,
+            };
+            if let (Some(draft_delta), Some(accepted_delta)) = (draft_delta, accepted_delta) {
                 let acceptance = (accepted_delta / draft_delta * 100.0).clamp(0.0, 100.0);
                 self.last_spec_acceptance_pct = Some(acceptance);
                 self.last_spec_acceptance_at = Some(now);
@@ -534,6 +561,9 @@ impl LlamaMonitor {
             }
         }
 
+        // Only a *present* sample may become the baseline: storing a fabricated
+        // `None`/0 here would make the first real sample after a gap look like a
+        // spike.
         self.previous_metrics.at = Some(now);
         self.previous_metrics.prompt_total = stats.prompt_total;
         self.previous_metrics.generated_total = stats.generated_total;
@@ -558,8 +588,8 @@ impl LlamaMonitor {
             if let Some((prompt_tps, generation_tps)) =
                 slot_delta_tps(&self.previous_slots.slots, &slots, seconds)
             {
-                stats.prompt_tps = prompt_tps;
-                stats.generation_tps = generation_tps;
+                stats.prompt_tps = Some(prompt_tps);
+                stats.generation_tps = Some(generation_tps);
                 live = Some((prompt_tps, generation_tps));
             }
         }
@@ -718,8 +748,8 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
     let mut fallback_busy: Option<(u64, Option<u64>)> = None;
     let mut fallback_any: Option<(u64, Option<u64>)> = None;
     let mut busy = 0u64;
-    let mut request_prompt_tokens = 0u64;
-    let mut request_generated_tokens = 0u64;
+    let mut request_prompt_tokens: Option<u64> = None;
+    let mut request_generated_tokens: Option<u64> = None;
     let mut counters = Vec::with_capacity(slots.len());
     let mut overview = Vec::with_capacity(slots.len());
 
@@ -754,10 +784,16 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
         let decoded = slot_decoded_tokens_opt(slot);
 
         if is_processing {
-            request_prompt_tokens =
-                request_prompt_tokens.saturating_add(prompt_processed.unwrap_or(0));
-            request_generated_tokens =
-                request_generated_tokens.saturating_add(decoded.unwrap_or(0));
+            // Only a reported count contributes; a busy slot that reports no
+            // prompt/decoded count leaves the field unknown (—), not 0.
+            if let Some(value) = prompt_processed {
+                request_prompt_tokens =
+                    Some(request_prompt_tokens.unwrap_or(0).saturating_add(value));
+            }
+            if let Some(value) = decoded {
+                request_generated_tokens =
+                    Some(request_generated_tokens.unwrap_or(0).saturating_add(value));
+            }
         }
 
         // Current llama.cpp exposes n_prompt_tokens as the slot's current prompt/context
@@ -1117,8 +1153,17 @@ fn slot_delta_tps(
 
 /// Prefer trustworthy per-slot deltas; otherwise fall back to the aggregated
 /// `/metrics` counters. Never a fabricated per-slot value.
-fn choose_live_throughput(slot_live: Option<(f64, f64)>, metric_live: (f64, f64)) -> (f64, f64) {
-    slot_live.unwrap_or(metric_live)
+/// Live throughput, preferring the verified slot delta and otherwise the
+/// aggregate `/metrics` counter delta. `None` means unavailable (no verified
+/// slot pairing and no usable aggregate counters) — never a fabricated zero.
+fn choose_live_throughput(
+    slot_live: Option<(f64, f64)>,
+    metric_live: (Option<f64>, Option<f64>),
+) -> (Option<f64>, Option<f64>) {
+    match slot_live {
+        Some((prompt, generation)) => (Some(prompt), Some(generation)),
+        None => metric_live,
+    }
 }
 
 fn task_ids_match(previous: Option<i64>, current: Option<i64>) -> bool {
@@ -1194,20 +1239,29 @@ fn pick_metric_opt(metrics: &[MetricSample], names: &[&str]) -> Option<f64> {
     })
 }
 
-fn pick_metric(metrics: &[MetricSample], names: &[&str]) -> f64 {
-    pick_metric_opt(metrics, names).unwrap_or(0.0)
+/// Lifetime average rate from a monotonic token counter and a seconds counter.
+/// `None` when either is absent or the denominator is not positive.
+fn average_over_seconds(tokens: Option<f64>, seconds: Option<f64>) -> Option<f64> {
+    let tokens = tokens?;
+    let seconds = seconds?;
+    (tokens.is_finite() && seconds.is_finite() && seconds > 0.0).then(|| tokens / seconds)
 }
 
-fn safe_ratio(value: f64, seconds: f64) -> Option<f64> {
-    (value.is_finite() && seconds.is_finite() && seconds > 0.0).then(|| value / seconds)
-}
-
-fn counter_delta(current: f64, previous: f64) -> f64 {
+/// Delta of a monotonic counter. `None` when a value is non-finite or the
+/// counter decreased (reset): unavailable for that sample, never a fake `0`.
+fn counter_delta_opt(current: f64, previous: f64) -> Option<f64> {
     if current.is_finite() && previous.is_finite() && current >= previous {
-        current - previous
+        Some(current - previous)
     } else {
-        0.0
+        None
     }
+}
+
+/// Live throughput from a counter pair over `seconds`. `None` when either value
+/// is absent (also covers a reset via `counter_delta_opt`).
+fn counter_rate(current: Option<f64>, previous: Option<f64>, seconds: f64) -> Option<f64> {
+    let (current, previous) = (current?, previous?);
+    counter_delta_opt(current, previous).map(|delta| delta / seconds)
 }
 
 fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1639,25 +1693,25 @@ mod tests {
         let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_current.prom"));
 
         assert_eq!(
-            pick_metric(&metrics, &["llamacpp:prompt_tokens_total"]),
-            12000.0
+            pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_total"]),
+            Some(12000.0)
         );
         assert_eq!(
-            pick_metric(&metrics, &["llamacpp:prompt_tokens_cached_total"]),
-            26000.0
+            pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_cached_total"]),
+            Some(26000.0)
         );
         assert_eq!(
-            pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]),
-            12.0
+            pick_metric_opt(&metrics, &["llamacpp:prompt_seconds_total"]),
+            Some(12.0)
         );
         assert_eq!(
-            pick_metric(&metrics, &["llamacpp:tokens_predicted_seconds_total"]),
-            20.0
+            pick_metric_opt(&metrics, &["llamacpp:tokens_predicted_seconds_total"]),
+            Some(20.0)
         );
         assert_eq!(
-            safe_ratio(
-                pick_metric(&metrics, &["llamacpp:prompt_tokens_total"]),
-                pick_metric(&metrics, &["llamacpp:prompt_seconds_total"]),
+            average_over_seconds(
+                pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_total"]),
+                pick_metric_opt(&metrics, &["llamacpp:prompt_seconds_total"]),
             ),
             Some(1000.0)
         );
@@ -1667,15 +1721,15 @@ mod tests {
     fn speculative_fixture_preserves_position_labels() {
         let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_speculative.prom"));
         assert_eq!(
-            pick_metric(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]),
-            200.0
+            pick_metric_opt(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]),
+            Some(200.0)
         );
         assert_eq!(
-            pick_metric(
+            pick_metric_opt(
                 &metrics,
                 &["llamacpp:spec_decode_num_accepted_tokens_total"]
             ),
-            140.0
+            Some(140.0)
         );
         assert_eq!(
             metrics
@@ -1701,7 +1755,7 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(pick_metric(&metrics, &["llamacpp:test"]), 0.0);
+        // A labeled series must not be collapsed into an unlabeled aggregate.
         assert_eq!(pick_metric_opt(&metrics, &["llamacpp:test"]), None);
         assert_eq!(pick_metric_opt(&metrics, &["missing"]), None);
         assert!(!metrics.iter().any(|metric| metric.name == "not_finite"));
@@ -1709,14 +1763,51 @@ mod tests {
 
     #[test]
     fn derives_average_throughput_from_time_counters() {
-        assert_eq!(safe_ratio(1200.0, 2.0), Some(600.0));
-        assert_eq!(safe_ratio(1200.0, 0.0), None);
+        assert_eq!(average_over_seconds(Some(1200.0), Some(2.0)), Some(600.0));
+        assert_eq!(average_over_seconds(Some(1200.0), Some(0.0)), None);
+        // An absent numerator or denominator is unavailable, not zero.
+        assert_eq!(average_over_seconds(None, Some(2.0)), None);
+        assert_eq!(average_over_seconds(Some(1200.0), None), None);
     }
 
     #[test]
     fn counter_delta_handles_counter_reset() {
-        assert_eq!(counter_delta(150.0, 100.0), 50.0);
-        assert_eq!(counter_delta(10.0, 100.0), 0.0);
+        assert_eq!(counter_delta_opt(150.0, 100.0), Some(50.0));
+        // A counter decrease (reset) is unavailable, not a real 0.
+        assert_eq!(counter_delta_opt(10.0, 100.0), None);
+        // Unchanged counters are a legitimate 0/s rate.
+        assert_eq!(counter_rate(Some(0.0), Some(0.0), 1.0), Some(0.0));
+        // An absent current or previous value is unavailable, not 0.
+        assert_eq!(counter_rate(None, Some(5.0), 1.0), None);
+        assert_eq!(counter_rate(Some(5.0), None, 1.0), None);
+    }
+
+    #[test]
+    fn metric_counter_absence_does_not_poison_the_baseline() {
+        let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
+        let mut stats = LlmStats {
+            prompt_total: Some(1000.0),
+            ..Default::default()
+        };
+        monitor.update_metric_counters(&mut stats);
+
+        // Partial payload: the prompt counter is absent this sample.
+        let mut stats = LlmStats {
+            prompt_total: None,
+            ..Default::default()
+        };
+        let live = monitor.update_metric_counters(&mut stats);
+        assert_eq!(live.0, None, "absent counter -> unavailable rate");
+
+        // It reappears: the absent sample must not be stored as a `0` baseline,
+        // so this establishes a fresh baseline instead of a huge spike.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut stats = LlmStats {
+            prompt_total: Some(1100.0),
+            ..Default::default()
+        };
+        let live = monitor.update_metric_counters(&mut stats);
+        assert_eq!(live.0, None, "reappearance must re-baseline, never spike");
     }
 
     #[test]
@@ -1738,8 +1829,8 @@ mod tests {
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(counters[0].prompt_processed, 12000);
         assert_eq!(counters[0].decoded, 779);
-        assert_eq!(stats.request_prompt_tokens, 12000);
-        assert_eq!(stats.request_generated_tokens, 779);
+        assert_eq!(stats.request_prompt_tokens, Some(12000));
+        assert_eq!(stats.request_generated_tokens, Some(779));
     }
 
     #[test]
@@ -1790,8 +1881,9 @@ mod tests {
         apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.slot_count, 1);
         assert_eq!(stats.busy_slots, 0);
-        assert_eq!(stats.request_prompt_tokens, 0);
-        assert_eq!(stats.request_generated_tokens, 0);
+        // No slot is processing, so there is no current request to report.
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(stats.request_generated_tokens, None);
         // `n_prompt_tokens_processed: 0` + `n_decoded: 0` are present, so a
         // real 0 is reported here (not unknown).
         assert_eq!(stats.context_used, Some(0));
@@ -1872,7 +1964,7 @@ mod tests {
         assert_eq!(stats.busy_slots, 2);
         assert_eq!(stats.context_used, Some(4000));
         assert_eq!(stats.context_size, 150000);
-        assert_eq!(stats.request_prompt_tokens, 6000);
+        assert_eq!(stats.request_prompt_tokens, Some(6000));
         assert_eq!(stats.context_slot_id, Some(1));
     }
 
@@ -2303,7 +2395,10 @@ mod tests {
         assert_eq!(slot_live, None, "no identity → no per-slot delta");
         // The decision must fall back to the aggregated metrics, never to the
         // fabricated 900/90 the old index-as-id behavior produced.
-        assert_eq!(choose_live_throughput(slot_live, (0.0, 0.0)), (0.0, 0.0));
+        assert_eq!(
+            choose_live_throughput(slot_live, (None, None)),
+            (None, None)
+        );
     }
 
     #[test]
@@ -2400,16 +2495,16 @@ mod tests {
         let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
 
         let mut stats = LlmStats {
-            spec_draft_tokens: 200.0,
-            spec_accepted_tokens: 140.0,
+            spec_draft_tokens: Some(200.0),
+            spec_accepted_tokens: Some(140.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
 
         // Second sample: 100 new draft tokens, 60 accepted -> 60%.
         let mut stats = LlmStats {
-            spec_draft_tokens: 300.0,
-            spec_accepted_tokens: 200.0,
+            spec_draft_tokens: Some(300.0),
+            spec_accepted_tokens: Some(200.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
@@ -2418,8 +2513,8 @@ mod tests {
         // Third sample with no new draft tokens: the last value is held for
         // SPEC_ACCEPTANCE_HOLD instead of dropping to None.
         let mut stats = LlmStats {
-            spec_draft_tokens: 300.0,
-            spec_accepted_tokens: 200.0,
+            spec_draft_tokens: Some(300.0),
+            spec_accepted_tokens: Some(200.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
@@ -2431,22 +2526,22 @@ mod tests {
         let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
 
         let mut stats = LlmStats {
-            spec_draft_tokens: 100.0,
-            spec_accepted_tokens: 50.0,
+            spec_draft_tokens: Some(100.0),
+            spec_accepted_tokens: Some(50.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
         let mut stats = LlmStats {
-            spec_draft_tokens: 200.0,
-            spec_accepted_tokens: 100.0,
+            spec_draft_tokens: Some(200.0),
+            spec_accepted_tokens: Some(100.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
         assert_eq!(stats.spec_acceptance_pct, Some(50.0));
 
         let mut stats = LlmStats {
-            spec_draft_tokens: 200.0,
-            spec_accepted_tokens: 100.0,
+            spec_draft_tokens: Some(200.0),
+            spec_accepted_tokens: Some(100.0),
             ..Default::default()
         };
         let expired = Instant::now() - (SPEC_ACCEPTANCE_HOLD + Duration::from_secs(1));
@@ -2460,16 +2555,16 @@ mod tests {
         let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
 
         let mut stats = LlmStats {
-            spec_draft_tokens: 100.0,
-            spec_accepted_tokens: 100.0,
+            spec_draft_tokens: Some(100.0),
+            spec_accepted_tokens: Some(100.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
 
         // Accepted delta larger than the draft delta must clamp, not exceed.
         let mut stats = LlmStats {
-            spec_draft_tokens: 200.0,
-            spec_accepted_tokens: 250.0,
+            spec_draft_tokens: Some(200.0),
+            spec_accepted_tokens: Some(250.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
@@ -2481,8 +2576,8 @@ mod tests {
         let mut monitor = LlamaMonitor::new("http://127.0.0.1:8080").unwrap();
 
         let mut stats = LlmStats {
-            spec_draft_tokens: 1000.0,
-            spec_accepted_tokens: 900.0,
+            spec_draft_tokens: Some(1000.0),
+            spec_accepted_tokens: Some(900.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
@@ -2490,8 +2585,8 @@ mod tests {
         // Server restart: counters reset below the previous values. No draft
         // progress and no fresh hold -> no acceptance value, no NaN.
         let mut stats = LlmStats {
-            spec_draft_tokens: 10.0,
-            spec_accepted_tokens: 5.0,
+            spec_draft_tokens: Some(10.0),
+            spec_accepted_tokens: Some(5.0),
             ..Default::default()
         };
         monitor.update_metric_counters(&mut stats);
