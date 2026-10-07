@@ -18,6 +18,13 @@ All notable changes to OrsikTop will be documented here.
   accepted delta; a missing accepted counter is unknown, not `0 accepted`.
 - GPU hwmon selection breaks equal-score ties by hwmon name rather than raw
   directory enumeration order.
+- A per-slot prompt or decode counter that temporarily disappears is no longer
+  stored as a `0` baseline, so reappearance cannot fabricate a catch-up
+  throughput spike; the two counter dimensions are tracked independently and a
+  reset/decrease is unavailable rather than `0`.
+- `request_prompt_tokens`/`request_generated_tokens` are unavailable (`—`) when
+  any contributing busy slot lacks that counter, instead of silently treating
+  the missing contribution as zero; idle slots do not affect the busy total.
 
 ## [0.2.9] - 2026-10-07
 
