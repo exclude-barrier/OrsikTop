@@ -1227,19 +1227,63 @@ fn json_u64_path(value: &Value, path: &[&str]) -> Option<u64> {
     current.as_u64()
 }
 
+/// Longest model display string, in `char`s. A server-controlled name is
+/// truncated to this so it cannot bloat the TUI or `orsiktop diag` output.
+const MAX_MODEL_DISPLAY_CHARS: usize = 120;
+
+/// Make a server-controlled model string safe to display: drop control
+/// characters (ANSI/CR/LF/tab/NUL, ...), collapse whitespace and bound the
+/// length. Ordinary Unicode is preserved. The endpoint used for networking is
+/// never derived from this.
+fn sanitize_model_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    if out.chars().count() > MAX_MODEL_DISPLAY_CHARS {
+        let mut truncated: String = out.chars().take(MAX_MODEL_DISPLAY_CHARS).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        out
+    }
+}
+
 fn model_display_name(value: &str) -> String {
-    Path::new(value)
+    let name = Path::new(value)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(value)
-        .trim_end_matches(".gguf")
-        .to_string()
+        .trim_end_matches(".gguf");
+    sanitize_model_text(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_display_name_strips_control_characters_and_bounds_length() {
+        assert_eq!(model_display_name("/models/qwen2.5-7b.gguf"), "qwen2.5-7b");
+        // ANSI/CR/LF/tab are neutralized (control run collapses to a space).
+        let cleaned = model_display_name("evil\x1b[31m\nname\t.gguf");
+        assert_eq!(cleaned, "evil [31m name");
+        assert!(!cleaned.contains('\n') && !cleaned.contains('\x1b'));
+        // Excessively long names are bounded with an ellipsis.
+        let long = "x".repeat(500);
+        let bounded = model_display_name(&long);
+        assert_eq!(bounded.chars().count(), MAX_MODEL_DISPLAY_CHARS + 1);
+    }
 
     #[test]
     fn endpoint_url_appends_to_the_path_and_keeps_the_query() {
