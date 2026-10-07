@@ -321,10 +321,9 @@ fn connected_probe_report(stats: &LlmStats) -> String {
     } else {
         &stats.model
     };
-    let watermark = if stats.metrics_available {
-        stats.context_high_watermark.to_string()
-    } else {
-        "—".to_string()
+    let watermark = match (stats.metrics_available, stats.context_high_watermark) {
+        (true, Some(value)) => value.to_string(),
+        _ => "—".to_string(),
     };
     let used = stats
         .context_used
@@ -661,7 +660,7 @@ mod tests {
             metrics_available: true,
             context_used: Some(1000),
             context_size: 4096,
-            context_high_watermark: 2048,
+            context_high_watermark: Some(2048),
             prompt_tps: 12.5,
             generation_tps: 34.5,
             slot_count: 2,
