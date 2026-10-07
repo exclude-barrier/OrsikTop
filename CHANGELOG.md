@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-07
+
 ### Changed
 
 - NVIDIA MIG identity is handled honestly: a modern opaque `MIG-<uuid>` and the
