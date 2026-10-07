@@ -46,7 +46,9 @@ pub struct LlmStats {
     /// without `/slots`. `None` when `/slots` reports no usable occupancy:
     /// unknown, rendered `—`, never a fabricated `0`.
     pub context_used: Option<u64>,
-    pub context_high_watermark: u64,
+    /// `/metrics` context high-water mark. `None` when the metric is absent, so
+    /// a missing watermark can never be mistaken for a real `0` occupancy.
+    pub context_high_watermark: Option<u64>,
     /// ID of the slot the displayed (context_used, context_size) pair comes
     /// from, per the slot's own `id` field in /slots. `None` when /slots is
     /// unavailable, empty, or the selected slot reports no `id` — never a
@@ -354,10 +356,11 @@ impl LlamaMonitor {
                 "requests_deferred",
             ],
         );
-        stats.context_high_watermark = pick_metric(
+        stats.context_high_watermark = pick_metric_opt(
             &metrics,
             &["llamacpp:n_tokens_max", "llamacpp_n_tokens_max"],
-        ) as u64;
+        )
+        .map(|value| value as u64);
         stats.spec_drafts_total = pick_metric(&metrics, &["llamacpp:spec_decode_num_drafts_total"]);
         stats.spec_draft_tokens =
             pick_metric(&metrics, &["llamacpp:spec_decode_num_draft_tokens_total"]);

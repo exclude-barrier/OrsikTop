@@ -319,25 +319,31 @@ fn engine_utilization(
     utilization
 }
 
-/// Utilization % from cumulative busy nanoseconds over elapsed wall time.
-/// A counter that read lower than before (kernel reset) yields a zero delta.
+/// Utilization % from cumulative busy nanoseconds over elapsed wall time. A
+/// counter that read lower than before (kernel/driver reset) is unmeasurable
+/// for this sample: `None`, never a fabricated `0%`. The caller updates the
+/// baseline regardless, so the next sample recovers.
 fn utilization_ns(busy_now: u64, busy_prev: u64, elapsed_ns: u64) -> Option<f64> {
-    if elapsed_ns == 0 {
+    if elapsed_ns == 0 || busy_now < busy_prev {
         return None;
     }
-    let delta = busy_now.saturating_sub(busy_prev);
-    Some(delta as f64 / elapsed_ns as f64 * 100.0)
+    Some((busy_now - busy_prev) as f64 / elapsed_ns as f64 * 100.0)
 }
 
-/// Utilization % from busy cycles over total cycles (xe scheme).
+/// Utilization % from busy cycles over total cycles (xe scheme). A decrease in
+/// either counter (reset) is unmeasurable: `None`, not `0%`; the caller updates
+/// the baseline so the next valid sample recovers.
 fn utilization_cycles(
     busy_now: u64,
     busy_prev: u64,
     total_now: u64,
     total_prev: u64,
 ) -> Option<f64> {
-    let delta_busy = busy_now.saturating_sub(busy_prev);
-    let delta_total = total_now.saturating_sub(total_prev);
+    if busy_now < busy_prev || total_now < total_prev {
+        return None;
+    }
+    let delta_busy = busy_now - busy_prev;
+    let delta_total = total_now - total_prev;
     if delta_total == 0 {
         return None;
     }
@@ -748,11 +754,12 @@ mod tests {
         // 50% of 2_000_000_000 ns (2 s) busy.
         let pct = utilization_ns(1_000_000_000, 0, 2_000_000_000).unwrap();
         assert!((pct - 50.0).abs() < 1e-9);
-        // Counter reset (read lower) yields a zero delta, not negative.
-        let pct = utilization_ns(100, 1000, 2_000_000_000).unwrap();
-        assert_eq!(pct, 0.0);
+        // Counter reset (read lower) is unmeasurable for that sample.
+        assert_eq!(utilization_ns(100, 1000, 2_000_000_000), None);
         // Zero elapsed wall time is undefined.
         assert_eq!(utilization_ns(100, 0, 0), None);
+        // Unchanged counters are a legitimate 0%.
+        assert_eq!(utilization_ns(1000, 1000, 2_000_000_000), Some(0.0));
     }
 
     #[test]
@@ -762,9 +769,9 @@ mod tests {
         assert!((pct - 200.0).abs() < 1e-9);
         // No total progress → undefined.
         assert_eq!(utilization_cycles(5000, 4000, 9000, 9000), None);
-        // Counter reset yields zero busy delta.
-        let pct = utilization_cycles(100, 4000, 10000, 9000).unwrap();
-        assert_eq!(pct, 0.0);
+        // A counter reset on either field is unmeasurable.
+        assert_eq!(utilization_cycles(100, 4000, 10000, 9000), None);
+        assert_eq!(utilization_cycles(5000, 4000, 8000, 9000), None);
     }
 
     #[test]
@@ -803,7 +810,8 @@ mod tests {
         let pct = rcs.utilization_pct.unwrap();
         assert!((pct - 20.0).abs() < 1e-9);
 
-        // Third sample with a reset counter (busy reads lower) → 0%, not negative.
+        // Third sample with a reset counter (busy reads lower) is unmeasurable
+        // for that sample: unavailable, not a fabricated 0%.
         let mut sys3 = FixtureSys::default();
         sys_with_drm_fd(
             &mut sys3,
@@ -813,7 +821,38 @@ mod tests {
         let t2 = t1 + std::time::Duration::from_secs(2);
         let g3 = sample_process_gpus(&sys3, t2, identity, &mut state);
         let rcs3 = g3[0].engines.iter().find(|e| e.name == "rcs").unwrap();
-        assert_eq!(rcs3.utilization_pct, Some(0.0));
+        assert_eq!(rcs3.utilization_pct, None);
+
+        // The baseline was updated, so the next valid sample recovers.
+        let mut sys4 = FixtureSys::default();
+        sys_with_drm_fd(
+            &mut sys4,
+            pid,
+            &format!("drm-driver:\txe\ndrm-pdev:\t{BDF}\ndrm-cycles-rcs:\t550\ndrm-total-cycles-rcs:\t22000\n"),
+        );
+        let t3 = t2 + std::time::Duration::from_secs(2);
+        let g4 = sample_process_gpus(&sys4, t3, identity, &mut state);
+        let rcs4 = g4[0].engines.iter().find(|e| e.name == "rcs").unwrap();
+        let recovered = rcs4.utilization_pct.expect("recovers after reset");
+        assert!((recovered - 50.0).abs() < 1e-9, "got {recovered}");
+    }
+
+    #[test]
+    fn drm_utilization_reset_is_unavailable_not_zero() {
+        // busy-ns path: a counter decrease is unavailable, not a fake 0%.
+        assert_eq!(utilization_ns(100, 500, 1_000_000), None);
+        // unchanged busy-ns is a legitimate 0%.
+        assert_eq!(utilization_ns(500, 500, 1_000_000), Some(0.0));
+        // zero elapsed is unavailable.
+        assert_eq!(utilization_ns(500, 400, 0), None);
+
+        // cycle path: a decrease in either counter is unavailable.
+        assert_eq!(utilization_cycles(50, 3000, 21_000, 20_000), None);
+        assert_eq!(utilization_cycles(3000, 3000, 19_000, 20_000), None);
+        // unchanged counters with a real total delta is a legitimate 0%.
+        assert_eq!(utilization_cycles(3000, 3000, 21_000, 20_000), Some(0.0));
+        // zero total delta is unavailable.
+        assert_eq!(utilization_cycles(3000, 3000, 20_000, 20_000), None);
     }
 
     #[test]

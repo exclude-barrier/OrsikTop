@@ -1395,7 +1395,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
-        Some(llm.context_high_watermark)
+        llm.context_high_watermark
     };
     let context_pct = match (context_used, llm.context_size) {
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
@@ -1427,6 +1427,20 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         },
         Style::default().fg(MUTED),
     ));
+    // An unknown occupancy or capacity renders the meter as unavailable (`—`),
+    // never as a fabricated `0.0%`; a known zero stays a real `0.0%`.
+    let context_line = if context_used.is_some() && llm.context_size > 0 {
+        meter_line(
+            "CTX",
+            context_pct,
+            context_bar,
+            context_color(context_pct),
+            format!("{:>5.1}%", context_pct),
+            context_suffix,
+        )
+    } else {
+        unavailable_meter_line("CTX", context_bar, context_suffix)
+    };
     let slots = if llm.slots_available {
         format!("{}/{}", llm.busy_slots, llm.slot_count)
     } else if llm.props_slot_count > 0 {
@@ -1599,14 +1613,7 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
             llm_metric_cell(&request_tg, metric_width, request_color, false),
         ]),
         Line::from(total_line),
-        meter_line(
-            "CTX",
-            context_pct,
-            context_bar,
-            context_color(context_pct),
-            format!("{:>5.1}%", context_pct),
-            context_suffix,
-        ),
+        context_line,
     ];
 
     // Compact per-slot context overview, directly below the CTX row it
@@ -1692,7 +1699,7 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
     let context_used = if llm.slots_available {
         llm.context_used
     } else {
-        Some(llm.context_high_watermark)
+        llm.context_high_watermark
     };
     let context_pct = match (context_used, llm.context_size) {
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
@@ -1718,6 +1725,20 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
         },
         Style::default().fg(MUTED),
     ));
+    // An unknown occupancy or capacity renders the meter as unavailable (`—`),
+    // never as a fabricated `0.0%`; a known zero stays a real `0.0%`.
+    let context_line = if context_used.is_some() && llm.context_size > 0 {
+        meter_line(
+            "CTX",
+            context_pct,
+            context_bar,
+            context_color(context_pct),
+            format!("{:>5.1}%", context_pct),
+            context_suffix,
+        )
+    } else {
+        unavailable_meter_line("CTX", context_bar, context_suffix)
+    };
     let slots = if llm.slots_available {
         format!("{}/{}", llm.busy_slots, llm.slot_count)
     } else if llm.props_slot_count > 0 {
@@ -1759,14 +1780,7 @@ fn draw_llm_metrics_unavailable(frame: &mut Frame, inner: Rect, llm: &LlmStats, 
                 Style::default().fg(MUTED),
             ),
         ]),
-        meter_line(
-            "CTX",
-            context_pct,
-            context_bar,
-            context_color(context_pct),
-            format!("{:>5.1}%", context_pct),
-            context_suffix,
-        ),
+        context_line,
     ];
 
     if llm.slots_available && llm.slot_count > 1 {
@@ -6437,6 +6451,80 @@ mod tests {
             !text.contains("TOTAL") && !text.contains("AVG") && !text.contains("REQUEST"),
             "no metric row may be fabricated without /metrics, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn unknown_context_occupancy_renders_the_ctx_meter_unavailable() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            context_size: 115200,
+            context_used: None,
+            slots_available: true,
+            slot_count: 1,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            !text.contains("0.0%"),
+            "unknown occupancy must not render 0.0%:\n{text}"
+        );
+        assert!(text.contains("— / 115,200 tok"), "got:\n{text}");
+    }
+
+    #[test]
+    fn known_zero_context_occupancy_still_renders_zero_percent() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            context_size: 4096,
+            context_used: Some(0),
+            slots_available: true,
+            slot_count: 1,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(text.contains("0.0%"), "a real zero is 0.0%:\n{text}");
+        assert!(text.contains("0 / 4,096 tok"), "got:\n{text}");
+    }
+
+    #[test]
+    fn context_without_capacity_renders_the_meter_unavailable() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            context_size: 0,
+            context_used: Some(5),
+            slots_available: false,
+            context_high_watermark: None,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            !text.contains("0.0%"),
+            "no capacity means the percentage is unknown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_unavailable_panel_with_slots_keeps_context_unknown() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: false,
+            model: "test-model".to_string(),
+            context_size: 8192,
+            context_used: None,
+            slots_available: true,
+            slot_count: 1,
+            error: "/metrics disabled; start llama.cpp with --metrics".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(text.contains("METRICS"), "got:\n{text}");
+        assert!(!text.contains("0.0%"), "got:\n{text}");
     }
 
     #[test]
