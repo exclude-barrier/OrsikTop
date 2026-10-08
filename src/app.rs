@@ -94,13 +94,11 @@ pub fn run(
         mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
     let mut llm_generation: u64 = 0;
     let mut mapping_generation: u64 = 0;
-    if let Some(identity) = server_identity {
-        let _ = server_identity_tx.send((mapping_generation, Some(identity)));
-    }
 
     // Multi-server registry: the full endpoint set to monitor, keyed by stable
-    // identity, in a deterministic display order. `resolved` above still
-    // describes the primary local server whose process is mapped to a GPU.
+    // identity, in a deterministic display order. `resolved` above describes
+    // the primary local server (endpoint/auto label); the GPU association
+    // follows the *selected* server's verified local process identity.
     let mut server_list = servers.monitored;
     // Endpoints past the cap: shown as "limit reached", never polled.
     let mut overflow: Vec<ServerSpec> = servers.overflow;
@@ -115,6 +113,13 @@ pub fn run(
     } else {
         order.first().cloned().unwrap_or_default()
     };
+    // Attribute the initially selected server from its verified process
+    // identity. A remote/configured server has no identity => Unknown.
+    publish_selected_mapping(
+        selected_identity_of(&server_list, &selected),
+        &mut mapping_generation,
+        &server_identity_tx,
+    );
 
     let fast_worker = spawn_fast_worker(
         Arc::clone(&gpu_selector_shared),
@@ -171,12 +176,7 @@ pub fn run(
         // frame; the worst-case staleness is `SERVER_RESYNC_INTERVAL`.
         if settings.auto_discovery && last_server_resync.elapsed() >= SERVER_RESYNC_INTERVAL {
             let next = crate::resolve_monitor_target(&settings);
-            apply_server_mapping(
-                &mut resolved,
-                next,
-                &mut mapping_generation,
-                &server_identity_tx,
-            );
+            update_resolved_server(&mut resolved, next);
             sync_server_set(
                 &settings,
                 &mut server_list,
@@ -186,7 +186,9 @@ pub fn run(
                 &mut registry,
                 &mut selected,
                 &mut llm_generation,
+                &mut mapping_generation,
                 &server_tx,
+                &server_identity_tx,
                 &mut snapshot,
                 &mut ui_state,
             );
@@ -265,12 +267,7 @@ pub fn run(
                                     // auto/manual origin without changing the
                                     // endpoint (and vice versa).
                                     let next = crate::resolve_monitor_target(&settings);
-                                    apply_server_mapping(
-                                        &mut resolved,
-                                        next,
-                                        &mut mapping_generation,
-                                        &server_identity_tx,
-                                    );
+                                    update_resolved_server(&mut resolved, next);
                                     sync_server_set(
                                         &settings,
                                         &mut server_list,
@@ -280,7 +277,9 @@ pub fn run(
                                         &mut registry,
                                         &mut selected,
                                         &mut llm_generation,
+                                        &mut mapping_generation,
                                         &server_tx,
+                                        &server_identity_tx,
                                         &mut snapshot,
                                         &mut ui_state,
                                     );
@@ -335,6 +334,16 @@ pub fn run(
                                     // Show this server's own accumulated history;
                                     // every other server's history is preserved.
                                     ui_state.select_llm_history(key);
+                                    // Re-attribute the GPU association to this
+                                    // server's verified process and drop the
+                                    // previous server's mapping so it is never
+                                    // shown for the newly selected one.
+                                    publish_selected_mapping(
+                                        selected_identity_of(&server_list, &selected),
+                                        &mut mapping_generation,
+                                        &server_identity_tx,
+                                    );
+                                    snapshot.gpu_map = GpuMapping::None;
                                 }
                             }
                             ui_state.close_server_selector();
@@ -589,23 +598,11 @@ fn apply_fast_snapshot(
     }
 }
 
-/// Re-attribute the primary local process to a GPU (or clear it) on an
-/// independently-detected PID/origin change, advancing the mapping generation
-/// so a stale mapping cannot overwrite the new state. The LLM server set is
-/// reconciled separately by `sync_server_set`.
-fn apply_server_mapping(
-    current: &mut crate::ResolvedServer,
-    next: crate::ResolvedServer,
-    mapping_generation: &mut u64,
-    server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
-) {
+/// Update the tracked primary `resolved` server (used for the header endpoint
+/// and the `auto` label). It no longer drives GPU attribution: the association
+/// follows the *selected* server via `publish_selected_mapping`.
+fn update_resolved_server(current: &mut crate::ResolvedServer, next: crate::ResolvedServer) {
     let change = reconcile_server(current, &next);
-    if change.pid {
-        // The fast worker recomputes the server→GPU mapping from this identity;
-        // a `None` clears it so a vanished server leaves no stale attribution.
-        *mapping_generation = mapping_generation.wrapping_add(1);
-        let _ = server_identity_tx.send((*mapping_generation, next.identity));
-    }
     if change.endpoint || change.pid || change.auto {
         *current = next;
     }
@@ -627,7 +624,9 @@ fn sync_server_set(
     registry: &mut BTreeMap<String, LlmStats>,
     selected: &mut String,
     llm_generation: &mut u64,
+    mapping_generation: &mut u64,
     server_tx: &mpsc::Sender<LlmCommand>,
+    server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
     snapshot: &mut DashboardSnapshot,
     ui_state: &mut UiState,
 ) {
@@ -671,7 +670,38 @@ fn sync_server_set(
             snapshot.llm = registry.get(selected).cloned().unwrap_or_default();
             ui_state.select_llm_history(selected);
         }
+        // The selected server's identity (or its disappearance) may have
+        // changed: republish so the GPU association follows it and any stale
+        // mapping is invalidated.
+        publish_selected_mapping(
+            selected_identity_of(server_list, selected),
+            mapping_generation,
+            server_identity_tx,
+        );
+        snapshot.gpu_map = GpuMapping::None;
     }
+}
+
+/// The verified local process identity of the selected server, if it has one.
+/// A remote or explicitly configured endpoint without a matching process is
+/// `None` and must stay UNKNOWN — never guessed.
+fn selected_identity_of(server_list: &[ServerSpec], selected: &str) -> Option<LocalServerIdentity> {
+    server_list
+        .iter()
+        .find(|spec| spec.key == selected)
+        .and_then(|spec| spec.identity)
+}
+
+/// Publish which process's GPU association the fast worker should resolve,
+/// advancing the mapping generation so a stale mapping of a previously
+/// selected server cannot be applied.
+fn publish_selected_mapping(
+    identity: Option<LocalServerIdentity>,
+    mapping_generation: &mut u64,
+    server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
+) {
+    *mapping_generation = mapping_generation.wrapping_add(1);
+    let _ = server_identity_tx.send((*mapping_generation, identity));
 }
 
 /// Keys present in both sets whose process identity changed (a known
@@ -1690,33 +1720,44 @@ mod tests {
     }
 
     #[test]
-    fn apply_server_mapping_updates_only_the_gpu_mapping() {
-        let (identity_tx, identity_rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
-        let mut mapping_generation = 0u64;
+    fn selected_identity_and_mapping_publication() {
+        let (tx, rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
+        let specs = vec![
+            ServerSpec {
+                key: "a".to_string(),
+                endpoint: "http://a".to_string(),
+                identity: Some(ident(5000, 1)),
+            },
+            ServerSpec {
+                key: "b".to_string(),
+                endpoint: "http://b".to_string(),
+                identity: None,
+            },
+        ];
+        // The identity comes from the selected spec; a remote/configured server
+        // (no local process) yields None and must stay UNKNOWN.
+        assert_eq!(selected_identity_of(&specs, "a"), Some(ident(5000, 1)));
+        assert_eq!(selected_identity_of(&specs, "b"), None);
+        assert_eq!(selected_identity_of(&specs, "missing"), None);
+
+        // Publishing advances the generation and sends the selected identity, so
+        // a stale mapping of a previously selected server is invalidated.
+        let mut generation = 0u64;
+        publish_selected_mapping(selected_identity_of(&specs, "a"), &mut generation, &tx);
+        assert_eq!(generation, 1);
+        assert_eq!(rx.try_recv().unwrap(), (1, Some(ident(5000, 1))));
+        publish_selected_mapping(selected_identity_of(&specs, "b"), &mut generation, &tx);
+        assert_eq!(generation, 2);
+        assert_eq!(rx.try_recv().unwrap(), (2, None));
+    }
+
+    #[test]
+    fn update_resolved_server_only_relabels() {
         let mut current = target("http://127.0.0.1:8081", Some(ident(5000, 1)), true);
-
-        // An identity-only change (server restart, same URL): the GPU mapping
-        // is refreshed.
-        apply_server_mapping(
-            &mut current,
-            target("http://127.0.0.1:8081", Some(ident(6000, 1)), true),
-            &mut mapping_generation,
-            &identity_tx,
-        );
-        assert_eq!(mapping_generation, 1);
-        assert_eq!(identity_rx.try_recv().unwrap(), (1, Some(ident(6000, 1))));
-        assert_eq!(current.identity, Some(ident(6000, 1)));
-
-        // An endpoint change clears the local attribution too.
-        apply_server_mapping(
-            &mut current,
-            target("http://127.0.0.1:9090", None, false),
-            &mut mapping_generation,
-            &identity_tx,
-        );
-        assert_eq!(mapping_generation, 2);
-        assert_eq!(identity_rx.try_recv().unwrap(), (2, None));
+        update_resolved_server(&mut current, target("http://127.0.0.1:9090", None, false));
+        assert_eq!(current.endpoint, "http://127.0.0.1:9090");
         assert!(!current.auto);
+        assert_eq!(current.identity, None);
     }
 
     #[test]

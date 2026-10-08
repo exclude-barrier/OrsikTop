@@ -17,7 +17,6 @@ mod system;
 mod ui;
 
 use std::{
-    collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -405,12 +404,11 @@ pub(crate) fn collect_server_list_with<S: system::Sys>(
     settings: &config::AppConfig,
 ) -> ServerList {
     let mut out: Vec<ServerSpec> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
     if let Some(server) = settings.server.as_deref() {
-        push_server(&mut out, &mut seen, server, None);
+        push_server(&mut out, server, None);
     }
     for server in &settings.servers {
-        push_server(&mut out, &mut seen, server, None);
+        push_server(&mut out, server, None);
     }
     if settings.auto_discovery {
         for candidate in discovery_llm::collect_candidates(sys, true, settings.server.as_deref()) {
@@ -420,11 +418,11 @@ pub(crate) fn collect_server_list_with<S: system::Sys>(
                     .map(|start_time| LocalServerIdentity { pid, start_time }),
                 ServerSource::Configured => None,
             };
-            push_server(&mut out, &mut seen, &candidate.endpoint, identity);
+            push_server(&mut out, &candidate.endpoint, identity);
         }
     }
     if out.is_empty() {
-        push_server(&mut out, &mut seen, DEFAULT_SERVER, None);
+        push_server(&mut out, DEFAULT_SERVER, None);
     }
     // Configured endpoints come first (primary, then extras), so the cap only
     // truncates the tail — discovered servers first, then configured extras
@@ -441,27 +439,29 @@ pub(crate) fn collect_server_list_with<S: system::Sys>(
     }
 }
 
-/// Add an endpoint under its stable key unless it is blank or already present.
-/// The first occurrence wins, so a configured endpoint keeps its (absent)
-/// discovery identity over a later duplicate.
-fn push_server(
-    out: &mut Vec<ServerSpec>,
-    seen: &mut HashSet<String>,
-    endpoint: &str,
-    identity: Option<LocalServerIdentity>,
-) {
+/// Add an endpoint under its stable key, or merge into an existing entry.
+///
+/// The first occurrence wins for the endpoint (configured priority), but a
+/// later duplicate that carries a verified local process identity adopts it
+/// when the existing entry has none — so a pinned `server=` that is also
+/// auto-discovered still gets its GPU association.
+fn push_server(out: &mut Vec<ServerSpec>, endpoint: &str, identity: Option<LocalServerIdentity>) {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
         return;
     }
     let key = server_key(trimmed);
-    if seen.insert(key.clone()) {
-        out.push(ServerSpec {
-            key,
-            endpoint: trimmed.to_string(),
-            identity,
-        });
+    if let Some(existing) = out.iter_mut().find(|spec| spec.key == key) {
+        if existing.identity.is_none() && identity.is_some() {
+            existing.identity = identity;
+        }
+        return;
     }
+    out.push(ServerSpec {
+        key,
+        endpoint: trimmed.to_string(),
+        identity,
+    });
 }
 
 #[cfg(test)]
@@ -677,6 +677,27 @@ mod tests {
             list.monitored.iter().all(|spec| spec.identity.is_some()),
             "{:?}",
             list.monitored
+        );
+    }
+
+    #[test]
+    fn configured_endpoint_adopts_a_discovered_identity() {
+        // `server=` pins a local endpoint that is also auto-discovered with a
+        // process identity: the merged entry keeps the configured endpoint but
+        // adopts the discovered identity so GPU attribution still works.
+        let settings = config::AppConfig {
+            server: Some("http://127.0.0.1:8081".to_string()),
+            auto_discovery: true,
+            ..config::AppConfig::default()
+        };
+        let sys = llama_fixture(&[(5000, 8081)]);
+        let list = collect_server_list_with(&sys, &settings);
+        assert_eq!(list.monitored.len(), 1, "duplicate endpoint is merged");
+        assert_eq!(list.monitored[0].endpoint, "http://127.0.0.1:8081");
+        assert!(
+            list.monitored[0].identity.is_some(),
+            "the discovered identity must be adopted: {:?}",
+            list.monitored[0]
         );
     }
 
