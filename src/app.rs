@@ -1823,6 +1823,140 @@ mod tests {
     }
 
     #[test]
+    fn integrated_selection_switch_rejects_delayed_gpu_mapping() {
+        use crate::domain::{DeviceId, GpuMapping};
+
+        // Two locally verified servers on distinct GPUs. Everything below runs
+        // through the production seams: `selected_identity_of` +
+        // `publish_selected_mapping` (selection → generation) and
+        // `map_server_identity` + `apply_fast_snapshot` (evidence → TUI), with
+        // no GPU hardware and no HTTP.
+        let gpus = vec![
+            discovered_gpu("0000:01:00.0"),
+            discovered_gpu("0000:02:00.0"),
+        ];
+        let ident_a = ident(5000, 1);
+        let ident_b = ident(6000, 1);
+        let specs = vec![
+            ServerSpec {
+                key: "a".to_string(),
+                endpoint: "http://127.0.0.1:8081".to_string(),
+                identity: Some(ident_a),
+            },
+            ServerSpec {
+                key: "b".to_string(),
+                endpoint: "http://127.0.0.1:8082".to_string(),
+                identity: Some(ident_b),
+            },
+        ];
+        let evidence_a = vec![DeviceId::new(Some("0000:01:00.0".into()), None)];
+        let evidence_b = vec![DeviceId::new(Some("0000:02:00.0".into()), None)];
+
+        let (tx, _rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
+        let mut mapping_generation = 0u64;
+        let mut selected = "a".to_string();
+        let mut snapshot = DashboardSnapshot::default();
+        let mut ui_state = UiState::default();
+        let publish = |selected: &str, generation: &mut u64, snapshot: &mut DashboardSnapshot| {
+            publish_selected_mapping(selected_identity_of(&specs, selected), generation, &tx);
+            // The app clears the shown mapping synchronously on any selection
+            // change so no stale device label survives the switch.
+            snapshot.gpu_map = GpuMapping::None;
+        };
+
+        // --- Select A → GPU 1. ---
+        publish(&selected, &mut mapping_generation, &mut snapshot);
+        let generation_a = mapping_generation;
+        let map_a = map_server_identity(ident_a, Some(1), evidence_a.clone(), Vec::new(), &gpus);
+        assert!(matches!(map_a, GpuMapping::Single(_)), "A maps to one GPU");
+        apply_fast_snapshot(
+            &mut snapshot,
+            &mut ui_state,
+            mapping_generation,
+            FastSnapshot {
+                gpu_map: map_a.clone(),
+                mapping_generation: generation_a,
+                ..FastSnapshot::default()
+            },
+        );
+        assert_eq!(snapshot.gpu_map, map_a, "GPU 1 displayed for A");
+
+        // --- Select B → A's mapping cleared immediately. ---
+        selected = "b".to_string();
+        publish(&selected, &mut mapping_generation, &mut snapshot);
+        assert!(
+            snapshot.gpu_map.is_empty(),
+            "switching servers must clear the previous attribution immediately"
+        );
+
+        // A delayed snapshot produced for A arrives under B → rejected.
+        apply_fast_snapshot(
+            &mut snapshot,
+            &mut ui_state,
+            mapping_generation,
+            FastSnapshot {
+                gpu_map: map_a.clone(),
+                mapping_generation: generation_a,
+                ..FastSnapshot::default()
+            },
+        );
+        assert!(
+            snapshot.gpu_map.is_empty(),
+            "delayed A snapshot must not be applied under B"
+        );
+
+        // B's valid snapshot → GPU 2.
+        let generation_b = mapping_generation;
+        let map_b = map_server_identity(ident_b, Some(1), evidence_b.clone(), Vec::new(), &gpus);
+        assert!(matches!(map_b, GpuMapping::Single(_)), "B maps to one GPU");
+        apply_fast_snapshot(
+            &mut snapshot,
+            &mut ui_state,
+            mapping_generation,
+            FastSnapshot {
+                gpu_map: map_b.clone(),
+                mapping_generation: generation_b,
+                ..FastSnapshot::default()
+            },
+        );
+        assert_eq!(snapshot.gpu_map, map_b, "GPU 2 displayed for B");
+        assert_ne!(map_a, map_b, "A and B are attributed to distinct GPUs");
+
+        // --- Switch back to A. ---
+        selected = "a".to_string();
+        publish(&selected, &mut mapping_generation, &mut snapshot);
+        assert!(
+            snapshot.gpu_map.is_empty(),
+            "B mapping cleared on return to A"
+        );
+        apply_fast_snapshot(
+            &mut snapshot,
+            &mut ui_state,
+            mapping_generation,
+            FastSnapshot {
+                gpu_map: map_b.clone(),
+                mapping_generation: generation_b,
+                ..FastSnapshot::default()
+            },
+        );
+        assert!(
+            snapshot.gpu_map.is_empty(),
+            "delayed B snapshot must not be applied under the second A selection"
+        );
+        apply_fast_snapshot(
+            &mut snapshot,
+            &mut ui_state,
+            mapping_generation,
+            FastSnapshot {
+                gpu_map: map_a.clone(),
+                mapping_generation,
+                ..FastSnapshot::default()
+            },
+        );
+        assert_eq!(snapshot.gpu_map, map_a, "fresh A snapshot re-shows GPU 1");
+    }
+
+    #[test]
     fn reused_pid_with_a_new_start_time_gets_no_gpu_mapping() {
         let gpus = vec![discovered_gpu("0000:01:00.0")];
         let evidence = vec![crate::domain::DeviceId::new(
