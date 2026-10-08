@@ -405,6 +405,7 @@ Subcommands:
 | --- | --- |
 | `orsiktop update` | Updates a standalone installation to the latest release |
 | `orsiktop diag` | Prints a no-secrets diagnostics summary for bug reports (honors `--server` and `--gpu`/`--gpu-index`) |
+| `orsiktop diag --servers` | Prints the multi-server overview: every monitored endpoint (up to 16) probed once, plus any configured endpoint past the cap listed as *not monitored* (never probed) |
 | `orsiktop uninstall` | Removes the standalone binaries, keeps the config |
 | `orsiktop uninstall --purge` | Removes the binaries and the config directory |
 

@@ -6,6 +6,18 @@ All notable changes to OrsikTop will be documented here.
 
 ### Added
 
+- Multi-server diagnostics: `orsiktop diag --servers` prints a read-only
+  overview of every monitored endpoint (up to the 16-server cap) — connection
+  state, model, slots, context and the verified local GPU association where
+  trustworthy evidence exists (a remote or non-local endpoint shows the
+  association is not evaluated, distinct from a local process that could not
+  be attributed). Probes reuse the existing bounded llama timeouts and run
+  concurrently (one scoped thread per server), so one unreachable server does
+  not hide the healthy ones. Configured endpoints past the cap are listed as
+  *not monitored* (never probed, availability not claimed), so they are never
+  confused with offline endpoints. All endpoints are redacted (`safe_endpoint`)
+  and no secrets are printed. The default `orsiktop diag` sections are
+  unchanged apart from the fix below.
 - Multi-server monitoring: OrsikTop now monitors every locally discovered
   llama.cpp server and every configured endpoint at once, instead of a single
   selected server. Additional endpoints can be listed in the config with
@@ -40,6 +52,15 @@ All notable changes to OrsikTop will be documented here.
   utilization. Device-level utilization is never presented as process-level
   usage, and a local endpoint that is also auto-discovered keeps its
   association.
+
+### Fixed
+
+- `orsiktop diag` no longer prints a fabricated slot count when `/slots` is
+  unavailable: the probe previously reported `0 busy / 0 total` for a server
+  whose `/metrics` answered but whose `/slots` did not, the same fabricated
+  zero the TUI already avoids. It now shows `—` (or `—/N total` from `/props`
+  when known). Likewise an unknown context capacity renders `—` instead of
+  `used/0`.
 
 ## [0.2.10] - 2026-10-08
 
