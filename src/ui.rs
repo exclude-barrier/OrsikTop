@@ -16,7 +16,7 @@ use crate::{
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
         GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu, ProcessIdentity,
-        ProcessStats, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+        ProcessStats, ServerSummary, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
 };
@@ -135,7 +135,13 @@ pub struct UiState {
     settings_process_refresh_ms: String,
     settings_offline_grace_ms: String,
     settings_auto_discovery: bool,
+    /// Additional configured endpoints, preserved verbatim across a settings
+    /// save (the dialog edits host/port of the primary endpoint).
+    settings_servers: Vec<String>,
     settings_error: Option<String>,
+    /// Multi-server selector: open state and highlighted row.
+    server_selector_open: bool,
+    server_selector_index: usize,
 }
 
 impl Default for UiState {
@@ -181,7 +187,10 @@ impl Default for UiState {
             settings_process_refresh_ms: "1000".to_string(),
             settings_offline_grace_ms: "2500".to_string(),
             settings_auto_discovery: true,
+            settings_servers: Vec::new(),
             settings_error: None,
+            server_selector_open: false,
+            server_selector_index: 0,
         }
     }
 }
@@ -246,6 +255,40 @@ impl UiState {
             self.llm_connected_since = None;
             self.llm_connected_flash_until = None;
         }
+    }
+
+    pub fn is_server_selector_open(&self) -> bool {
+        self.server_selector_open
+    }
+
+    /// Open the selector with the highlight on `selected_index` (the currently
+    /// selected server), so opening and confirming does not switch away.
+    pub fn open_server_selector(&mut self, selected_index: usize) {
+        self.server_selector_open = true;
+        self.server_selector_index = selected_index;
+        self.help_open = false;
+        self.process_search_open = false;
+        self.settings_open = false;
+    }
+
+    pub fn close_server_selector(&mut self) {
+        self.server_selector_open = false;
+    }
+
+    /// Move the highlight within `len` servers, wrapping around. No server is
+    /// selected by moving; `Enter` commits the highlight.
+    pub fn move_server_selection(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.server_selector_index = 0;
+            return;
+        }
+        let current = self.server_selector_index.min(len - 1) as isize;
+        self.server_selector_index = (current + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// The highlighted index, clamped to the current list length.
+    pub fn server_selector_index(&self, len: usize) -> Option<usize> {
+        (len > 0).then(|| self.server_selector_index.min(len - 1))
     }
 
     pub fn reset_llm_connection_state(&mut self) {
@@ -579,6 +622,7 @@ impl UiState {
         self.settings_process_refresh_ms = settings.process_refresh_ms.to_string();
         self.settings_offline_grace_ms = settings.offline_grace_ms.to_string();
         self.settings_auto_discovery = settings.auto_discovery;
+        self.settings_servers = settings.servers.clone();
         self.settings_error = None;
     }
 
@@ -709,6 +753,7 @@ impl UiState {
 
         Ok(AppConfig {
             server: Some(endpoint),
+            servers: self.settings_servers.clone(),
             gpu_selector,
             refresh_ms,
             process_refresh_ms,
@@ -904,6 +949,8 @@ pub fn draw(
     llm: &LlmStats,
     gpu: &GpuStats,
     gpu_map: &GpuMapping,
+    servers: &[ServerSummary],
+    selected_server: &str,
     state: &mut UiState,
     server: &str,
     refresh_ms: u64,
@@ -950,18 +997,34 @@ pub fn draw(
             .split(area)
     };
 
-    draw_header(frame, rows[0], llm, state, server, refresh_ms, server_auto);
+    draw_header(
+        frame,
+        rows[0],
+        llm,
+        state,
+        server,
+        refresh_ms,
+        server_auto,
+        servers,
+        selected_server,
+    );
     draw_gpu(frame, rows[1], gpu, gpu_map);
     draw_llm_and_system(frame, rows[2], system, llm, state, gpu_map);
 
     if show_history {
         draw_bottom(frame, rows[3], state, &system.processes);
-        draw_footer(frame, rows[4], llm, gpu, state);
-    } else {
-        draw_footer(frame, rows[4], llm, gpu, state);
     }
+    draw_footer(frame, rows[4], llm, gpu, state);
 
-    if state.settings_open {
+    if state.server_selector_open {
+        draw_server_selector(
+            frame,
+            area,
+            servers,
+            selected_server,
+            state.server_selector_index,
+        );
+    } else if state.settings_open {
         draw_settings_popup(frame, area, state);
     } else if state.help_open {
         draw_help_popup(frame, area);
@@ -982,6 +1045,7 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_header(
     frame: &mut Frame,
     area: Rect,
@@ -990,6 +1054,8 @@ fn draw_header(
     server: &str,
     refresh_ms: u64,
     server_auto: bool,
+    servers: &[ServerSummary],
+    selected_server: &str,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1033,6 +1099,16 @@ fn draw_header(
         ]);
         if server_auto {
             spans.push(Span::styled(" ·auto", Style::default().fg(MUTED)));
+        }
+        if servers.len() > 1 {
+            let index = servers
+                .iter()
+                .position(|summary| summary.key == selected_server)
+                .map_or(0, |position| position + 1);
+            spans.push(Span::styled(
+                format!("  [{index}/{}]  s = servers", servers.len()),
+                Style::default().fg(MUTED),
+            ));
         }
 
         frame.render_widget(
@@ -3964,7 +4040,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, st
 
 fn draw_help_popup(frame: &mut Frame, area: Rect) {
     let width = area.width.saturating_sub(6).min(72);
-    let height = area.height.saturating_sub(4).min(20);
+    let height = area.height.saturating_sub(4).min(22);
     if width < 48 || height < 16 {
         return;
     }
@@ -4000,6 +4076,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![key("Esc"), desc("Quit")]),
         Line::from(vec![key("h"), desc("Toggle this help")]),
         Line::from(vec![key("q"), desc("Open settings")]),
+        Line::from(vec![key("s"), desc("Server selector (multi-server)")]),
         Line::from(vec![key("/"), desc("Search / filter processes")]),
         Line::from(vec![
             key("- / +"),
@@ -4053,6 +4130,92 @@ fn draw_settings_too_small(frame: &mut Frame, area: Rect) {
         ))),
         inner,
     );
+}
+
+/// Multi-server selector/overview popup. Lists every known server with its
+/// state, slot counts, context and throughput; the selected server is marked
+/// `*` and the highlighted row `>`. Endpoints are redacted before display.
+fn draw_server_selector(
+    frame: &mut Frame,
+    area: Rect,
+    servers: &[ServerSummary],
+    selected_server: &str,
+    highlight: usize,
+) {
+    let width = area.width.saturating_sub(6).min(78);
+    let height = (servers.len() as u16 + 4)
+        .min(area.height.saturating_sub(4))
+        .max(5);
+    if width < 48 || height < 5 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" LLM SERVERS · Up/Down · Enter select · Esc close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let highlight = if servers.is_empty() {
+        0
+    } else {
+        highlight.min(servers.len() - 1)
+    };
+    let mut lines: Vec<Line> = Vec::with_capacity(servers.len());
+    for (index, server) in servers.iter().enumerate() {
+        let is_selected = server.key == selected_server;
+        let marker = if index == highlight { ">" } else { " " };
+        let star = if is_selected { "*" } else { " " };
+        let (state, state_color) = if server.connected {
+            ("connected", ORK_GREEN)
+        } else if server.reconnecting {
+            ("reconnecting", YELLOW)
+        } else {
+            ("offline", MUTED)
+        };
+        let ctx = match (server.context_used, server.context_size) {
+            (Some(used), size) if size > 0 => format!("{used}/{size}"),
+            (None, size) if size > 0 => format!("—/{size}"),
+            _ => "—".to_string(),
+        };
+        let tps = server.generation_tps.map_or_else(
+            || "— tok/s".to_string(),
+            |value| format!("{value:.1} tok/s"),
+        );
+        let label = fit_cell(&server.label, 20);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{star} "),
+                Style::default().fg(if index == highlight { CYAN } else { MUTED }),
+            ),
+            Span::styled(format!("{label:<20} "), Style::default().fg(WHITE)),
+            Span::styled(format!("{state:<12} "), Style::default().fg(state_color)),
+            Span::styled(
+                format!("S {}/{}  ", server.busy_slots, server.slot_count),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(format!("CTX {ctx:<13} "), Style::default().fg(MUTED)),
+            Span::styled(format!("{tps:<12} "), Style::default().fg(MUTED)),
+            Span::styled(
+                compact_endpoint(&server.endpoint),
+                Style::default().fg(DIM_GREEN),
+            ),
+        ]));
+    }
+    if servers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no servers known",
+            Style::default().fg(MUTED),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
@@ -5476,6 +5639,23 @@ mod tests {
     }
 
     #[test]
+    fn server_selector_navigation_wraps_and_clamps() {
+        let mut state = UiState::default();
+        assert!(!state.is_server_selector_open());
+        state.open_server_selector(2);
+        assert!(state.is_server_selector_open());
+        assert_eq!(state.server_selector_index(3), Some(2), "opens on selected");
+        state.move_server_selection(1, 3);
+        assert_eq!(state.server_selector_index(3), Some(0), "wraps forward");
+        state.move_server_selection(-1, 3);
+        assert_eq!(state.server_selector_index(3), Some(2), "wraps backward");
+        state.move_server_selection(1, 0);
+        assert_eq!(state.server_selector_index(0), None);
+        state.close_server_selector();
+        assert!(!state.is_server_selector_open());
+    }
+
+    #[test]
     fn endpoint_is_compact() {
         assert_eq!(compact_endpoint("http://127.0.0.1:8081/"), "127.0.0.1:8081");
     }
@@ -5514,6 +5694,7 @@ mod tests {
         let mut state = UiState::default();
         let settings = AppConfig {
             server: Some("http://127.0.0.1:8081".to_string()),
+            servers: Vec::new(),
             gpu_selector: GpuSelector::PciBusId("0000:41:00.0".to_string()),
             refresh_ms: 200,
             process_refresh_ms: 1500,

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::Stdout,
     sync::{
@@ -25,7 +26,8 @@ use crate::{
     discovery_llm::LocalServerIdentity,
     domain::{
         DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessIdentity, ProcessStats,
-        SystemStats, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
+        ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
+        MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
     drm::{sample_process_gpus, DrmSamplerState},
     gpu::new_gpu_provider,
@@ -57,6 +59,11 @@ pub fn run(
     initial_settings: config::AppConfig,
     // True when `server` was resolved via local auto-discovery.
     server_auto: bool,
+    // Full set of servers to monitor, in display order (configured + locally
+    // discovered), already de-duplicated.
+    servers: Vec<ServerSpec>,
+    // Stable key of the server selected at startup.
+    default_selected: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Endpoint, local server identity and origin are tracked together but
     // compared independently: a stable URL can still get a new identity, and
@@ -75,10 +82,12 @@ pub fn run(
     let gpu_selector_shared = Arc::new(RwLock::new(settings.gpu_selector.clone()));
     let stop = Arc::new(AtomicBool::new(false));
     let (fast_tx, fast_rx) = mpsc::sync_channel::<FastSnapshot>(2);
-    let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmSample>(2);
-    // Endpoint/PID/origin changes are carried with a monotonically increasing
-    // generation so a result produced for a previous target can be rejected
-    // instead of being shown under the new one (see `apply_server_resolution`).
+    // One sample per server per cycle must fit without being dropped, so the
+    // bound matches the server cap rather than the single-server size.
+    let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmSample>(MAX_MONITORED_SERVERS);
+    // Server-set changes are carried with a monotonically increasing
+    // generation so a result produced for a previous set can be rejected
+    // instead of being shown under the new one (see `sync_server_set`).
     let (server_tx, server_rx) = mpsc::channel::<LlmCommand>();
     let (server_identity_tx, server_identity_rx) =
         mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
@@ -87,6 +96,22 @@ pub fn run(
     if let Some(identity) = server_identity {
         let _ = server_identity_tx.send((mapping_generation, Some(identity)));
     }
+
+    // Multi-server registry: the full endpoint set to monitor, keyed by stable
+    // identity, in a deterministic display order. `resolved` above still
+    // describes the primary local server whose process is mapped to a GPU.
+    let mut server_list = servers;
+    let mut order: Vec<String> = server_list.iter().map(|spec| spec.key.clone()).collect();
+    let mut endpoints: BTreeMap<String, String> = server_list
+        .iter()
+        .map(|spec| (spec.key.clone(), spec.endpoint.clone()))
+        .collect();
+    let mut registry: BTreeMap<String, LlmStats> = BTreeMap::new();
+    let mut selected = if endpoints.contains_key(&default_selected) {
+        default_selected
+    } else {
+        order.first().cloned().unwrap_or_default()
+    };
 
     let fast_worker = spawn_fast_worker(
         Arc::clone(&gpu_selector_shared),
@@ -97,7 +122,7 @@ pub fn run(
         server_identity_rx,
     );
     let llm_worker = spawn_llm_worker(
-        resolved.endpoint.clone(),
+        server_list.clone(),
         Arc::clone(&refresh_shared),
         Arc::clone(&offline_grace_shared),
         Arc::clone(&stop),
@@ -114,15 +139,24 @@ pub fn run(
             apply_fast_snapshot(&mut snapshot, &mut ui_state, mapping_generation, next);
         }
         while let Ok(next) = llm_rx.try_recv() {
-            // Drop results produced for a server we already switched away from:
-            // they can still arrive after the channel drained (a sample was
-            // already in flight) and must not appear under the new endpoint.
+            // Drop results produced for a server set we already replaced, or
+            // for a server that is no longer known: they must not appear under
+            // a different server's state.
             if !accepts_llm_sample(llm_generation, &next) {
                 continue;
             }
-            ui_state.observe_llm_sample(&next.stats);
-            snapshot.llm = next.stats;
+            if !endpoints.contains_key(&next.server) {
+                continue;
+            }
+            let is_selected = next.server == selected;
+            registry.insert(next.server, next.stats.clone());
+            if is_selected {
+                ui_state.observe_llm_sample(&next.stats);
+                snapshot.llm = next.stats;
+            }
         }
+        snapshot.servers = build_server_summaries(&order, &endpoints, &registry);
+        snapshot.selected_server = selected.clone();
 
         // S16: an auto-discovered server is dynamic — it can restart on the
         // same port (new PID) or exit entirely during a run. Re-resolve on a
@@ -132,13 +166,21 @@ pub fn run(
         // frame; the worst-case staleness is `SERVER_RESYNC_INTERVAL`.
         if settings.auto_discovery && last_server_resync.elapsed() >= SERVER_RESYNC_INTERVAL {
             let next = crate::resolve_monitor_target(&settings);
-            apply_server_resolution(
+            apply_server_mapping(
                 &mut resolved,
                 next,
-                &mut llm_generation,
                 &mut mapping_generation,
-                &server_tx,
                 &server_identity_tx,
+            );
+            sync_server_set(
+                &settings,
+                &mut server_list,
+                &mut order,
+                &mut endpoints,
+                &mut registry,
+                &mut selected,
+                &mut llm_generation,
+                &server_tx,
                 &mut snapshot,
                 &mut ui_state,
             );
@@ -152,6 +194,8 @@ pub fn run(
                 &snapshot.llm,
                 &snapshot.gpu,
                 &snapshot.gpu_map,
+                &snapshot.servers,
+                &snapshot.selected_server,
                 &mut ui_state,
                 &resolved.endpoint,
                 refresh_ms,
@@ -165,7 +209,8 @@ pub fn run(
                     if key.kind == KeyEventKind::Repeat
                         && !ui_state.is_help_open()
                         && !ui_state.is_settings_open()
-                        && !ui_state.is_process_search_open() =>
+                        && !ui_state.is_process_search_open()
+                        && !ui_state.is_server_selector_open() =>
                 {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -213,13 +258,21 @@ pub fn run(
                                     // auto/manual origin without changing the
                                     // endpoint (and vice versa).
                                     let next = crate::resolve_monitor_target(&settings);
-                                    apply_server_resolution(
+                                    apply_server_mapping(
                                         &mut resolved,
                                         next,
-                                        &mut llm_generation,
                                         &mut mapping_generation,
-                                        &server_tx,
                                         &server_identity_tx,
+                                    );
+                                    sync_server_set(
+                                        &settings,
+                                        &mut server_list,
+                                        &mut order,
+                                        &mut endpoints,
+                                        &mut registry,
+                                        &mut selected,
+                                        &mut llm_generation,
+                                        &server_tx,
                                         &mut snapshot,
                                         &mut ui_state,
                                     );
@@ -255,7 +308,34 @@ pub fn run(
                         _ => {}
                     }
                 }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press && ui_state.is_server_selector_open() =>
+                {
+                    match key.code {
+                        KeyCode::Esc => ui_state.close_server_selector(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            ui_state.move_server_selection(-1, order.len());
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            ui_state.move_server_selection(1, order.len());
+                        }
+                        KeyCode::Enter => {
+                            if let Some(index) = ui_state.server_selector_index(order.len()) {
+                                if let Some(key) = order.get(index) {
+                                    selected = key.clone();
+                                    snapshot.llm = registry.get(key).cloned().unwrap_or_default();
+                                    ui_state.reset_llm_connection_state();
+                                }
+                            }
+                            ui_state.close_server_selector();
+                        }
+                        _ => {}
+                    }
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('s') => ui_state.open_server_selector(
+                        order.iter().position(|key| key == &selected).unwrap_or(0),
+                    ),
                     KeyCode::Char('/') => ui_state.open_process_search(),
                     KeyCode::Char('h') => ui_state.toggle_help(),
                     KeyCode::Esc if ui_state.is_help_open() => ui_state.close_help(),
@@ -289,7 +369,8 @@ pub fn run(
                 Event::Mouse(mouse)
                     if !ui_state.is_help_open()
                         && !ui_state.is_settings_open()
-                        && !ui_state.is_process_search_open() =>
+                        && !ui_state.is_process_search_open()
+                        && !ui_state.is_server_selector_open() =>
                 {
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -412,6 +493,8 @@ fn reconcile_server(
 /// new endpoint. Generations increase monotonically, so A→B→A is handled too
 /// (the second A session has a different generation than the first).
 struct LlmSample {
+    /// Stable identity key of the server this sample was produced for.
+    server: String,
     generation: u64,
     stats: LlmStats,
 }
@@ -421,16 +504,58 @@ fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
     sample.generation == current_generation
 }
 
+/// Build the compact per-server summaries for the overview, in `order`.
+fn build_server_summaries(
+    order: &[String],
+    endpoints: &BTreeMap<String, String>,
+    registry: &BTreeMap<String, LlmStats>,
+) -> Vec<ServerSummary> {
+    order
+        .iter()
+        .map(|key| {
+            let endpoint = endpoints.get(key).cloned().unwrap_or_default();
+            let stats = registry.get(key);
+            let label = stats
+                .map(|stats| stats.model.clone())
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| crate::redact::safe_endpoint(&endpoint));
+            ServerSummary {
+                key: key.clone(),
+                endpoint,
+                label,
+                connected: stats.is_some_and(|stats| stats.connected && !stats.reconnecting),
+                reconnecting: stats.is_some_and(|stats| stats.reconnecting),
+                slot_count: stats.map_or(0, |stats| stats.slot_count),
+                busy_slots: stats.map_or(0, |stats| stats.busy_slots),
+                context_used: stats.and_then(|stats| stats.context_used),
+                context_size: stats.map_or(0, |stats| stats.context_size),
+                generation_tps: stats.and_then(|stats| stats.generation_tps),
+            }
+        })
+        .collect()
+}
+
+/// One server to monitor: a stable key, the endpoint to poll, and (for a
+/// locally discovered process) its identity so a same-endpoint restart can be
+/// detected and that server's caches reset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServerSpec {
+    pub key: String,
+    pub endpoint: String,
+    pub identity: Option<LocalServerIdentity>,
+}
+
 /// Command to the LLM worker.
 enum LlmCommand {
-    /// Poll a new endpoint: start a new LLM session (new generation).
-    Switch { generation: u64, endpoint: String },
-    /// The process behind the current endpoint was replaced (e.g. a llama.cpp
-    /// restart on the same port). A new process is not a cosmetic label
-    /// change: its /metrics counters and /props start over, so the
-    /// server-dependent caches (counter baselines, cached props, slot
-    /// baselines) are dropped without starting a new LLM session.
-    ResetServer,
+    /// Replace the monitored server set. `generation` tags every sample the
+    /// worker produces from now on; a monitor whose key, endpoint and identity
+    /// all persist keeps its per-server baselines, while a new key — or the
+    /// same key with a changed process identity (a same-port restart) — starts
+    /// fresh, and a dropped key is discarded.
+    SetServers {
+        generation: u64,
+        servers: Vec<ServerSpec>,
+    },
 }
 
 /// Apply a fast snapshot.
@@ -454,41 +579,17 @@ fn apply_fast_snapshot(
     }
 }
 
-/// Apply an independently-detected endpoint/PID/origin change to the running
-/// app:
-/// * an endpoint change resets the LLM HTTP session (a new server to poll) and
-///   advances the LLM generation, so late results of the previous session are
-///   rejected;
-/// * a PID-only change updates the local GPU mapping without touching the
-///   monitor or its history (a pure local re-attribution), advancing the
-///   mapping generation so a stale mapping cannot overwrite the new one;
-/// * an origin-only change just relabels the display.
-#[allow(clippy::too_many_arguments)]
-fn apply_server_resolution(
+/// Re-attribute the primary local process to a GPU (or clear it) on an
+/// independently-detected PID/origin change, advancing the mapping generation
+/// so a stale mapping cannot overwrite the new state. The LLM server set is
+/// reconciled separately by `sync_server_set`.
+fn apply_server_mapping(
     current: &mut crate::ResolvedServer,
     next: crate::ResolvedServer,
-    llm_generation: &mut u64,
     mapping_generation: &mut u64,
-    server_tx: &mpsc::Sender<LlmCommand>,
     server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
-    snapshot: &mut DashboardSnapshot,
-    ui_state: &mut UiState,
 ) {
     let change = reconcile_server(current, &next);
-    if change.endpoint {
-        *llm_generation = llm_generation.wrapping_add(1);
-        snapshot.llm = LlmStats::default();
-        ui_state.reset_llm_connection_state();
-        let _ = server_tx.send(LlmCommand::Switch {
-            generation: *llm_generation,
-            endpoint: next.endpoint.clone(),
-        });
-    } else if change.pid {
-        // Same endpoint, new process: reset the monitor's server-dependent
-        // caches (counter baselines, /props) so a restart cannot produce
-        // spurious deltas or carry stale speculative parameters.
-        let _ = server_tx.send(LlmCommand::ResetServer);
-    }
     if change.pid {
         // The fast worker recomputes the server→GPU mapping from this identity;
         // a `None` clears it so a vanished server leaves no stale attribution.
@@ -497,6 +598,50 @@ fn apply_server_resolution(
     }
     if change.endpoint || change.pid || change.auto {
         *current = next;
+    }
+}
+
+/// Reconcile the monitored server set against the current settings/discovery.
+///
+/// When the set changes, a new LLM generation is started and the worker is
+/// told the full new list. Per-server baselines for keys that persist are kept
+/// by the worker. The selection falls back deterministically to the first
+/// entry (by discovery order) only when the selected server is gone.
+#[allow(clippy::too_many_arguments)]
+fn sync_server_set(
+    settings: &config::AppConfig,
+    server_list: &mut Vec<ServerSpec>,
+    order: &mut Vec<String>,
+    endpoints: &mut BTreeMap<String, String>,
+    registry: &mut BTreeMap<String, LlmStats>,
+    selected: &mut String,
+    llm_generation: &mut u64,
+    server_tx: &mpsc::Sender<LlmCommand>,
+    snapshot: &mut DashboardSnapshot,
+    ui_state: &mut UiState,
+) {
+    let next_list = crate::collect_server_list(settings);
+    if next_list == *server_list {
+        return;
+    }
+    *llm_generation = llm_generation.wrapping_add(1);
+    let _ = server_tx.send(LlmCommand::SetServers {
+        generation: *llm_generation,
+        servers: next_list.clone(),
+    });
+    *server_list = next_list;
+    *order = server_list.iter().map(|spec| spec.key.clone()).collect();
+    endpoints.clear();
+    endpoints.extend(
+        server_list
+            .iter()
+            .map(|spec| (spec.key.clone(), spec.endpoint.clone())),
+    );
+    registry.retain(|key, _| endpoints.contains_key(key));
+    if !endpoints.contains_key(selected) {
+        *selected = order.first().cloned().unwrap_or_default();
+        snapshot.llm = registry.get(selected).cloned().unwrap_or_default();
+        ui_state.reset_llm_connection_state();
     }
 }
 
@@ -940,8 +1085,63 @@ fn read_cpu_frequency_mhz(sys: &dyn Sys) -> Option<f64> {
     (count > 0).then_some(total / count as f64)
 }
 
+/// One monitored server's worker-side state.
+struct LlmServerMonitor {
+    key: String,
+    endpoint: String,
+    /// Process identity of a locally discovered server (pid + start time); a
+    /// change on the same key means the process restarted, so the monitor's
+    /// caches are rebuilt.
+    identity: Option<LocalServerIdentity>,
+    monitor: Option<LlamaMonitor>,
+    init_error: String,
+    /// Per-server last good sample and its time, for the offline-grace hold.
+    last_good: Option<(LlmStats, Instant)>,
+}
+
+fn new_server_monitor(spec: ServerSpec) -> LlmServerMonitor {
+    let monitor = LlamaMonitor::new(&spec.endpoint).ok();
+    let init_error = if monitor.is_none() {
+        "failed to initialize HTTP client".to_string()
+    } else {
+        String::new()
+    };
+    LlmServerMonitor {
+        key: spec.key,
+        endpoint: spec.endpoint,
+        identity: spec.identity,
+        monitor,
+        init_error,
+        last_good: None,
+    }
+}
+
+/// Rebuild the monitor list for a new server set. A monitor is preserved only
+/// when its key, endpoint *and* process identity all still match, so a periodic
+/// resync keeps telemetry for an unchanged server while a same-endpoint
+/// restart (new identity) resets that server's caches.
+fn rebuild_server_monitors(
+    existing: Vec<LlmServerMonitor>,
+    list: Vec<ServerSpec>,
+) -> Vec<LlmServerMonitor> {
+    let mut old: BTreeMap<String, LlmServerMonitor> = existing
+        .into_iter()
+        .map(|monitor| (monitor.key.clone(), monitor))
+        .collect();
+    list.into_iter()
+        .map(|spec| match old.remove(&spec.key) {
+            Some(existing)
+                if existing.endpoint == spec.endpoint && existing.identity == spec.identity =>
+            {
+                existing
+            }
+            _ => new_server_monitor(spec),
+        })
+        .collect()
+}
+
 fn spawn_llm_worker(
-    server: String,
+    initial_servers: Vec<ServerSpec>,
     refresh_ms: Arc<AtomicU64>,
     offline_grace_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -949,68 +1149,75 @@ fn spawn_llm_worker(
     server_rx: Receiver<LlmCommand>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut current_server = server;
-        // Generation of the LLM session this worker is currently configured
-        // for; every published sample is tagged with it so the app can reject
-        // results of a session it already switched away from.
-        let mut current_generation: u64 = 0;
-        let mut llama = LlamaMonitor::new(&current_server).ok();
-        let mut llama_init_error = if llama.is_none() {
-            "failed to initialize HTTP client".to_string()
-        } else {
-            String::new()
-        };
-        let mut last_good_llm: Option<(LlmStats, Instant)> = None;
+        // Session generation of the current server set; every published sample
+        // is tagged with it so a result from a set the app already replaced can
+        // be rejected. Each server additionally carries its own key, so samples
+        // never cross server boundaries.
+        let mut generation: u64 = 0;
+        let mut servers: Vec<LlmServerMonitor> = initial_servers
+            .into_iter()
+            .map(new_server_monitor)
+            .collect();
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
             while let Ok(command) = server_rx.try_recv() {
                 match command {
-                    LlmCommand::Switch {
-                        generation,
-                        endpoint,
+                    LlmCommand::SetServers {
+                        generation: next_generation,
+                        servers: list,
                     } => {
-                        current_generation = generation;
-                        current_server = endpoint;
-                    }
-                    LlmCommand::ResetServer => {
-                        // Same endpoint, new process: keep the generation (and
-                        // thus the UI history) but drop every server-dependent
-                        // cache by rebuilding the monitor.
+                        generation = next_generation;
+                        servers = rebuild_server_monitors(servers, list);
                     }
                 }
-                llama = LlamaMonitor::new(&current_server).ok();
-                llama_init_error = if llama.is_none() {
-                    "failed to initialize HTTP client".to_string()
-                } else {
-                    String::new()
-                };
-                last_good_llm = None;
             }
-            // `sample` is synchronous; `current_generation` cannot change
-            // while it runs, so the tag is the session this sample belongs to.
-            let raw_stats = match llama.as_mut() {
-                Some(monitor) => monitor.sample(),
-                None => LlmStats {
-                    error: llama_init_error.clone(),
-                    ..Default::default()
-                },
-            };
+
             let offline_grace = Duration::from_millis(
                 offline_grace_ms
                     .load(Ordering::Relaxed)
                     .min(config::MAX_OFFLINE_GRACE_MS),
             );
-            let stats =
-                stabilize_llm_sample(raw_stats, &mut last_good_llm, Instant::now(), offline_grace);
-
-            let sample = LlmSample {
-                generation: current_generation,
-                stats,
-            };
-            match tx.try_send(sample) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => break,
+            // Poll every server concurrently (bounded by the server cap), so a
+            // slow or hanging server cannot delay a healthy server's refresh.
+            // `sample` is synchronous per server; a scoped thread per server is
+            // bounded and joined within the cycle.
+            let samples: Vec<LlmSample> = thread::scope(|scope| {
+                let handles: Vec<_> = servers
+                    .iter_mut()
+                    .map(|server| {
+                        scope.spawn(move || {
+                            let raw_stats = match server.monitor.as_mut() {
+                                Some(monitor) => monitor.sample(),
+                                None => LlmStats {
+                                    error: server.init_error.clone(),
+                                    ..Default::default()
+                                },
+                            };
+                            let stats = stabilize_llm_sample(
+                                raw_stats,
+                                &mut server.last_good,
+                                Instant::now(),
+                                offline_grace,
+                            );
+                            LlmSample {
+                                server: server.key.clone(),
+                                generation,
+                                stats,
+                            }
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect()
+            });
+            for sample in samples {
+                match tx.try_send(sample) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
             }
 
             sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_LLM_POLL_MS, &stop);
@@ -1086,6 +1293,14 @@ fn sleep_until_next_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_spec(key: &str, endpoint: &str) -> ServerSpec {
+        ServerSpec {
+            key: key.to_string(),
+            endpoint: endpoint.to_string(),
+            identity: None,
+        }
+    }
 
     #[test]
     fn per_cpu_usage_is_indexed_by_kernel_cpu_id_with_holes() {
@@ -1426,148 +1641,61 @@ mod tests {
     }
 
     #[test]
-    fn apply_resets_llm_only_on_endpoint_change_and_forwards_identity() {
-        let (server_tx, server_rx) = mpsc::channel::<LlmCommand>();
+    fn apply_server_mapping_updates_only_the_gpu_mapping() {
         let (identity_tx, identity_rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
-        let mut snapshot = DashboardSnapshot::default();
-        snapshot.llm.model = "kept".to_string();
-        let mut ui_state = UiState::default();
-        let mut llm_generation = 0u64;
         let mut mapping_generation = 0u64;
         let mut current = target("http://127.0.0.1:8081", Some(ident(5000, 1)), true);
 
         // An identity-only change (server restart, same URL): the GPU mapping
-        // is refreshed, but the LLM session and its history are preserved.
-        apply_server_resolution(
+        // is refreshed.
+        apply_server_mapping(
             &mut current,
             target("http://127.0.0.1:8081", Some(ident(6000, 1)), true),
-            &mut llm_generation,
             &mut mapping_generation,
-            &server_tx,
             &identity_tx,
-            &mut snapshot,
-            &mut ui_state,
-        );
-        assert_eq!(snapshot.llm.model, "kept");
-        assert_eq!(
-            llm_generation, 0,
-            "identity-only change keeps the LLM session"
         );
         assert_eq!(mapping_generation, 1);
         assert_eq!(identity_rx.try_recv().unwrap(), (1, Some(ident(6000, 1))));
-        // A same-endpoint process change resets the server-dependent caches
-        // but keeps the LLM session (generation unchanged).
-        assert!(matches!(
-            server_rx.try_recv().unwrap(),
-            LlmCommand::ResetServer
-        ));
         assert_eq!(current.identity, Some(ident(6000, 1)));
 
-        // An endpoint change resets the LLM session and re-targets the worker;
-        // the identity is cleared along with the local attribution.
-        apply_server_resolution(
+        // An endpoint change clears the local attribution too.
+        apply_server_mapping(
             &mut current,
             target("http://127.0.0.1:9090", None, false),
-            &mut llm_generation,
             &mut mapping_generation,
-            &server_tx,
             &identity_tx,
-            &mut snapshot,
-            &mut ui_state,
         );
-        assert_eq!(
-            snapshot.llm.model, "",
-            "endpoint change resets the LLM session"
-        );
-        assert_eq!(llm_generation, 1);
         assert_eq!(mapping_generation, 2);
-        assert!(matches!(
-            server_rx.try_recv().unwrap(),
-            LlmCommand::Switch { generation: 1, endpoint } if endpoint == "http://127.0.0.1:9090"
-        ));
         assert_eq!(identity_rx.try_recv().unwrap(), (2, None));
         assert!(!current.auto);
     }
 
     #[test]
-    fn stale_llm_sample_is_rejected_across_a_b_a() {
-        let (server_tx, _server_rx) = mpsc::channel::<LlmCommand>();
-        let (identity_tx, _identity_rx) = mpsc::channel::<(u64, Option<LocalServerIdentity>)>();
-        let mut snapshot = DashboardSnapshot::default();
-        let mut ui_state = UiState::default();
-        let mut llm_generation = 0u64;
-        let mut mapping_generation = 0u64;
-        let mut current = target("http://127.0.0.1:8081", Some(ident(1, 1)), true);
-
+    fn stale_llm_sample_is_rejected_across_generations() {
+        // A sample is accepted only under the current generation; the A→B→A
+        // case is handled because the second A session has a new generation.
         let a_sample = LlmSample {
+            server: "http://a:1/".to_string(),
             generation: 0,
             stats: LlmStats {
                 model: "A".to_string(),
                 ..Default::default()
             },
         };
-        assert!(accepts_llm_sample(llm_generation, &a_sample));
-
-        let switch = |current: &mut crate::ResolvedServer,
-                      next,
-                      llm_generation: &mut u64,
-                      mapping_generation: &mut u64,
-                      snapshot: &mut DashboardSnapshot,
-                      ui_state: &mut UiState| {
-            apply_server_resolution(
-                current,
-                next,
-                llm_generation,
-                mapping_generation,
-                &server_tx,
-                &identity_tx,
-                snapshot,
-                ui_state,
-            );
-        };
-
-        // Switch A → B: the endpoint change advances the LLM generation, so
-        // A's in-flight result must be rejected under B.
-        switch(
-            &mut current,
-            target("http://127.0.0.1:9090", Some(ident(2, 1)), true),
-            &mut llm_generation,
-            &mut mapping_generation,
-            &mut snapshot,
-            &mut ui_state,
-        );
-        assert_eq!(llm_generation, 1);
-        assert!(!accepts_llm_sample(llm_generation, &a_sample));
+        assert!(accepts_llm_sample(0, &a_sample));
         let b_sample = LlmSample {
+            server: "http://b:1/".to_string(),
             generation: 1,
             stats: LlmStats {
                 model: "B".to_string(),
                 ..Default::default()
             },
         };
-        assert!(accepts_llm_sample(llm_generation, &b_sample));
-
-        // Back to A: a *new* generation. A late result from the first A
-        // session (generation 0) is still rejected even though the URL matches
-        // A again — a pure URL comparison could not distinguish them.
-        switch(
-            &mut current,
-            target("http://127.0.0.1:8081", Some(ident(3, 1)), true),
-            &mut llm_generation,
-            &mut mapping_generation,
-            &mut snapshot,
-            &mut ui_state,
-        );
-        assert_eq!(llm_generation, 2);
-        assert!(!accepts_llm_sample(llm_generation, &a_sample));
-        let a2_sample = LlmSample {
-            generation: 2,
-            stats: LlmStats {
-                model: "A".to_string(),
-                ..Default::default()
-            },
-        };
-        assert!(accepts_llm_sample(llm_generation, &a2_sample));
+        assert!(accepts_llm_sample(1, &b_sample));
+        // A delayed result from the first A session is rejected under B and
+        // under the second A session (generation 2).
+        assert!(!accepts_llm_sample(1, &a_sample));
+        assert!(!accepts_llm_sample(2, &a_sample));
     }
 
     #[test]
@@ -2080,11 +2208,14 @@ mod tests {
     }
 
     #[test]
-    fn real_worker_drops_delayed_results_across_an_endpoint_switch() {
+    fn real_worker_tags_samples_per_server_across_a_set_change() {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel::<()>();
         let (a_addr, a_stop, a_handle) = spawn_gated_server(Arc::clone(&release), started_tx);
         let (b_addr, b_stop, b_handle) = spawn_plain_server("model-B", 8192, 10_000, 20_000);
+
+        let key_a = crate::domain::server_key(&format!("http://{a_addr}"));
+        let key_b = crate::domain::server_key(&format!("http://{b_addr}"));
 
         let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
         let offline = Arc::new(AtomicU64::new(2_500));
@@ -2093,7 +2224,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
 
         let worker = spawn_llm_worker(
-            format!("http://{a_addr}"),
+            vec![test_spec(&key_a, &format!("http://{a_addr}"))],
             Arc::clone(&refresh),
             Arc::clone(&offline),
             Arc::clone(&stop),
@@ -2101,99 +2232,243 @@ mod tests {
             cmd_rx,
         );
 
-        // 1-2: the real worker has an A request in flight, held by the mock.
+        // The real worker has an A request in flight, held by the mock.
         started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("worker must contact server A");
 
-        // 3: switch the monitored target to B.
+        // Replace the monitored set with B under a new generation.
         cmd_tx
-            .send(LlmCommand::Switch {
+            .send(LlmCommand::SetServers {
                 generation: 1,
-                endpoint: format!("http://{b_addr}"),
+                servers: vec![test_spec(&key_b, &format!("http://{b_addr}"))],
             })
             .unwrap();
 
-        // 4: release A's delayed response.
+        // Release A's delayed response.
         {
             let (lock, condvar) = &*release;
             *lock.lock().unwrap() = true;
             condvar.notify_all();
         }
 
-        // 5-6: consume the real worker's published samples through the
-        // production acceptance path (current target = B, generation 1).
-        let current_generation = 1u64;
-        let mut snapshot = DashboardSnapshot::default();
+        // Consume published samples through the production acceptance path.
         let mut saw_delayed_a = false;
         let mut accepted_b = false;
+        let mut saw_old_generation = false;
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline && !(saw_delayed_a && accepted_b) {
             if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
-                if sample.stats.model == "model-A" {
+                assert!(
+                    sample.server == key_a || sample.server == key_b,
+                    "every sample must carry a known server key"
+                );
+                if sample.server == key_a {
                     saw_delayed_a = true;
                     assert!(
-                        !accepts_llm_sample(current_generation, &sample),
-                        "delayed A result must be rejected under B"
+                        !accepts_llm_sample(1, &sample),
+                        "a delayed A result must be rejected under the new generation"
                     );
                 }
-                if accepts_llm_sample(current_generation, &sample)
-                    && sample.stats.model == "model-B"
-                {
-                    snapshot.llm = sample.stats.clone();
+                if accepts_llm_sample(1, &sample) && sample.server == key_b {
                     accepted_b = true;
+                }
+                if sample.generation != 1 {
+                    saw_old_generation = true;
                 }
             }
         }
+        assert!(saw_delayed_a, "the delayed A result must be published");
+        assert!(accepted_b, "B must be accepted under the new generation");
         assert!(
-            saw_delayed_a,
-            "the real worker must publish the delayed A result"
+            saw_old_generation,
+            "a pre-switch-generation sample must be observable"
         );
-        assert!(accepted_b, "B must be accepted after the switch");
-        assert_eq!(snapshot.llm.model, "model-B");
-        assert_ne!(snapshot.llm.model, "model-A");
 
-        // A buffered result from the first A generation stays rejected.
+        // A buffered result from the previous generation stays rejected, and a
+        // sample for a server no longer in the set is dropped by the membership
+        // check (covered here for the generation half).
         let buffered_stale = LlmSample {
+            server: key_a.clone(),
             generation: 0,
             stats: LlmStats {
                 model: "model-A".to_string(),
                 ..Default::default()
             },
         };
-        assert!(!accepts_llm_sample(current_generation, &buffered_stale));
-
-        // A → B → A: a fresh A generation is accepted, the first one is not.
-        let (a2_addr, a2_stop, a2_handle) = spawn_plain_server("model-A", 4096, 1000, 1500);
-        cmd_tx
-            .send(LlmCommand::Switch {
-                generation: 2,
-                endpoint: format!("http://{a2_addr}"),
-            })
-            .unwrap();
-        let mut accepted_a2 = false;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline && !accepted_a2 {
-            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
-                if sample.generation == 0 {
-                    assert!(!accepts_llm_sample(2, &sample));
-                }
-                if accepts_llm_sample(2, &sample) {
-                    snapshot.llm = sample.stats.clone();
-                    accepted_a2 = true;
-                }
-            }
-        }
-        assert!(accepted_a2, "the new A generation must be accepted");
-        assert_eq!(snapshot.llm.model, "model-A");
+        assert!(!accepts_llm_sample(1, &buffered_stale));
 
         stop.store(true, Ordering::Relaxed);
         let _ = worker.join();
         a_stop.store(true, Ordering::Relaxed);
         b_stop.store(true, Ordering::Relaxed);
-        a2_stop.store(true, Ordering::Relaxed);
         let _ = a_handle.join();
         let _ = b_handle.join();
-        let _ = a2_handle.join();
+    }
+
+    #[test]
+    fn build_server_summaries_reflects_per_server_state() {
+        let order = vec!["http://a:1/".to_string(), "http://b:2/".to_string()];
+        let mut endpoints = BTreeMap::new();
+        endpoints.insert("http://a:1/".to_string(), "http://a:1".to_string());
+        endpoints.insert("http://b:2/".to_string(), "http://b:2".to_string());
+        let mut registry = BTreeMap::new();
+        registry.insert(
+            "http://a:1/".to_string(),
+            LlmStats {
+                connected: true,
+                model: "model-A".to_string(),
+                slot_count: 2,
+                busy_slots: 1,
+                context_used: Some(10),
+                context_size: 100,
+                ..Default::default()
+            },
+        );
+
+        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].label, "model-A");
+        assert!(summaries[0].connected);
+        assert_eq!(summaries[0].busy_slots, 1);
+        assert_eq!(summaries[0].context_used, Some(10));
+        // Server B has no telemetry yet: offline with no fabricated zeros.
+        assert!(!summaries[1].connected);
+        assert_eq!(summaries[1].slot_count, 0);
+        assert_eq!(summaries[1].context_used, None);
+    }
+
+    #[test]
+    fn real_worker_polls_multiple_servers_independently() {
+        let (a_addr, a_stop, a_handle) = spawn_plain_server("model-A", 4096, 1000, 500);
+        let (b_addr, b_stop, b_handle) = spawn_plain_server("model-B", 8192, 2000, 600);
+        let key_a = crate::domain::server_key(&format!("http://{a_addr}"));
+        let key_b = crate::domain::server_key(&format!("http://{b_addr}"));
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(2_500));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            vec![
+                test_spec(&key_a, &format!("http://{a_addr}")),
+                test_spec(&key_b, &format!("http://{b_addr}")),
+            ],
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        let mut a_model = None;
+        let mut b_model = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && (a_model.is_none() || b_model.is_none()) {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                if sample.server == key_a {
+                    a_model = Some(sample.stats.model.clone());
+                }
+                if sample.server == key_b {
+                    b_model = Some(sample.stats.model.clone());
+                }
+            }
+        }
+        assert_eq!(a_model.as_deref(), Some("model-A"));
+        assert_eq!(b_model.as_deref(), Some("model-B"));
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        a_stop.store(true, Ordering::Relaxed);
+        b_stop.store(true, Ordering::Relaxed);
+        let _ = a_handle.join();
+        let _ = b_handle.join();
+    }
+
+    #[test]
+    fn an_unreachable_server_does_not_block_a_healthy_one() {
+        let (a_addr, a_stop, a_handle) = spawn_plain_server("model-A", 4096, 1000, 500);
+        // Bind then drop a port so connections are refused immediately.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let key_a = crate::domain::server_key(&format!("http://{a_addr}"));
+        let key_b = crate::domain::server_key(&format!("http://{dead_addr}"));
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(2_500));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            vec![
+                test_spec(&key_b, &format!("http://{dead_addr}")),
+                test_spec(&key_a, &format!("http://{a_addr}")),
+            ],
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        // Server A (listed after the dead one) must still report its model.
+        let mut a_model = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && a_model.is_none() {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                if sample.server == key_a && sample.stats.connected {
+                    a_model = Some(sample.stats.model.clone());
+                }
+            }
+        }
+        assert_eq!(a_model.as_deref(), Some("model-A"));
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        a_stop.store(true, Ordering::Relaxed);
+        let _ = a_handle.join();
+    }
+
+    #[test]
+    fn rebuild_resets_monitor_on_a_same_endpoint_restart() {
+        let spec = ServerSpec {
+            key: "http://h:1/".to_string(),
+            endpoint: "http://h:1".to_string(),
+            identity: Some(LocalServerIdentity {
+                pid: 100,
+                start_time: 5,
+            }),
+        };
+        let mut monitor = new_server_monitor(spec.clone());
+        // Simulate a warm cache (a previous good sample).
+        monitor.last_good = Some((LlmStats::default(), Instant::now()));
+
+        // Same identity: the monitor and its per-server caches are preserved.
+        let kept = rebuild_server_monitors(vec![monitor], vec![spec.clone()]);
+        assert_eq!(kept.len(), 1);
+        assert!(
+            kept[0].last_good.is_some(),
+            "an unchanged server keeps its state"
+        );
+
+        // Same endpoint, new process (new start time): the monitor is rebuilt,
+        // dropping the stale caches instead of keeping them until the next
+        // /props refresh.
+        let restarted = ServerSpec {
+            identity: Some(LocalServerIdentity {
+                pid: 100,
+                start_time: 6,
+            }),
+            ..spec
+        };
+        let reset = rebuild_server_monitors(kept, vec![restarted]);
+        assert_eq!(reset.len(), 1);
+        assert!(
+            reset[0].last_good.is_none(),
+            "a same-endpoint restart must reset the per-server caches"
+        );
     }
 }
