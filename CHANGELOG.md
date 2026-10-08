@@ -4,6 +4,24 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Multi-server monitoring: OrsikTop now monitors every locally discovered
+  llama.cpp server and every configured endpoint at once, instead of a single
+  selected server. Additional endpoints can be listed in the config with
+  `servers=http://a:8081,http://b:8082` (the existing `server=` remains the
+  primary and is fully backward compatible).
+- A server selector (press `s`) lists all known servers with their connection
+  state, slot counts, context and throughput; Up/Down highlight, Enter selects
+  and Esc closes. The header shows the selected server as `[n/N]` when more
+  than one server is monitored, and the details/LLM panels keep showing the
+  selected server.
+- Per-server outage isolation: an unreachable server is shown as offline and
+  does not affect the others; monitoring of a healthy server continues while a
+  slow one times out, and each server keeps its own counter baselines, slot
+  identities and connection state, so telemetry never crosses server
+  boundaries. Counters resume from a clean baseline when a server returns.
+
 ## [0.2.10] - 2026-10-08
 
 ### Fixed
