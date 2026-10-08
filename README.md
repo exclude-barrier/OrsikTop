@@ -308,6 +308,20 @@ Auto discovery only inspects local processes. OrsikTop does **not** scan your LA
 
 For a remote or fixed endpoint, disable Auto discovery in Settings and enter the desired host and port, or use `--server` for a one-off override.
 
+## Monitoring multiple servers
+
+OrsikTop monitors every locally discovered llama.cpp server **and** every configured endpoint at the same time, polling them all in the background. The details and LLM panels show the currently selected server; use the server selector to switch.
+
+- Press `s` to open the server selector: it lists every known server with its connection state, slot counts, context and throughput. `↑`/`↓` highlight a row, `Enter` selects it and `Esc` closes the selector. The header shows the selected server as `[n/N]` when more than one server is monitored.
+- Add extra endpoints to the config, comma-separated, next to the existing `server=`:
+
+```text
+server=http://127.0.0.1:8080
+servers=http://127.0.0.1:8081,http://192.168.1.20:8080
+```
+
+Each server is identified by its normalized endpoint, so `http://127.0.0.1:8081` and `http://127.0.0.1:8081/` are the same server, while `127.0.0.1` and `localhost` are kept distinct. An unreachable server is shown as offline and does not affect the others; its counters resume from a clean baseline when it returns. Up to 16 servers are monitored.
+
 ## Controls
 
 | Action | Control |
@@ -315,6 +329,7 @@ For a remote or fixed endpoint, disable Auto discovery in Settings and enter the
 | Quit | `Esc` |
 | Help | `h` |
 | Settings | `q` |
+| Server selector | `s` |
 | Process search | `/` |
 | Faster refresh | click `[ - ]`, `-` or `[` |
 | Slower refresh | click `[ + ]`, `+` or `]` |
