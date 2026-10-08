@@ -326,6 +326,8 @@ Each server keeps its own in-memory throughput history for the duration of the r
 
 At most **16** servers are polled. If you configure more, OrsikTop keeps the extra endpoints in the server selector under **NOT MONITORED — limit reached** and shows `· N over limit` in the header, instead of silently ignoring them; they are not polled and your saved config is left untouched.
 
+For a locally running server, the LLM panel shows the GPU it uses (`GPU <id>`) — a verified association from the server's process identity plus NVIDIA NVML compute-process / DRM render-node evidence, and it changes with the selected server. A remote or otherwise unverifiable server shows `GPU —` (not determined); this is not the same as CPU-only or 0% utilization.
+
 ## Controls
 
 | Action | Control |

@@ -31,6 +31,15 @@ All notable changes to OrsikTop will be documented here.
   dropped silently: the header shows `· N over limit` and the server selector
   lists them under "NOT MONITORED — limit reached" (endpoints redacted). They
   are not polled, and the saved configuration is not rewritten.
+- Selected-server GPU attribution: the GPU association shown for the selected
+  server is derived only from its verified local process identity (PID + start
+  time) through the existing NVML compute-process and DRM render-node evidence,
+  and follows the selected server when you switch (press `s`). Several GPUs are
+  shown as a set. A remote or otherwise unverifiable server shows `—` (not
+  determined) — never a guess from the model name, port, server order or global
+  utilization. Device-level utilization is never presented as process-level
+  usage, and a local endpoint that is also auto-discovered keeps its
+  association.
 
 ## [0.2.10] - 2026-10-08
 
