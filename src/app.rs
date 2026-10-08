@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Stdout,
     sync::{
@@ -60,8 +60,9 @@ pub fn run(
     // True when `server` was resolved via local auto-discovery.
     server_auto: bool,
     // Full set of servers to monitor, in display order (configured + locally
-    // discovered), already de-duplicated.
-    servers: Vec<ServerSpec>,
+    // discovered), already de-duplicated, plus any configured endpoints that
+    // exceed the monitoring cap.
+    servers: crate::ServerList,
     // Stable key of the server selected at startup.
     default_selected: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -100,7 +101,9 @@ pub fn run(
     // Multi-server registry: the full endpoint set to monitor, keyed by stable
     // identity, in a deterministic display order. `resolved` above still
     // describes the primary local server whose process is mapped to a GPU.
-    let mut server_list = servers;
+    let mut server_list = servers.monitored;
+    // Endpoints past the cap: shown as "limit reached", never polled.
+    let mut overflow: Vec<ServerSpec> = servers.overflow;
     let mut order: Vec<String> = server_list.iter().map(|spec| spec.key.clone()).collect();
     let mut endpoints: BTreeMap<String, String> = server_list
         .iter()
@@ -149,9 +152,11 @@ pub fn run(
                 continue;
             }
             let is_selected = next.server == selected;
+            // Record for every server (background servers keep accumulating),
+            // mirroring into the active view only for the selected server.
+            ui_state.record_llm_sample(&next.server, &selected, &next.stats);
             registry.insert(next.server, next.stats.clone());
             if is_selected {
-                ui_state.observe_llm_sample(&next.stats);
                 snapshot.llm = next.stats;
             }
         }
@@ -175,6 +180,7 @@ pub fn run(
             sync_server_set(
                 &settings,
                 &mut server_list,
+                &mut overflow,
                 &mut order,
                 &mut endpoints,
                 &mut registry,
@@ -196,6 +202,7 @@ pub fn run(
                 &snapshot.gpu_map,
                 &snapshot.servers,
                 &snapshot.selected_server,
+                &overflow,
                 &mut ui_state,
                 &resolved.endpoint,
                 refresh_ms,
@@ -267,6 +274,7 @@ pub fn run(
                                     sync_server_set(
                                         &settings,
                                         &mut server_list,
+                                        &mut overflow,
                                         &mut order,
                                         &mut endpoints,
                                         &mut registry,
@@ -324,7 +332,9 @@ pub fn run(
                                 if let Some(key) = order.get(index) {
                                     selected = key.clone();
                                     snapshot.llm = registry.get(key).cloned().unwrap_or_default();
-                                    ui_state.reset_llm_connection_state();
+                                    // Show this server's own accumulated history;
+                                    // every other server's history is preserved.
+                                    ui_state.select_llm_history(key);
                                 }
                             }
                             ui_state.close_server_selector();
@@ -611,6 +621,7 @@ fn apply_server_mapping(
 fn sync_server_set(
     settings: &config::AppConfig,
     server_list: &mut Vec<ServerSpec>,
+    overflow: &mut Vec<ServerSpec>,
     order: &mut Vec<String>,
     endpoints: &mut BTreeMap<String, String>,
     registry: &mut BTreeMap<String, LlmStats>,
@@ -620,29 +631,62 @@ fn sync_server_set(
     snapshot: &mut DashboardSnapshot,
     ui_state: &mut UiState,
 ) {
-    let next_list = crate::collect_server_list(settings);
-    if next_list == *server_list {
+    let next = crate::collect_server_list(settings);
+    let monitored_changed = next.monitored != *server_list;
+    let overflow_changed = next.overflow != *overflow;
+    if !monitored_changed && !overflow_changed {
         return;
     }
-    *llm_generation = llm_generation.wrapping_add(1);
-    let _ = server_tx.send(LlmCommand::SetServers {
-        generation: *llm_generation,
-        servers: next_list.clone(),
-    });
-    *server_list = next_list;
-    *order = server_list.iter().map(|spec| spec.key.clone()).collect();
-    endpoints.clear();
-    endpoints.extend(
-        server_list
-            .iter()
-            .map(|spec| (spec.key.clone(), spec.endpoint.clone())),
-    );
-    registry.retain(|key, _| endpoints.contains_key(key));
-    if !endpoints.contains_key(selected) {
-        *selected = order.first().cloned().unwrap_or_default();
-        snapshot.llm = registry.get(selected).cloned().unwrap_or_default();
-        ui_state.reset_llm_connection_state();
+    *overflow = next.overflow;
+
+    if monitored_changed {
+        let next_list = next.monitored;
+        // A server whose process identity changed while its endpoint stayed the
+        // same is a known restart: start a fresh history boundary for it so
+        // pre/post-restart throughput is never drawn as continuous.
+        for key in changed_identity_keys(server_list, &next_list) {
+            ui_state.reset_llm_history(&key);
+        }
+
+        *llm_generation = llm_generation.wrapping_add(1);
+        let _ = server_tx.send(LlmCommand::SetServers {
+            generation: *llm_generation,
+            servers: next_list.clone(),
+        });
+        *server_list = next_list;
+        *order = server_list.iter().map(|spec| spec.key.clone()).collect();
+        endpoints.clear();
+        endpoints.extend(
+            server_list
+                .iter()
+                .map(|spec| (spec.key.clone(), spec.endpoint.clone())),
+        );
+        registry.retain(|key, _| endpoints.contains_key(key));
+        // Bound per-server history memory and drop histories of servers that
+        // are gone (no tombstone growth).
+        let live_keys: HashSet<String> = server_list.iter().map(|spec| spec.key.clone()).collect();
+        ui_state.retain_llm_histories(&live_keys);
+        if !endpoints.contains_key(selected) {
+            *selected = order.first().cloned().unwrap_or_default();
+            snapshot.llm = registry.get(selected).cloned().unwrap_or_default();
+            ui_state.select_llm_history(selected);
+        }
     }
+}
+
+/// Keys present in both sets whose process identity changed (a known
+/// same-endpoint restart). A new or removed key is not a restart.
+fn changed_identity_keys(old: &[ServerSpec], new: &[ServerSpec]) -> Vec<String> {
+    let previous: BTreeMap<&str, Option<LocalServerIdentity>> = old
+        .iter()
+        .map(|spec| (spec.key.as_str(), spec.identity))
+        .collect();
+    new.iter()
+        .filter(
+            |spec| matches!(previous.get(spec.key.as_str()), Some(prev) if *prev != spec.identity),
+        )
+        .map(|spec| spec.key.clone())
+        .collect()
 }
 
 /// Map the local server to a GPU, gated on its identity.
@@ -1178,46 +1222,51 @@ fn spawn_llm_worker(
                     .load(Ordering::Relaxed)
                     .min(config::MAX_OFFLINE_GRACE_MS),
             );
-            // Poll every server concurrently (bounded by the server cap), so a
-            // slow or hanging server cannot delay a healthy server's refresh.
-            // `sample` is synchronous per server; a scoped thread per server is
-            // bounded and joined within the cycle.
-            let samples: Vec<LlmSample> = thread::scope(|scope| {
-                let handles: Vec<_> = servers
-                    .iter_mut()
-                    .map(|server| {
-                        scope.spawn(move || {
-                            let raw_stats = match server.monitor.as_mut() {
-                                Some(monitor) => monitor.sample(),
-                                None => LlmStats {
-                                    error: server.init_error.clone(),
-                                    ..Default::default()
-                                },
-                            };
-                            let stats = stabilize_llm_sample(
-                                raw_stats,
-                                &mut server.last_good,
-                                Instant::now(),
-                                offline_grace,
-                            );
-                            LlmSample {
-                                server: server.key.clone(),
-                                generation,
-                                stats,
-                            }
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .filter_map(|handle| handle.join().ok())
-                    .collect()
-            });
-            for sample in samples {
-                match tx.try_send(sample) {
-                    Ok(()) | Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => return,
+            // Poll every server concurrently (bounded by the server cap) and
+            // deliver each completed sample to the app as soon as it is ready,
+            // so a slow or hanging server cannot delay a healthy server's
+            // refresh for the whole cycle. A scoped thread per server is
+            // bounded and joined when the scope closes.
+            let disconnected = thread::scope(|scope| {
+                let (done_tx, done_rx) = mpsc::channel::<LlmSample>();
+                for server in servers.iter_mut() {
+                    let done_tx = done_tx.clone();
+                    scope.spawn(move || {
+                        let raw_stats = match server.monitor.as_mut() {
+                            Some(monitor) => monitor.sample(),
+                            None => LlmStats {
+                                error: server.init_error.clone(),
+                                ..Default::default()
+                            },
+                        };
+                        let stats = stabilize_llm_sample(
+                            raw_stats,
+                            &mut server.last_good,
+                            Instant::now(),
+                            offline_grace,
+                        );
+                        let _ = done_tx.send(LlmSample {
+                            server: server.key.clone(),
+                            generation,
+                            stats,
+                        });
+                    });
                 }
+                drop(done_tx);
+                let mut disconnected = false;
+                for sample in done_rx.iter() {
+                    match tx.try_send(sample) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                disconnected
+            });
+            if disconnected {
+                return;
             }
 
             sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_LLM_POLL_MS, &stop);
@@ -2470,5 +2519,99 @@ mod tests {
             reset[0].last_good.is_none(),
             "a same-endpoint restart must reset the per-server caches"
         );
+    }
+
+    #[test]
+    fn changed_identity_keys_detects_only_restarted_servers() {
+        let a = ServerSpec {
+            key: "a".to_string(),
+            endpoint: "http://a".to_string(),
+            identity: Some(LocalServerIdentity {
+                pid: 1,
+                start_time: 1,
+            }),
+        };
+        let b = ServerSpec {
+            key: "b".to_string(),
+            endpoint: "http://b".to_string(),
+            identity: Some(LocalServerIdentity {
+                pid: 2,
+                start_time: 1,
+            }),
+        };
+        // Only A restarted (same key, new start time).
+        let a2 = ServerSpec {
+            identity: Some(LocalServerIdentity {
+                pid: 1,
+                start_time: 2,
+            }),
+            ..a.clone()
+        };
+        assert_eq!(
+            changed_identity_keys(&[a.clone(), b.clone()], &[a2, b.clone()]),
+            vec!["a".to_string()]
+        );
+        // A new or removed key is not a restart.
+        assert!(
+            changed_identity_keys(std::slice::from_ref(&a), std::slice::from_ref(&b)).is_empty()
+        );
+        assert!(changed_identity_keys(&[], std::slice::from_ref(&a)).is_empty());
+    }
+
+    #[test]
+    fn a_slow_server_does_not_delay_a_healthy_servers_delivery() {
+        // A is gated (holds its response); B answers immediately. B's sample
+        // must reach the app while A is still hanging.
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, _started_rx) = mpsc::channel::<()>();
+        let (a_addr, a_stop, a_handle) = spawn_gated_server(Arc::clone(&release), started_tx);
+        let (b_addr, b_stop, b_handle) = spawn_plain_server("model-B", 8192, 10_000, 20_000);
+        let key_a = crate::domain::server_key(&format!("http://{a_addr}"));
+        let key_b = crate::domain::server_key(&format!("http://{b_addr}"));
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(2_500));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            vec![
+                test_spec(&key_a, &format!("http://{a_addr}")),
+                test_spec(&key_b, &format!("http://{b_addr}")),
+            ],
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        let mut b_model = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && b_model.is_none() {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                if sample.server == key_b && sample.stats.connected {
+                    b_model = Some(sample.stats.model.clone());
+                }
+            }
+        }
+        assert_eq!(
+            b_model.as_deref(),
+            Some("model-B"),
+            "healthy B must be delivered while A hangs"
+        );
+
+        // Release A so the worker's scope can finish and shut down.
+        {
+            let (lock, condvar) = &*release;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        a_stop.store(true, Ordering::Relaxed);
+        b_stop.store(true, Ordering::Relaxed);
+        let _ = a_handle.join();
+        let _ = b_handle.join();
     }
 }
