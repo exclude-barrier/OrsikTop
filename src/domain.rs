@@ -19,6 +19,10 @@ pub const REFRESH_STEP_MS: u64 = 100;
 /// change meaningfully faster than this, so fast UI refresh rates should not
 /// multiply the HTTP polling overhead.
 pub const MIN_LLM_POLL_MS: u64 = 250;
+/// Upper bound on concurrently monitored llama.cpp servers. Bound the worker's
+/// per-cycle work and the publish channel so a pathological discovery result
+/// cannot cause unbounded polling.
+pub const MAX_MONITORED_SERVERS: usize = 16;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProcessStats {
@@ -423,6 +427,33 @@ impl GpuSelector {
     }
 }
 
+/// Stable identity key for a monitored llama.cpp server.
+///
+/// The key is a normalized endpoint: scheme and host are lower-cased by the URL
+/// parser, the default port is dropped, the path is kept (with a single
+/// canonical form for a trailing slash) and the query is kept so two endpoints
+/// that only differ by routing/query are not silently merged. Userinfo
+/// (credentials) is deliberately removed: it must never define identity nor
+/// appear in a key that might be logged or displayed. Two different host names
+/// stay distinct even if they resolve to the same address; only syntactically
+/// identical endpoints collapse. Falls back to the trimmed string when the
+/// endpoint does not parse.
+pub(crate) fn server_key(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    let Ok(mut url) = reqwest::Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    // `Url` already lower-cases the host and drops a default port. Normalize a
+    // trailing slash on a non-root path so `…/v1` and `…/v1/` share a key.
+    let path = url.path().to_string();
+    if path != "/" && path.ends_with('/') {
+        url.set_path(path.trim_end_matches('/'));
+    }
+    url.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +467,42 @@ mod tests {
         assert_eq!(uuid_only.key(), "GPU-abc");
 
         assert_eq!(uuid_only, DeviceId::new(None, Some("GPU-abc".into())));
+    }
+
+    #[test]
+    fn server_key_normalizes_without_merging_distinct_hosts() {
+        // Same endpoint, different surface forms -> one identity.
+        assert_eq!(
+            server_key("http://127.0.0.1:8081"),
+            server_key("http://127.0.0.1:8081/")
+        );
+        assert_eq!(
+            server_key("HTTP://LocalHost:8081"),
+            server_key("http://localhost:8081")
+        );
+        assert_eq!(server_key("http://h:80"), server_key("http://h"));
+        assert_eq!(server_key("http://h/v1/"), server_key("http://h/v1"));
+        assert_eq!(
+            server_key("http://[::1]:8081"),
+            server_key("http://[::1]:8081/")
+        );
+        // Different hosts are never merged.
+        assert_ne!(
+            server_key("http://127.0.0.1:8081"),
+            server_key("http://localhost:8081")
+        );
+        // Credentials are not part of identity.
+        assert_eq!(
+            server_key("http://user:pass@h:8081"),
+            server_key("http://h:8081")
+        );
+        // Query is preserved, so distinct routing stays distinct.
+        assert_ne!(
+            server_key("http://h:8081/?token=a"),
+            server_key("http://h:8081/?token=b")
+        );
+        // Unparseable endpoints fall back to the trimmed text.
+        assert_eq!(server_key("  not a url  "), "not a url");
     }
 
     #[test]
@@ -721,12 +788,39 @@ pub struct FastSnapshot {
     pub mapping_generation: u64,
 }
 
+/// Compact per-server status for the multi-server overview and selector.
+///
+/// This carries only what the overview needs; the full [`LlmStats`] for the
+/// selected server is rendered by the existing LLM panel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServerSummary {
+    /// Stable identity key (`domain::server_key` of the endpoint).
+    pub key: String,
+    /// Configured/advertised endpoint (may contain credentials; the UI must
+    /// redact it before display with `redact::safe_endpoint`).
+    pub endpoint: String,
+    /// Display label: the model name (sanitized) or the compact endpoint.
+    pub label: String,
+    pub connected: bool,
+    pub reconnecting: bool,
+    pub slot_count: u64,
+    pub busy_slots: u64,
+    pub context_used: Option<u64>,
+    pub context_size: u64,
+    pub generation_tps: Option<f64>,
+}
+
 /// Latest coherent snapshot held by the app and rendered by the UI.
 #[derive(Clone, Debug, Default)]
 pub struct DashboardSnapshot {
     pub gpu: GpuStats,
     pub system: SystemStats,
+    /// Full telemetry of the currently selected server.
     pub llm: LlmStats,
+    /// Compact status of every known server, in stable display order.
+    pub servers: Vec<ServerSummary>,
+    /// Identity key of the selected server (matches `servers[].key`).
+    pub selected_server: String,
     /// Which GPU(s) the inference server process uses, when determined.
     pub gpu_map: GpuMapping,
 }

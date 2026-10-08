@@ -5,9 +5,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::domain::GpuSelector;
+use crate::domain::{server_key, GpuSelector};
 
 const SERVER_KEY: &str = "server";
+const SERVERS_KEY: &str = "servers";
 const GPU_KEY: &str = "gpu";
 const GPU_INDEX_KEY: &str = "gpu_index";
 const REFRESH_MS_KEY: &str = "refresh_ms";
@@ -28,7 +29,13 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
+    /// Primary configured endpoint (legacy `server=`). Kept for backward
+    /// compatibility and CLI precedence; it is the first entry of the monitored
+    /// server set when present.
     pub server: Option<String>,
+    /// Additional configured endpoints (`servers=`, comma-separated). Monitored
+    /// alongside `server` and any locally discovered servers.
+    pub servers: Vec<String>,
     pub gpu_selector: GpuSelector,
     pub refresh_ms: u64,
     pub process_refresh_ms: u64,
@@ -40,6 +47,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server: None,
+            servers: Vec::new(),
             gpu_selector: GpuSelector::Auto,
             refresh_ms: DEFAULT_REFRESH_MS,
             process_refresh_ms: DEFAULT_PROCESS_REFRESH_MS,
@@ -56,6 +64,17 @@ impl AppConfig {
             .take()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        // Trim, drop blanks and de-duplicate the extra endpoints by their stable
+        // identity, preserving order. The primary `server` is de-duplicated at
+        // the point where the full set is assembled.
+        let mut seen = std::collections::HashSet::new();
+        self.servers = self
+            .servers
+            .drain(..)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .filter(|value| seen.insert(server_key(value)))
+            .collect();
         self.refresh_ms = self.refresh_ms.clamp(100, 10_000);
         self.process_refresh_ms = self
             .process_refresh_ms
@@ -284,6 +303,9 @@ fn render_config(config: &AppConfig) -> String {
     if let Some(server) = config.server.as_deref() {
         lines.push(format!("{SERVER_KEY}={server}"));
     }
+    if !config.servers.is_empty() {
+        lines.push(format!("{SERVERS_KEY}={}", config.servers.join(",")));
+    }
     let selector = config.gpu_selector.as_string();
     if !selector.is_empty() {
         lines.push(format!("{GPU_KEY}={selector}"));
@@ -339,6 +361,14 @@ fn parse_config(text: &str) -> AppConfig {
             SERVER_KEY if !value.is_empty() => {
                 config.server = Some(value.to_string());
                 saw_server = true;
+            }
+            SERVERS_KEY => {
+                config.servers.extend(
+                    value
+                        .split(',')
+                        .map(|entry| entry.trim().to_string())
+                        .filter(|entry| !entry.is_empty()),
+                );
             }
             GPU_KEY => {
                 config.gpu_selector = GpuSelector::parse(value);
@@ -479,6 +509,47 @@ mod tests {
             GpuSelector::PciBusId("0000:41:00.0".to_string())
         );
         assert_eq!(GpuSelector::Index(2).sanitized(), GpuSelector::Index(2));
+    }
+
+    #[test]
+    fn parses_and_renders_multiple_servers_backward_compatibly() {
+        let config = parse_config("server=http://a:1\nservers=http://b:2, http://c:3\n");
+        assert_eq!(config.server.as_deref(), Some("http://a:1"));
+        assert_eq!(
+            config.servers,
+            vec!["http://b:2".to_string(), "http://c:3".to_string()]
+        );
+
+        let rendered = render_config(&config);
+        assert!(rendered.contains("server=http://a:1"));
+        assert!(rendered.contains("servers=http://b:2,http://c:3"));
+        // Round-trips without changing the configured set.
+        let again = parse_config(&rendered);
+        assert_eq!(again.server, config.server);
+        assert_eq!(again.servers, config.servers);
+
+        // A legacy single-server config still parses with no extra servers.
+        let legacy = parse_config("server=http://only:9\n");
+        assert_eq!(legacy.server.as_deref(), Some("http://only:9"));
+        assert!(legacy.servers.is_empty());
+    }
+
+    #[test]
+    fn sanitized_dedups_servers_by_identity() {
+        let config = AppConfig {
+            servers: vec![
+                "http://h:1".into(),
+                "http://h:1/".into(),
+                " http://g:2 ".into(),
+                "".into(),
+            ],
+            ..AppConfig::default()
+        }
+        .sanitized();
+        assert_eq!(
+            config.servers,
+            vec!["http://h:1".to_string(), "http://g:2".to_string()]
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod system;
 mod ui;
 
 use std::{
+    collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -33,7 +34,9 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::domain::GpuSelector;
+use crate::app::ServerSpec;
+use crate::discovery_llm::{LocalServerIdentity, ServerSource};
+use crate::domain::{server_key, GpuSelector, MAX_MONITORED_SERVERS};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const CARGO_UPDATE_COMMAND: &str =
@@ -146,6 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let resolved = resolve_monitor_target(&settings);
+    // The full set of servers to monitor (configured + discovered), and the
+    // stable key of the one selected at startup.
+    let server_list = collect_server_list(&settings);
+    let default_selected = server_key(&resolved.endpoint);
 
     enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
@@ -163,6 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         resolved.identity,
         settings,
         resolved.auto,
+        server_list,
+        default_selected,
     )
 }
 
@@ -370,6 +379,71 @@ pub(crate) fn resolve_monitor_target_with<S: system::Sys>(
     }
 }
 
+/// The full set of endpoints to monitor, as `(stable key, endpoint)`.
+///
+/// Order is deterministic: the configured primary (`server=`), then configured
+/// extras (`servers=`), then locally discovered processes (only when
+/// auto-discovery is on). Entries are de-duplicated by stable identity and the
+/// whole set is capped at [`MAX_MONITORED_SERVERS`]. No network scanning is
+/// performed: discovery only reads local `/proc` process arguments.
+pub(crate) fn collect_server_list(settings: &config::AppConfig) -> Vec<ServerSpec> {
+    collect_server_list_with(&system::RealSys, settings)
+}
+
+/// Fixture-testable [`collect_server_list`].
+pub(crate) fn collect_server_list_with<S: system::Sys>(
+    sys: &S,
+    settings: &config::AppConfig,
+) -> Vec<ServerSpec> {
+    let mut out: Vec<ServerSpec> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(server) = settings.server.as_deref() {
+        push_server(&mut out, &mut seen, server, None);
+    }
+    for server in &settings.servers {
+        push_server(&mut out, &mut seen, server, None);
+    }
+    if settings.auto_discovery {
+        for candidate in discovery_llm::collect_candidates(sys, true, settings.server.as_deref()) {
+            let identity = match candidate.source {
+                ServerSource::Process { pid } => candidate
+                    .start_time
+                    .map(|start_time| LocalServerIdentity { pid, start_time }),
+                ServerSource::Configured => None,
+            };
+            push_server(&mut out, &mut seen, &candidate.endpoint, identity);
+        }
+    }
+    if out.is_empty() {
+        push_server(&mut out, &mut seen, DEFAULT_SERVER, None);
+    }
+    out.truncate(MAX_MONITORED_SERVERS);
+    out
+}
+
+/// Add an endpoint under its stable key unless it is blank or already present.
+/// The first occurrence wins, so a configured endpoint keeps its (absent)
+/// discovery identity over a later duplicate.
+fn push_server(
+    out: &mut Vec<ServerSpec>,
+    seen: &mut HashSet<String>,
+    endpoint: &str,
+    identity: Option<LocalServerIdentity>,
+) {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let key = server_key(trimmed);
+    if seen.insert(key.clone()) {
+        out.push(ServerSpec {
+            key,
+            endpoint: trimmed.to_string(),
+            identity,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +605,56 @@ mod tests {
     fn updater_wait_missing_binary_is_not_found() {
         let result = run_updater_command(Command::new("definitely-not-a-real-updater-binary"));
         assert!(matches!(result, Err(UpdaterError::NotFound)));
+    }
+
+    #[test]
+    fn collect_server_list_orders_and_dedups_configured_endpoints() {
+        let settings = config::AppConfig {
+            server: Some("http://a:1".to_string()),
+            servers: vec!["http://a:1/".to_string(), "http://b:2".to_string()],
+            auto_discovery: false,
+            ..config::AppConfig::default()
+        };
+        let list = collect_server_list_with(&FixtureSys::default(), &settings);
+        let endpoints: Vec<&str> = list.iter().map(|spec| spec.endpoint.as_str()).collect();
+        // The primary comes first; the trailing-slash duplicate collapses; the
+        // extra endpoint is kept.
+        assert_eq!(endpoints, vec!["http://a:1", "http://b:2"]);
+    }
+
+    #[test]
+    fn collect_server_list_adds_discovered_servers_when_auto() {
+        let sys = llama_fixture(&[(5000, 8081), (6000, 8082)]);
+        let settings = config::AppConfig {
+            auto_discovery: true,
+            ..config::AppConfig::default()
+        };
+        let list = collect_server_list_with(&sys, &settings);
+        assert!(
+            list.iter()
+                .any(|spec| spec.endpoint == "http://127.0.0.1:8081"),
+            "{list:?}"
+        );
+        assert!(
+            list.iter()
+                .any(|spec| spec.endpoint == "http://127.0.0.1:8082"),
+            "{list:?}"
+        );
+        let keys: std::collections::HashSet<&String> = list.iter().map(|spec| &spec.key).collect();
+        assert_eq!(keys.len(), list.len(), "keys must be unique");
+        // Discovered servers carry their process identity so a same-port restart
+        // can be detected.
+        assert!(list.iter().all(|spec| spec.identity.is_some()), "{list:?}");
+    }
+
+    #[test]
+    fn collect_server_list_falls_back_to_default() {
+        let settings = config::AppConfig {
+            auto_discovery: false,
+            ..config::AppConfig::default()
+        };
+        let list = collect_server_list_with(&FixtureSys::default(), &settings);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].endpoint, DEFAULT_SERVER);
     }
 }
