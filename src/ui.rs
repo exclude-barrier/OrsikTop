@@ -90,18 +90,32 @@ struct ProcessRowsHit {
     targets: Vec<ProcessRowTarget>,
 }
 
+/// Bounded in-memory LLM telemetry history and connection state for one
+/// server. Kept per server (keyed by stable identity) so every monitored
+/// server accumulates independently and the history survives switching the
+/// selected server. Host-level CPU/GPU histories are separate and unaffected.
+#[derive(Clone, Default)]
+struct LlmHistory {
+    prefill: VecDeque<TimedSample>,
+    decode: VecDeque<TimedSample>,
+    last_fresh_at: Option<Instant>,
+    sample_interval_ema_ms: Option<f64>,
+    connected_since: Option<Instant>,
+    connected_flash_until: Option<Instant>,
+    was_connected: bool,
+}
+
 pub struct UiState {
     gpu_history: VecDeque<TimedSample>,
     vram_history: VecDeque<TimedSample>,
     cpu_history: VecDeque<TimedSample>,
     ram_history: VecDeque<TimedSample>,
-    llm_prefill_history: VecDeque<TimedSample>,
-    llm_decode_history: VecDeque<TimedSample>,
-    llm_last_fresh_at: Option<Instant>,
-    llm_sample_interval_ema_ms: Option<f64>,
-    llm_connected_since: Option<Instant>,
-    llm_connected_flash_until: Option<Instant>,
-    llm_was_connected: bool,
+    /// History/connection state of the currently selected server.
+    llm_history: LlmHistory,
+    /// Per-server history/connection state, keyed by stable server identity.
+    llm_histories: HashMap<String, LlmHistory>,
+    /// Server key the active `llm_history` belongs to.
+    llm_history_key: String,
     process_selected_pid: Option<ProcessIdentity>,
     process_pinned_pid: Option<ProcessIdentity>,
     last_process_click: Option<(ProcessIdentity, Instant)>,
@@ -151,13 +165,9 @@ impl Default for UiState {
             vram_history: VecDeque::with_capacity(600),
             cpu_history: VecDeque::with_capacity(600),
             ram_history: VecDeque::with_capacity(600),
-            llm_prefill_history: VecDeque::with_capacity(600),
-            llm_decode_history: VecDeque::with_capacity(600),
-            llm_last_fresh_at: None,
-            llm_sample_interval_ema_ms: None,
-            llm_connected_since: None,
-            llm_connected_flash_until: None,
-            llm_was_connected: false,
+            llm_history: LlmHistory::default(),
+            llm_histories: HashMap::new(),
+            llm_history_key: String::new(),
             process_selected_pid: None,
             process_pinned_pid: None,
             last_process_click: None,
@@ -223,37 +233,54 @@ impl UiState {
         }
     }
 
-    pub fn observe_llm_sample(&mut self, llm: &LlmStats) {
+    /// Record one LLM sample for `key`, mirroring it into the active history
+    /// when `key` is the selected server. Called exactly once per received
+    /// sample, so a UI redraw never creates a duplicate history point.
+    pub fn record_llm_sample(&mut self, key: &str, selected: &str, llm: &LlmStats) {
         let now = Instant::now();
-        if llm.connected && !llm.reconnecting {
-            if !self.llm_was_connected {
-                self.llm_connected_since = Some(now);
-                self.llm_connected_flash_until = Some(now + Duration::from_secs(2));
-                self.llm_sample_interval_ema_ms = None;
-            } else if let Some(previous) = self.llm_last_fresh_at {
-                let interval_ms = now.saturating_duration_since(previous).as_secs_f64() * 1_000.0;
-                self.llm_sample_interval_ema_ms =
-                    smooth_llm_sample_interval(self.llm_sample_interval_ema_ms, interval_ms);
+        if key == selected {
+            if self.llm_history_key != key {
+                self.llm_history = LlmHistory::default();
+                self.llm_history_key = key.to_string();
             }
-            self.llm_was_connected = true;
-            self.llm_last_fresh_at = Some(now);
-            // Only real /metrics samples belong in the rate history. With
-            // /metrics unavailable the throughput is unknown, and pushing the
-            // zeroed fields would draw a fabricated flat line.
-            if llm.metrics_available {
-                // Only a present rate belongs in the history; a missing metric
-                // must not append a fabricated 0 that distorts the graph.
-                if let Some(value) = llm.prompt_tps {
-                    push_metric_history_at(&mut self.llm_prefill_history, value, now);
-                }
-                if let Some(value) = llm.generation_tps {
-                    push_metric_history_at(&mut self.llm_decode_history, value, now);
-                }
-            }
-        } else if !llm.connected {
-            self.llm_was_connected = false;
-            self.llm_connected_since = None;
-            self.llm_connected_flash_until = None;
+            observe_llm_into(&mut self.llm_history, llm, now);
+            self.llm_histories
+                .insert(key.to_string(), self.llm_history.clone());
+        } else {
+            observe_llm_into(
+                self.llm_histories.entry(key.to_string()).or_default(),
+                llm,
+                now,
+            );
+        }
+    }
+
+    /// Make `key`'s own history active (the selected server changed). Other
+    /// servers' histories are left untouched.
+    pub fn select_llm_history(&mut self, key: &str) {
+        if self.llm_history_key == key {
+            return;
+        }
+        self.llm_history = self.llm_histories.get(key).cloned().unwrap_or_default();
+        self.llm_history_key = key.to_string();
+    }
+
+    /// Drop one server's history (e.g. a proven process restart at the same
+    /// endpoint), so an incompatible session is not drawn as continuous.
+    pub fn reset_llm_history(&mut self, key: &str) {
+        self.llm_histories.remove(key);
+        if self.llm_history_key == key {
+            self.llm_history = LlmHistory::default();
+        }
+    }
+
+    /// Keep histories only for servers that still exist, bounding memory and
+    /// avoiding tombstone growth when servers disappear.
+    pub fn retain_llm_histories(&mut self, keys: &HashSet<String>) {
+        self.llm_histories.retain(|key, _| keys.contains(key));
+        if !self.llm_history_key.is_empty() && !keys.contains(&self.llm_history_key) {
+            self.llm_history = LlmHistory::default();
+            self.llm_history_key.clear();
         }
     }
 
@@ -289,16 +316,6 @@ impl UiState {
     /// The highlighted index, clamped to the current list length.
     pub fn server_selector_index(&self, len: usize) -> Option<usize> {
         (len > 0).then(|| self.server_selector_index.min(len - 1))
-    }
-
-    pub fn reset_llm_connection_state(&mut self) {
-        self.llm_prefill_history.clear();
-        self.llm_decode_history.clear();
-        self.llm_last_fresh_at = None;
-        self.llm_sample_interval_ema_ms = None;
-        self.llm_connected_since = None;
-        self.llm_connected_flash_until = None;
-        self.llm_was_connected = false;
     }
 
     pub fn move_process_selection(&mut self, delta: isize, processes: &[ProcessStats]) {
@@ -951,6 +968,8 @@ pub fn draw(
     gpu_map: &GpuMapping,
     servers: &[ServerSummary],
     selected_server: &str,
+    // Configured endpoints beyond the monitoring cap; listed as "limit reached".
+    overflow: &[crate::app::ServerSpec],
     state: &mut UiState,
     server: &str,
     refresh_ms: u64,
@@ -1007,6 +1026,7 @@ pub fn draw(
         server_auto,
         servers,
         selected_server,
+        overflow.len(),
     );
     draw_gpu(frame, rows[1], gpu, gpu_map);
     draw_llm_and_system(frame, rows[2], system, llm, state, gpu_map);
@@ -1023,6 +1043,7 @@ pub fn draw(
             servers,
             selected_server,
             state.server_selector_index,
+            overflow,
         );
     } else if state.settings_open {
         draw_settings_popup(frame, area, state);
@@ -1056,6 +1077,7 @@ fn draw_header(
     server_auto: bool,
     servers: &[ServerSummary],
     selected_server: &str,
+    overflow_count: usize,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1100,7 +1122,7 @@ fn draw_header(
         if server_auto {
             spans.push(Span::styled(" ·auto", Style::default().fg(MUTED)));
         }
-        if servers.len() > 1 {
+        if servers.len() > 1 || overflow_count > 0 {
             let index = servers
                 .iter()
                 .position(|summary| summary.key == selected_server)
@@ -1109,6 +1131,12 @@ fn draw_header(
                 format!("  [{index}/{}]  s = servers", servers.len()),
                 Style::default().fg(MUTED),
             ));
+            if overflow_count > 0 {
+                spans.push(Span::styled(
+                    format!("  · {overflow_count} over limit"),
+                    Style::default().fg(YELLOW),
+                ));
+            }
         }
 
         frame.render_widget(
@@ -1911,7 +1939,8 @@ fn llm_link_status(state: &UiState, llm: &LlmStats) -> (&'static str, Color) {
     } else if !llm.connected {
         ("OFFLINE", RED)
     } else if state
-        .llm_connected_flash_until
+        .llm_history
+        .connected_flash_until
         .is_some_and(|until| Instant::now() <= until)
     {
         ("CONNECTED", BRIGHT_GREEN)
@@ -1922,13 +1951,14 @@ fn llm_link_status(state: &UiState, llm: &LlmStats) -> (&'static str, Color) {
 
 fn llm_last_sample_text(state: &UiState, llm: &LlmStats) -> String {
     if llm.connected && !llm.reconnecting {
-        if let Some(avg_ms) = state.llm_sample_interval_ema_ms {
+        if let Some(avg_ms) = state.llm_history.sample_interval_ema_ms {
             return format!("~{avg_ms:.0} ms avg");
         }
     }
 
     state
-        .llm_last_fresh_at
+        .llm_history
+        .last_fresh_at
         .map(|at| {
             format!(
                 "{} ago",
@@ -1954,7 +1984,8 @@ fn smooth_llm_sample_interval(previous_ms: Option<f64>, current_ms: f64) -> Opti
 
 fn llm_uptime_text(state: &UiState) -> String {
     state
-        .llm_connected_since
+        .llm_history
+        .connected_since
         .map(|at| format_uptime(Instant::now().saturating_duration_since(at)))
         .unwrap_or_else(|| "—".to_string())
 }
@@ -1994,7 +2025,7 @@ fn draw_llm_rate_history(frame: &mut Frame, area: Rect, state: &UiState) {
         frame,
         cols[0],
         "PREFILL",
-        &state.llm_prefill_history,
+        &state.llm_history.prefill,
         CYAN,
         true,
     );
@@ -2002,7 +2033,7 @@ fn draw_llm_rate_history(frame: &mut Frame, area: Rect, state: &UiState) {
         frame,
         cols[1],
         "DECODE",
-        &state.llm_decode_history,
+        &state.llm_history.decode,
         ORK_GREEN,
         false,
     );
@@ -4141,9 +4172,15 @@ fn draw_server_selector(
     servers: &[ServerSummary],
     selected_server: &str,
     highlight: usize,
+    overflow: &[crate::app::ServerSpec],
 ) {
+    let overflow_rows = if overflow.is_empty() {
+        0
+    } else {
+        overflow.len() as u16 + 1
+    };
     let width = area.width.saturating_sub(6).min(78);
-    let height = (servers.len() as u16 + 4)
+    let height = (servers.len() as u16 + overflow_rows + 4)
         .min(area.height.saturating_sub(4))
         .max(5);
     if width < 48 || height < 5 {
@@ -4214,6 +4251,31 @@ fn draw_server_selector(
             "no servers known",
             Style::default().fg(MUTED),
         )));
+    }
+    // Configured endpoints beyond the monitoring cap are shown explicitly so
+    // they are never silently dropped. They are not polled; endpoints are
+    // redacted (no credentials/query tokens).
+    if !overflow.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "── NOT MONITORED · server limit reached ({}) ──",
+                overflow.len()
+            ),
+            Style::default().fg(YELLOW),
+        )));
+        for spec in overflow {
+            lines.push(Line::from(vec![
+                Span::styled("  ✗ ", Style::default().fg(YELLOW)),
+                Span::styled(
+                    fit_cell(&compact_endpoint(&spec.endpoint), 40),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(
+                    "  not monitored — limit reached",
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+        }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -4777,6 +4839,37 @@ fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant
     }
     while history.len() > HISTORY_MAX_SAMPLES {
         history.pop_front();
+    }
+}
+
+/// Fold one LLM sample into a server's history/connection state. A missing
+/// metric is never appended as a fabricated zero; only a present rate enters
+/// the graph, keeping unknown distinct from a real `0`.
+fn observe_llm_into(history: &mut LlmHistory, llm: &LlmStats, now: Instant) {
+    if llm.connected && !llm.reconnecting {
+        if !history.was_connected {
+            history.connected_since = Some(now);
+            history.connected_flash_until = Some(now + Duration::from_secs(2));
+            history.sample_interval_ema_ms = None;
+        } else if let Some(previous) = history.last_fresh_at {
+            let interval_ms = now.saturating_duration_since(previous).as_secs_f64() * 1_000.0;
+            history.sample_interval_ema_ms =
+                smooth_llm_sample_interval(history.sample_interval_ema_ms, interval_ms);
+        }
+        history.was_connected = true;
+        history.last_fresh_at = Some(now);
+        if llm.metrics_available {
+            if let Some(value) = llm.prompt_tps {
+                push_metric_history_at(&mut history.prefill, value, now);
+            }
+            if let Some(value) = llm.generation_tps {
+                push_metric_history_at(&mut history.decode, value, now);
+            }
+        }
+    } else if !llm.connected {
+        history.was_connected = false;
+        history.connected_since = None;
+        history.connected_flash_until = None;
     }
 }
 
@@ -5594,27 +5687,35 @@ mod tests {
     #[test]
     fn llm_history_ignores_held_reconnect_samples() {
         let mut state = UiState::default();
-        state.observe_llm_sample(&LlmStats {
-            connected: true,
-            metrics_available: true,
-            prompt_tps: Some(1200.0),
-            generation_tps: Some(75.0),
-            ..LlmStats::default()
-        });
-        assert_eq!(state.llm_prefill_history.len(), 1);
-        assert_eq!(state.llm_decode_history.len(), 1);
-        assert!(state.llm_last_fresh_at.is_some());
-        assert!(state.llm_connected_since.is_some());
+        state.record_llm_sample(
+            "srv",
+            "srv",
+            &LlmStats {
+                connected: true,
+                metrics_available: true,
+                prompt_tps: Some(1200.0),
+                generation_tps: Some(75.0),
+                ..LlmStats::default()
+            },
+        );
+        assert_eq!(state.llm_history.prefill.len(), 1);
+        assert_eq!(state.llm_history.decode.len(), 1);
+        assert!(state.llm_history.last_fresh_at.is_some());
+        assert!(state.llm_history.connected_since.is_some());
 
-        state.observe_llm_sample(&LlmStats {
-            connected: true,
-            reconnecting: true,
-            prompt_tps: Some(9999.0),
-            generation_tps: Some(9999.0),
-            ..LlmStats::default()
-        });
-        assert_eq!(state.llm_prefill_history.len(), 1);
-        assert_eq!(state.llm_decode_history.len(), 1);
+        state.record_llm_sample(
+            "srv",
+            "srv",
+            &LlmStats {
+                connected: true,
+                reconnecting: true,
+                prompt_tps: Some(9999.0),
+                generation_tps: Some(9999.0),
+                ..LlmStats::default()
+            },
+        );
+        assert_eq!(state.llm_history.prefill.len(), 1);
+        assert_eq!(state.llm_history.decode.len(), 1);
     }
 
     #[test]
@@ -5623,19 +5724,79 @@ mod tests {
         // throughput: no point may enter the rate history (that would draw a
         // fabricated flat line).
         let mut state = UiState::default();
-        state.observe_llm_sample(&LlmStats {
-            connected: true,
-            metrics_available: false,
-            prompt_tps: Some(9999.0),
-            generation_tps: Some(9999.0),
-            ..LlmStats::default()
-        });
-        assert!(state.llm_prefill_history.is_empty());
-        assert!(state.llm_decode_history.is_empty());
+        state.record_llm_sample(
+            "srv",
+            "srv",
+            &LlmStats {
+                connected: true,
+                metrics_available: false,
+                prompt_tps: Some(9999.0),
+                generation_tps: Some(9999.0),
+                ..LlmStats::default()
+            },
+        );
+        assert!(state.llm_history.prefill.is_empty());
+        assert!(state.llm_history.decode.is_empty());
         assert!(
-            state.llm_last_fresh_at.is_some(),
+            state.llm_history.last_fresh_at.is_some(),
             "the link is still fresh even without metrics"
         );
+    }
+
+    fn llm_with(prompt: f64, generation: f64) -> LlmStats {
+        LlmStats {
+            connected: true,
+            metrics_available: true,
+            prompt_tps: Some(prompt),
+            generation_tps: Some(generation),
+            ..LlmStats::default()
+        }
+    }
+
+    #[test]
+    fn per_server_histories_are_independent_and_survive_selection() {
+        let mut state = UiState::default();
+        // A accumulates while it is the selected server.
+        state.record_llm_sample("A", "A", &llm_with(1200.0, 60.0));
+        state.record_llm_sample("A", "A", &llm_with(1300.0, 70.0));
+        assert_eq!(state.llm_history.prefill.len(), 2);
+
+        // B is monitored in the background while A stays selected: B's sample
+        // must not touch A's active view, but must be recorded for B.
+        state.record_llm_sample("B", "A", &llm_with(10.0, 1.0));
+        assert_eq!(
+            state.llm_history.prefill.len(),
+            2,
+            "a background sample must not alter the selected server's history"
+        );
+
+        // Switch to B: B's own accumulated history is shown immediately.
+        state.select_llm_history("B");
+        assert_eq!(state.llm_history.prefill.len(), 1);
+        // Switch back to A: A's history is preserved, not reset.
+        state.select_llm_history("A");
+        assert_eq!(state.llm_history.prefill.len(), 2);
+    }
+
+    #[test]
+    fn reset_and_retain_bound_per_server_history() {
+        let mut state = UiState::default();
+        state.record_llm_sample("A", "A", &llm_with(1.0, 1.0));
+        state.record_llm_sample("B", "A", &llm_with(1.0, 1.0));
+
+        // A proven restart of B resets only B.
+        state.reset_llm_history("B");
+        state.select_llm_history("B");
+        assert!(state.llm_history.prefill.is_empty());
+        state.select_llm_history("A");
+        assert_eq!(state.llm_history.prefill.len(), 1, "A is untouched");
+
+        // Retaining only the live keys drops the servers that are gone.
+        state.record_llm_sample("B", "A", &llm_with(2.0, 2.0));
+        let live: HashSet<String> = ["A".to_string()].into_iter().collect();
+        state.retain_llm_histories(&live);
+        assert!(state.llm_histories.contains_key("A"));
+        assert!(!state.llm_histories.contains_key("B"));
     }
 
     #[test]
@@ -5891,8 +6052,11 @@ mod tests {
     #[test]
     fn llm_last_uses_smoothed_interval_while_online() {
         let state = UiState {
-            llm_sample_interval_ema_ms: Some(101.4),
-            llm_last_fresh_at: Some(Instant::now()),
+            llm_history: LlmHistory {
+                sample_interval_ema_ms: Some(101.4),
+                last_fresh_at: Some(Instant::now()),
+                ..LlmHistory::default()
+            },
             ..UiState::default()
         };
         let llm = LlmStats {

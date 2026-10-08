@@ -379,6 +379,15 @@ pub(crate) fn resolve_monitor_target_with<S: system::Sys>(
     }
 }
 
+/// The endpoints to monitor, plus any that exceed the monitoring cap and are
+/// therefore NOT polled. `overflow` is surfaced in the UI/selector so a
+/// configured endpoint past [`MAX_MONITORED_SERVERS`] is never silently
+/// dropped.
+pub(crate) struct ServerList {
+    pub monitored: Vec<ServerSpec>,
+    pub overflow: Vec<ServerSpec>,
+}
+
 /// The full set of endpoints to monitor, as `(stable key, endpoint)`.
 ///
 /// Order is deterministic: the configured primary (`server=`), then configured
@@ -386,7 +395,7 @@ pub(crate) fn resolve_monitor_target_with<S: system::Sys>(
 /// auto-discovery is on). Entries are de-duplicated by stable identity and the
 /// whole set is capped at [`MAX_MONITORED_SERVERS`]. No network scanning is
 /// performed: discovery only reads local `/proc` process arguments.
-pub(crate) fn collect_server_list(settings: &config::AppConfig) -> Vec<ServerSpec> {
+pub(crate) fn collect_server_list(settings: &config::AppConfig) -> ServerList {
     collect_server_list_with(&system::RealSys, settings)
 }
 
@@ -394,7 +403,7 @@ pub(crate) fn collect_server_list(settings: &config::AppConfig) -> Vec<ServerSpe
 pub(crate) fn collect_server_list_with<S: system::Sys>(
     sys: &S,
     settings: &config::AppConfig,
-) -> Vec<ServerSpec> {
+) -> ServerList {
     let mut out: Vec<ServerSpec> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     if let Some(server) = settings.server.as_deref() {
@@ -417,8 +426,19 @@ pub(crate) fn collect_server_list_with<S: system::Sys>(
     if out.is_empty() {
         push_server(&mut out, &mut seen, DEFAULT_SERVER, None);
     }
-    out.truncate(MAX_MONITORED_SERVERS);
-    out
+    // Configured endpoints come first (primary, then extras), so the cap only
+    // truncates the tail — discovered servers first, then configured extras
+    // beyond the cap. Everything past the cap is returned as `overflow` and
+    // surfaced, never silently dropped.
+    let overflow = if out.len() > MAX_MONITORED_SERVERS {
+        out.split_off(MAX_MONITORED_SERVERS)
+    } else {
+        Vec::new()
+    };
+    ServerList {
+        monitored: out,
+        overflow,
+    }
 }
 
 /// Add an endpoint under its stable key unless it is blank or already present.
@@ -616,7 +636,11 @@ mod tests {
             ..config::AppConfig::default()
         };
         let list = collect_server_list_with(&FixtureSys::default(), &settings);
-        let endpoints: Vec<&str> = list.iter().map(|spec| spec.endpoint.as_str()).collect();
+        let endpoints: Vec<&str> = list
+            .monitored
+            .iter()
+            .map(|spec| spec.endpoint.as_str())
+            .collect();
         // The primary comes first; the trailing-slash duplicate collapses; the
         // extra endpoint is kept.
         assert_eq!(endpoints, vec!["http://a:1", "http://b:2"]);
@@ -631,20 +655,72 @@ mod tests {
         };
         let list = collect_server_list_with(&sys, &settings);
         assert!(
-            list.iter()
+            list.monitored
+                .iter()
                 .any(|spec| spec.endpoint == "http://127.0.0.1:8081"),
-            "{list:?}"
+            "{:?}",
+            list.monitored
         );
         assert!(
-            list.iter()
+            list.monitored
+                .iter()
                 .any(|spec| spec.endpoint == "http://127.0.0.1:8082"),
-            "{list:?}"
+            "{:?}",
+            list.monitored
         );
-        let keys: std::collections::HashSet<&String> = list.iter().map(|spec| &spec.key).collect();
-        assert_eq!(keys.len(), list.len(), "keys must be unique");
+        let keys: std::collections::HashSet<&String> =
+            list.monitored.iter().map(|spec| &spec.key).collect();
+        assert_eq!(keys.len(), list.monitored.len(), "keys must be unique");
         // Discovered servers carry their process identity so a same-port restart
         // can be detected.
-        assert!(list.iter().all(|spec| spec.identity.is_some()), "{list:?}");
+        assert!(
+            list.monitored.iter().all(|spec| spec.identity.is_some()),
+            "{:?}",
+            list.monitored
+        );
+    }
+
+    #[test]
+    fn collect_server_list_reports_overflow_beyond_the_cap() {
+        // 17 unique configured endpoints -> 16 monitored, 1 reported as
+        // overflow (never silently dropped). Configured order is preserved.
+        let servers: Vec<String> = (0..17u16).map(|i| format!("http://host{i}:1")).collect();
+        let settings = config::AppConfig {
+            servers,
+            auto_discovery: false,
+            ..config::AppConfig::default()
+        };
+        let list = collect_server_list_with(&FixtureSys::default(), &settings);
+        assert_eq!(list.monitored.len(), crate::domain::MAX_MONITORED_SERVERS);
+        assert_eq!(list.overflow.len(), 1);
+        assert_eq!(list.overflow[0].endpoint, "http://host16:1");
+        assert!(!list
+            .monitored
+            .iter()
+            .any(|spec| spec.key == list.overflow[0].key));
+    }
+
+    #[test]
+    fn configured_endpoints_outrank_discovery_at_the_cap() {
+        // 16 configured endpoints fill the cap, so a discovered server is
+        // reported as overflow rather than evicting a configured one.
+        let servers: Vec<String> = (0..16u16).map(|i| format!("http://host{i}:1")).collect();
+        let settings = config::AppConfig {
+            servers,
+            auto_discovery: true,
+            ..config::AppConfig::default()
+        };
+        let sys = llama_fixture(&[(5000, 8081)]);
+        let list = collect_server_list_with(&sys, &settings);
+        assert_eq!(list.monitored.len(), 16);
+        assert!(list
+            .monitored
+            .iter()
+            .all(|spec| spec.endpoint.starts_with("http://host")));
+        assert!(list
+            .overflow
+            .iter()
+            .any(|spec| spec.endpoint == "http://127.0.0.1:8081"));
     }
 
     #[test]
@@ -654,7 +730,7 @@ mod tests {
             ..config::AppConfig::default()
         };
         let list = collect_server_list_with(&FixtureSys::default(), &settings);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].endpoint, DEFAULT_SERVER);
+        assert_eq!(list.monitored.len(), 1);
+        assert_eq!(list.monitored[0].endpoint, DEFAULT_SERVER);
     }
 }
