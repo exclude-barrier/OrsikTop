@@ -6620,7 +6620,7 @@ mod tests {
         let label = gpu_attribution_label(&GpuMapping::Multi(vec![mapped, other])).unwrap();
         assert!(
             label.contains("+1"),
-            "multi attribution must show the extra GPU count: {label}"
+            "multi attribution must show the GPU count"
         );
     }
 
