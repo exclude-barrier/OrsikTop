@@ -16,16 +16,16 @@ use crate::{
     config,
     cpu::{detect_topology, CpuCoreKind},
     cpu_sensors::CpuSensors,
-    discovery::discover_gpus,
+    discovery::{discover_gpus, DiscoveredGpu},
     discovery_llm::{
         collect_candidates, read_process_start_time, select_endpoint, selected_endpoint_server,
-        ServerSource,
+        LocalServerIdentity, ServerSource,
     },
     domain::{GpuEvidence, GpuMapping, GpuSelector},
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
-    llama::{LlamaMonitor, LlmStats},
-    providers::nvidia::discover_mig_children,
+    llama::{LlamaMonitor, LlmStats, UNKNOWN_MODEL_LABEL},
+    providers::nvidia::{discover_mig_children, MigChild},
     redact::{redact_urls, safe_endpoint},
     system::RealSys,
 };
@@ -39,7 +39,15 @@ const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 ///
 /// `settings` is the same configuration the TUI runs with, so one-off CLI
 /// overrides (`--server`, `--gpu`, `--interval-ms`) apply to `diag` too.
-pub fn run(settings: &config::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `multi` switches to the opt-in multi-server overview (`orsiktop diag
+/// --servers`): every monitored endpoint is probed (bounded, read-only) and
+/// any configured endpoint past the cap is listed as not monitored. The
+/// default single-server report is unchanged.
+pub fn run(settings: &config::AppConfig, multi: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if multi {
+        return run_multi(settings);
+    }
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
@@ -275,19 +283,7 @@ fn llama_section(
     let gpus = discover_gpus(sys);
     let nvml = Nvml::init().ok();
     let mig_children = nvml.as_ref().map(discover_mig_children).unwrap_or_default();
-    let mapping = match server {
-        Some(identity) => {
-            let current_start = read_process_start_time(sys, identity.pid);
-            if current_start != Some(identity.start_time) {
-                GpuMapping::Unknown
-            } else {
-                let render = process_render_gpus(sys, identity.pid, &gpus);
-                let nvml_keys = nvml_compute_gpus(nvml.as_ref(), identity.pid, &mig_children);
-                map_server_gpus(true, render, nvml_keys, &gpus)
-            }
-        }
-        None => GpuMapping::None,
-    };
+    let mapping = server_gpu_mapping(sys, server, &gpus, nvml.as_ref(), &mig_children);
 
     out.push_str("llama.cpp\n");
     if candidates.is_empty() {
@@ -328,6 +324,16 @@ fn connected_probe_report(stats: &LlmStats) -> String {
     let used = stats
         .context_used
         .map_or_else(|| "—".to_string(), |value| value.to_string());
+    // A capacity of 0 means both /props and /slots were unavailable, so the
+    // pair is unknown — never a fabricated "0".
+    let context = if stats.context_size > 0 {
+        format!("{used}/{}", stats.context_size)
+    } else {
+        "—".to_string()
+    };
+    // /slots may be down while /metrics is up (connected, but no slot state):
+    // fall back to the /props total, else `—`, never a fabricated "0 busy".
+    let slots = slots_line(stats);
     let mut lines = vec![
         "  status     : connected".to_string(),
         format!("  model      : {model}"),
@@ -339,14 +345,8 @@ fn connected_probe_report(stats: &LlmStats) -> String {
                 "unavailable"
             }
         ),
-        format!(
-            "  context    : {used}/{} (watermark {watermark})",
-            stats.context_size
-        ),
-        format!(
-            "  slots      : {} busy / {} total",
-            stats.busy_slots, stats.slot_count
-        ),
+        format!("  context    : {context} (watermark {watermark})"),
+        format!("  slots      : {slots}"),
     ];
     if stats.metrics_available && (stats.prompt_tps.is_some() || stats.generation_tps.is_some()) {
         lines.push(format!(
@@ -389,6 +389,225 @@ fn probe_llama<S: crate::system::Sys>(sys: &S, auto_discovery: bool, server: Opt
             "  status     : client init failed ({})",
             redact_urls(&err.to_string())
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-server overview (`orsiktop diag --servers`)
+// ---------------------------------------------------------------------------
+
+/// One monitored server as shown in the multi-server overview.
+struct MultiServerEntry {
+    /// Display label: the server-sanitized model name, or the redacted
+    /// endpoint when no model is known.
+    label: String,
+    /// Raw endpoint; rendered through [`safe_endpoint`] so no credential can
+    /// reach stdout.
+    endpoint: String,
+    stats: LlmStats,
+    mapping: GpuMapping,
+}
+
+/// Probe every monitored endpoint concurrently and return their stats in the
+/// original order.
+///
+/// Bounded by the server cap: one scoped thread per server, joined when the
+/// scope closes, so a slow or hanging endpoint cannot delay the others and
+/// diagnostics always terminate. Each probe reuses the production
+/// [`LlamaMonitor`] timeouts (750 ms connect / 1200 ms total), and the whole
+/// set is bounded by the 16-server cap.
+fn probe_servers(servers: &[crate::app::ServerSpec]) -> Vec<LlmStats> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = servers
+            .iter()
+            .take(crate::domain::MAX_MONITORED_SERVERS)
+            .map(|spec| {
+                let endpoint = spec.endpoint.clone();
+                scope.spawn(move || match LlamaMonitor::new(&endpoint) {
+                    Ok(mut monitor) => monitor.sample(),
+                    Err(err) => LlmStats {
+                        // A client-construction error is rare; redact any URL
+                        // defensively so an endpoint credential cannot leak.
+                        error: redact_urls(&err.to_string()),
+                        ..Default::default()
+                    },
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// The GPU attribution for one server, from its verified local process
+/// identity. `None` (no local process) is deliberately distinct from
+/// `Unknown` (a local process that could not be attributed): a remote or
+/// configured endpoint is *not evaluated*, never guessed.
+fn server_gpu_mapping<S: crate::system::Sys>(
+    sys: &S,
+    identity: Option<LocalServerIdentity>,
+    gpus: &[DiscoveredGpu],
+    nvml: Option<&Nvml>,
+    mig_children: &[MigChild],
+) -> GpuMapping {
+    let Some(identity) = identity else {
+        return GpuMapping::None;
+    };
+    // PID-reuse guard: only attribute while the PID still carries the start
+    // time read at discovery.
+    if read_process_start_time(sys, identity.pid) != Some(identity.start_time) {
+        return GpuMapping::Unknown;
+    }
+    let render = process_render_gpus(sys, identity.pid, gpus);
+    let nvml_keys = nvml_compute_gpus(nvml, identity.pid, mig_children);
+    map_server_gpus(true, render, nvml_keys, gpus)
+}
+
+/// Run the opt-in multi-server overview: collect the monitored/overflow set,
+/// probe the monitored endpoints once, attribute GPUs, and print the report.
+fn run_multi(settings: &config::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let list = crate::collect_server_list(settings);
+    let stats = probe_servers(&list.monitored);
+
+    // Expensive host evidence (DRM discovery + optional NVML) is gathered once
+    // and reused for every server, so host queries do not grow per endpoint.
+    let gpus = discover_gpus(&RealSys);
+    let nvml = Nvml::init().ok();
+    let mig_children = nvml.as_ref().map(discover_mig_children).unwrap_or_default();
+
+    let entries: Vec<MultiServerEntry> = list
+        .monitored
+        .iter()
+        .zip(stats)
+        .map(|(spec, stats)| {
+            let mapping =
+                server_gpu_mapping(&RealSys, spec.identity, &gpus, nvml.as_ref(), &mig_children);
+            // Only a connected server with a real (non-placeholder) model name
+            // is labelled by it; otherwise the redacted endpoint is clearer and
+            // never claims a model that was not reported.
+            let label = entry_label(&stats, &spec.endpoint);
+            MultiServerEntry {
+                label,
+                endpoint: spec.endpoint.clone(),
+                stats,
+                mapping,
+            }
+        })
+        .collect();
+
+    let overflow: Vec<String> = list
+        .overflow
+        .iter()
+        .map(|spec| spec.endpoint.clone())
+        .collect();
+
+    print!("{}", render_multi_report(&entries, &overflow));
+    Ok(())
+}
+
+/// Display label for one monitored server: the real model name only when the
+/// server is connected and reported one; otherwise the redacted endpoint. The
+/// [`UNKNOWN_MODEL_LABEL`] placeholder is treated as "no model known".
+fn entry_label(stats: &LlmStats, endpoint: &str) -> String {
+    if stats.connected && !stats.model.is_empty() && stats.model != UNKNOWN_MODEL_LABEL {
+        stats.model.clone()
+    } else {
+        safe_endpoint(endpoint)
+    }
+}
+
+/// Build the multi-server overview string (pure; testable without a TTY or a
+/// live server). Only values actually reported by a server are shown: unknown
+/// slots/context/metrics render `—`, never a fabricated zero, and a single
+/// counter snapshot never produces a tok/s rate.
+fn render_multi_report(entries: &[MultiServerEntry], overflow: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str("OrsikTop multi-server diagnostics\n");
+    out.push_str(&format!("  version    : {}\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!(
+        "  monitored  : {} / {}\n",
+        entries.len(),
+        crate::domain::MAX_MONITORED_SERVERS
+    ));
+    out.push_str(&format!("  over limit : {}\n", overflow.len()));
+
+    for (index, entry) in entries.iter().enumerate() {
+        out.push_str(&format!("\n[{}] {}\n", index + 1, entry.label));
+        out.push_str(&format!(
+            "  endpoint   : {}\n",
+            safe_endpoint(&entry.endpoint)
+        ));
+        out.push_str(&format!("  status     : {}\n", status_line(&entry.stats)));
+        out.push_str(&format!(
+            "  metrics    : {}\n",
+            if entry.stats.metrics_available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ));
+        out.push_str(&format!("  slots      : {}\n", slots_line(&entry.stats)));
+        out.push_str(&format!("  context    : {}\n", context_line(&entry.stats)));
+        out.push_str(&format!(
+            "  gpu        : {}\n",
+            describe_mapping(&entry.mapping)
+        ));
+    }
+
+    if !overflow.is_empty() {
+        out.push_str(&format!(
+            "\nNot monitored (server cap of {} reached; not polled — availability not checked):\n",
+            crate::domain::MAX_MONITORED_SERVERS
+        ));
+        for (index, endpoint) in overflow.iter().enumerate() {
+            out.push_str(&format!("  [{}] {}\n", index + 1, safe_endpoint(endpoint)));
+        }
+    }
+
+    out
+}
+
+fn status_line(stats: &LlmStats) -> String {
+    if stats.connected {
+        if stats.metrics_available {
+            "connected".to_string()
+        } else {
+            "connected (metrics unavailable)".to_string()
+        }
+    } else {
+        let detail = if stats.error.is_empty() {
+            "no error detail".to_string()
+        } else {
+            redact_urls(&stats.error)
+        };
+        format!("unreachable ({detail})")
+    }
+}
+
+fn slots_line(stats: &LlmStats) -> String {
+    if stats.slots_available {
+        format!("{} busy / {} total", stats.busy_slots, stats.slot_count)
+    } else if stats.props_slot_count > 0 {
+        format!("—/{} total", stats.props_slot_count)
+    } else {
+        "—".to_string()
+    }
+}
+
+fn context_line(stats: &LlmStats) -> String {
+    // Mirror the TUI: when /slots is unavailable the /metrics high-water mark
+    // is the best known occupancy. Unknown capacity renders `—`, never `/0`.
+    let used = if stats.slots_available {
+        stats.context_used
+    } else {
+        stats.context_high_watermark
+    };
+    match (used, stats.context_size) {
+        (Some(used), size) if size > 0 => format!("{used}/{size}"),
+        (None, size) if size > 0 => format!("—/{size}"),
+        _ => "—".to_string(),
     }
 }
 
@@ -709,5 +928,342 @@ mod tests {
         assert!(report.contains("metrics    : available"), "{report}");
         assert!(report.contains("watermark 2048"), "{report}");
         assert!(report.contains("prompt 12.5 tps"), "{report}");
+    }
+
+    #[test]
+    fn probe_report_does_not_fabricate_zero_slots_when_slots_are_unavailable() {
+        // /metrics up but /slots down: `connected` is true (/metrics is the
+        // liveness gate) yet the slot state is unknown. It must render `—`,
+        // never a fabricated "0 busy / 0 total".
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            slots_available: false,
+            props_slot_count: 0,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(report.contains("slots      : —"), "{report}");
+        assert!(!report.contains("0 busy / 0 total"), "{report}");
+
+        // /props still knows the configured total.
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            slots_available: false,
+            props_slot_count: 3,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(report.contains("slots      : —/3 total"), "{report}");
+    }
+
+    #[test]
+    fn probe_report_does_not_print_a_zero_context_capacity() {
+        // Neither /props nor /slots reported a capacity: unknown, not "0".
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            context_size: 0,
+            context_used: None,
+            ..Default::default()
+        };
+        let report = connected_probe_report(&stats);
+        assert!(report.contains("context    : —"), "{report}");
+        assert!(!report.contains("/0"), "{report}");
+    }
+
+    fn multi_entry(
+        label: &str,
+        endpoint: &str,
+        stats: LlmStats,
+        mapping: GpuMapping,
+    ) -> MultiServerEntry {
+        MultiServerEntry {
+            label: label.to_string(),
+            endpoint: endpoint.to_string(),
+            stats,
+            mapping,
+        }
+    }
+
+    #[test]
+    fn multi_report_separates_states_and_bounds_the_inventory() {
+        let mapped = crate::domain::MappedGpu {
+            device: crate::domain::DeviceId::new(Some("0000:01:00.0".into()), None),
+            name: "card0".into(),
+            vendor: GpuVendor::Nvidia,
+            evidence: crate::domain::GpuEvidence::NvmlCompute,
+        };
+        let entries = vec![
+            multi_entry(
+                "Qwen2.5",
+                "http://127.0.0.1:8081",
+                LlmStats {
+                    connected: true,
+                    metrics_available: true,
+                    model: "Qwen2.5".into(),
+                    slots_available: true,
+                    slot_count: 4,
+                    busy_slots: 2,
+                    context_used: Some(1000),
+                    context_size: 4096,
+                    ..Default::default()
+                },
+                GpuMapping::Single(mapped),
+            ),
+            multi_entry(
+                "http://127.0.0.1:8082",
+                "http://127.0.0.1:8082",
+                LlmStats {
+                    connected: false,
+                    error: "connection refused".into(),
+                    ..Default::default()
+                },
+                GpuMapping::Unknown,
+            ),
+            multi_entry(
+                "Remote",
+                "http://example.org:8080",
+                LlmStats {
+                    connected: true,
+                    ..Default::default()
+                },
+                GpuMapping::None,
+            ),
+        ];
+
+        let report = render_multi_report(&entries, &[]);
+        assert!(report.contains("monitored  : 3 / 16"), "{report}");
+        assert!(report.contains("over limit : 0"), "{report}");
+        assert!(report.contains("slots      : 2 busy / 4 total"), "{report}");
+        assert!(report.contains("context    : 1000/4096"), "{report}");
+        assert!(
+            report.contains("gpu        : single 0000:01:00.0 (evidence: NVML compute)"),
+            "{report}"
+        );
+        // Offline, evaluated-but-unknown, and not-evaluated are distinct.
+        assert!(
+            report.contains("unreachable (connection refused)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("unknown (insufficient evidence)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("not computed (no local server process)"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn multi_report_redacts_endpoints_and_lists_overflow_as_not_polled() {
+        let entries = vec![multi_entry(
+            "srv",
+            "http://demo-user:demo-password@localhost:8081/v1?token=topsecret#frag",
+            LlmStats {
+                connected: true,
+                ..Default::default()
+            },
+            GpuMapping::None,
+        )];
+        let overflow = vec!["http://host16:1?token=overflowsecret".to_string()];
+        let report = render_multi_report(&entries, &overflow);
+
+        for secret in [
+            "demo-user",
+            "demo-password",
+            "topsecret",
+            "overflowsecret",
+            "frag",
+        ] {
+            assert!(!report.contains(secret), "leaked {secret}:\n{report}");
+        }
+        // Connection-relevant, non-secret parts survive.
+        assert!(report.contains("http://localhost:8081"), "{report}");
+        assert!(report.contains("monitored  : 1 / 16"), "{report}");
+        assert!(report.contains("over limit : 1"), "{report}");
+        // Overflow is explicitly not monitored and not claimed to be checked.
+        assert!(report.contains("Not monitored"), "{report}");
+        assert!(report.contains("availability not checked"), "{report}");
+        assert!(report.contains("http://host16:1"), "{report}");
+    }
+
+    #[test]
+    fn context_line_falls_back_to_the_metrics_watermark_without_slots() {
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            slots_available: false,
+            context_used: None,
+            context_high_watermark: Some(2048),
+            context_size: 4096,
+            ..Default::default()
+        };
+        assert_eq!(context_line(&stats), "2048/4096");
+
+        // No evidence at all: unknown, never a fabricated capacity.
+        let empty = LlmStats {
+            connected: true,
+            metrics_available: true,
+            ..Default::default()
+        };
+        assert_eq!(context_line(&empty), "—");
+    }
+
+    #[test]
+    fn multi_label_uses_model_only_for_a_connected_real_model() {
+        let connected = LlmStats {
+            connected: true,
+            model: "Qwen".into(),
+            ..Default::default()
+        };
+        assert_eq!(entry_label(&connected, "http://127.0.0.1:8081"), "Qwen");
+
+        // The /props placeholder is not a real model name.
+        let placeholder = LlmStats {
+            connected: true,
+            model: UNKNOWN_MODEL_LABEL.into(),
+            ..Default::default()
+        };
+        assert_eq!(entry_label(&placeholder, "http://host:1"), "http://host:1");
+
+        // An unreachable server never claims the model it may have reported
+        // earlier.
+        let offline = LlmStats {
+            connected: false,
+            model: "Qwen".into(),
+            ..Default::default()
+        };
+        assert_eq!(entry_label(&offline, "http://host:1"), "http://host:1");
+
+        // The endpoint fallback is redacted.
+        assert_eq!(
+            entry_label(&LlmStats::default(), "http://user:pw@host:1/x?token=s"),
+            "http://host:1/…?…"
+        );
+    }
+
+    #[test]
+    fn server_gpu_mapping_distinguishes_not_evaluated_from_unknown() {
+        let sys = crate::system::FixtureSys::default();
+        let gpus: Vec<DiscoveredGpu> = Vec::new();
+        // No local process -> not evaluated (never a guess).
+        assert_eq!(
+            server_gpu_mapping(&sys, None, &gpus, None, &[]),
+            GpuMapping::None
+        );
+        // A local identity whose process is gone: evaluated but unknown.
+        let identity = LocalServerIdentity {
+            pid: 4242,
+            start_time: 7,
+        };
+        assert_eq!(
+            server_gpu_mapping(&sys, Some(identity), &gpus, None, &[]),
+            GpuMapping::Unknown
+        );
+    }
+
+    #[test]
+    fn probe_servers_reports_a_healthy_server_while_an_offline_one_is_isolated() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn read_path(stream: &mut TcpStream) -> Option<String> {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = stream.read(&mut chunk).ok()?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .next()?
+                .split_whitespace()
+                .nth(1)
+                .map(str::to_string)
+        }
+        fn write_json(stream: &mut TcpStream, body: &str) {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Some(path) = read_path(&mut stream) {
+                            let body = if path.contains("/props") {
+                                "{\"model_path\":\"model-A\",\"total_slots\":1,\"default_generation_settings\":{\"n_ctx\":4096}}".to_string()
+                            } else if path.contains("/slots") {
+                                "[{\"id\":0,\"n_ctx\":4096,\"is_processing\":false}]".to_string()
+                            } else {
+                                "llamacpp:prompt_tokens_total 100\n".to_string()
+                            };
+                            write_json(&mut stream, &body);
+                        }
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // A port bound then released: nothing listens there, so a probe is
+        // refused quickly.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let servers = vec![
+            crate::app::ServerSpec {
+                key: crate::domain::server_key(&format!("http://{addr}")),
+                endpoint: format!("http://{addr}"),
+                identity: None,
+            },
+            crate::app::ServerSpec {
+                key: crate::domain::server_key(&format!("http://{dead_addr}")),
+                endpoint: format!("http://{dead_addr}"),
+                identity: None,
+            },
+        ];
+        let stats = probe_servers(&servers);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert!(
+            stats[0].connected && stats[0].metrics_available,
+            "healthy server must connect: {:?}",
+            stats[0]
+        );
+        assert!(
+            !stats[1].connected,
+            "offline server must be isolated, not fail the report: {:?}",
+            stats[1]
+        );
     }
 }

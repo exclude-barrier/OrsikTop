@@ -29,6 +29,11 @@ const LLM_REQUEST_TIMEOUT_MS: u64 = 1200;
 /// memory while leaving ample headroom.
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Placeholder shown when `/props` did not report a model name. It is not a
+/// real model, so display paths that have a better label (e.g. the endpoint)
+/// must treat it as "no model known".
+pub(crate) const UNKNOWN_MODEL_LABEL: &str = "llama.cpp model";
+
 #[derive(Clone, Debug, Default)]
 pub struct LlmStats {
     pub connected: bool,
@@ -416,7 +421,7 @@ impl LlamaMonitor {
         }
 
         if stats.model.is_empty() {
-            stats.model = "llama.cpp model".to_string();
+            stats.model = UNKNOWN_MODEL_LABEL.to_string();
         }
 
         stats

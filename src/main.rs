@@ -50,7 +50,13 @@ enum Commands {
     /// Update a standalone OrsikTop installation to the latest release.
     Update,
     /// Print a diagnostics summary for bug reports (no secrets).
-    Diag,
+    Diag {
+        /// Also list every monitored server (up to the 16-server cap) and any
+        /// configured endpoint that exceeds it, instead of only the primary
+        /// endpoint. Read-only; overflow endpoints are never probed.
+        #[arg(long)]
+        servers: bool,
+    },
     /// Remove the OrsikTop binaries, and optionally the saved config.
     Uninstall {
         /// Also remove the saved OrsikTop config (endpoint, GPU index, refresh settings).
@@ -143,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return match command {
             Commands::Update => run_updater(),
             Commands::Uninstall { purge } => run_uninstall(*purge),
-            Commands::Diag => diagnostics::run(&settings),
+            Commands::Diag { servers } => diagnostics::run(&settings, *servers),
         };
     }
 
