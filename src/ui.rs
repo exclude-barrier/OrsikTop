@@ -1202,6 +1202,27 @@ fn gpu_in_mapping(gpu: &GpuStats, map: &GpuMapping) -> bool {
     }
 }
 
+/// Text shown for the selected server's GPU attribution in the LLM panel.
+///
+/// `None` means no attribution (not computed or unknown) — the caller renders
+/// `—`. A single device shows its stable key. Multiple devices show the first
+/// key plus a visible `+N` count, so a tensor-parallel server is never mistaken
+/// for a single-GPU one.
+fn gpu_attribution_label(map: &GpuMapping) -> Option<String> {
+    match map {
+        GpuMapping::Single(m) => Some(fit_cell(m.key(), 16)),
+        GpuMapping::Multi(ms) => {
+            let first = ms.first().map_or("<unkeyed>", MappedGpu::key);
+            Some(format!(
+                "{} +{}",
+                fit_cell(first, 13),
+                ms.len().saturating_sub(1)
+            ))
+        }
+        GpuMapping::None | GpuMapping::Unknown => None,
+    }
+}
+
 fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &GpuMapping) {
     let idle = enc_dec_idle(gpu);
     let base_title = if gpu.available {
@@ -1672,19 +1693,15 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
             value_span(&mtp, mtp_color),
         ];
     }
-    let gpu_hint = match gpu_map {
-        GpuMapping::Single(m) => Some(m),
-        GpuMapping::Multi(ms) => ms.first(),
-        GpuMapping::None | GpuMapping::Unknown => None,
-    };
     if inner.width >= 103 {
         state_line.push(llm_sep());
         state_line.push(label_span("GPU "));
         // The selected server's verified local GPU association: its stable key
-        // (BDF/UUID) when evidence matched, otherwise "—" (not determined —
-        // distinct from CPU-only or 0% utilization).
-        match gpu_hint {
-            Some(m) => state_line.push(value_span(&fit_cell(m.key(), 16), CYAN)),
+        // (BDF/UUID) when a single device matched, a `+N` suffix when several
+        // are attributed, otherwise "—" (not determined — distinct from
+        // CPU-only or 0% utilization).
+        match gpu_attribution_label(gpu_map) {
+            Some(label) => state_line.push(value_span(&label, CYAN)),
             None => state_line.push(value_span("—", MUTED)),
         }
     }
@@ -6577,6 +6594,34 @@ mod tests {
             ..Default::default()
         };
         assert!(!gpu_in_mapping(&foreign, &GpuMapping::Single(child_mapped)));
+    }
+
+    #[test]
+    fn gpu_attribution_label_shows_single_key_and_visible_multi_count() {
+        let mapped = MappedGpu {
+            device: DeviceId::new(Some("0000:01:00.0".into()), None),
+            name: "card0".to_string(),
+            vendor: GpuVendor::Nvidia,
+            evidence: GpuEvidence::NvmlCompute,
+        };
+        let other = MappedGpu {
+            device: DeviceId::new(Some("0000:02:00.0".into()), None),
+            ..mapped.clone()
+        };
+
+        assert_eq!(gpu_attribution_label(&GpuMapping::None), None);
+        assert_eq!(gpu_attribution_label(&GpuMapping::Unknown), None);
+        assert_eq!(
+            gpu_attribution_label(&GpuMapping::Single(mapped.clone())),
+            Some("0000:01:00.0".to_string())
+        );
+
+        // Multi must not silently look like a single GPU: the count is visible.
+        let label = gpu_attribution_label(&GpuMapping::Multi(vec![mapped, other])).unwrap();
+        assert!(
+            label.contains("+1"),
+            "multi attribution must show the extra GPU count: {label}"
+        );
     }
 
     #[test]
