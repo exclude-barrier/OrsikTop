@@ -21,6 +21,16 @@ All notable changes to OrsikTop will be documented here.
   slow one times out, and each server keeps its own counter baselines, slot
   identities and connection state, so telemetry never crosses server
   boundaries. Counters resume from a clean baseline when a server returns.
+- Per-server telemetry histories kept in memory for the duration of the run:
+  every monitored server accumulates its own throughput history even while it
+  is not selected, and switching the selected server (or back) preserves each
+  server's history instead of clearing it. A proven same-endpoint restart
+  starts a fresh history boundary, and histories of servers that disappear are
+  removed, so memory stays bounded (16 servers × bounded samples).
+- Configured endpoints beyond the 16-server monitoring cap are no longer
+  dropped silently: the header shows `· N over limit` and the server selector
+  lists them under "NOT MONITORED — limit reached" (endpoints redacted). They
+  are not polled, and the saved configuration is not rewritten.
 
 ## [0.2.10] - 2026-10-08
 

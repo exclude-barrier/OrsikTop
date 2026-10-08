@@ -320,7 +320,11 @@ server=http://127.0.0.1:8080
 servers=http://127.0.0.1:8081,http://192.168.1.20:8080
 ```
 
-Each server is identified by its normalized endpoint, so `http://127.0.0.1:8081` and `http://127.0.0.1:8081/` are the same server, while `127.0.0.1` and `localhost` are kept distinct. An unreachable server is shown as offline and does not affect the others; its counters resume from a clean baseline when it returns. Up to 16 servers are monitored.
+Each server is identified by its normalized endpoint, so `http://127.0.0.1:8081` and `http://127.0.0.1:8081/` are the same server, while `127.0.0.1` and `localhost` are kept distinct. An unreachable server is shown as offline and does not affect the others; its counters resume from a clean baseline when it returns.
+
+Each server keeps its own in-memory throughput history for the duration of the run, so every monitored server — selected or not — accumulates history and switching between servers preserves it (a proven same-endpoint restart starts a fresh history).
+
+At most **16** servers are polled. If you configure more, OrsikTop keeps the extra endpoints in the server selector under **NOT MONITORED — limit reached** and shows `· N over limit` in the header, instead of silently ignoring them; they are not polled and your saved config is left untouched.
 
 ## Controls
 
