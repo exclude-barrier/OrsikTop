@@ -1678,10 +1678,14 @@ fn draw_llm(frame: &mut Frame, area: Rect, llm: &LlmStats, state: &UiState, gpu_
         GpuMapping::None | GpuMapping::Unknown => None,
     };
     if inner.width >= 103 {
-        if let Some(m) = gpu_hint {
-            state_line.push(llm_sep());
-            state_line.push(label_span("GPU "));
-            state_line.push(value_span(&fit_cell(m.key(), 16), CYAN));
+        state_line.push(llm_sep());
+        state_line.push(label_span("GPU "));
+        // The selected server's verified local GPU association: its stable key
+        // (BDF/UUID) when evidence matched, otherwise "—" (not determined —
+        // distinct from CPU-only or 0% utilization).
+        match gpu_hint {
+            Some(m) => state_line.push(value_span(&fit_cell(m.key(), 16), CYAN)),
+            None => state_line.push(value_span("—", MUTED)),
         }
     }
 
