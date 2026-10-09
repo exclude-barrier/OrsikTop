@@ -4,6 +4,21 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Native support for the Strata inference server's JSON `/metrics` API
+  (verified against Strata build 0.1.40). A working Strata server previously
+  showed as online with "metrics unavailable" because its single-line JSON body
+  was parsed as llama.cpp Prometheus text, which yielded no samples.
+  `orsiktop` now detects the JSON telemetry object and maps its cumulative
+  `totals` counters (prompt/generated tokens, prompt/decode milliseconds) into
+  the existing throughput pipeline; a Strata counter reset (`totals.since`
+  change) or a wire-format switch resets the counter baseline instead of
+  reporting a false spike. Fields Strata does not expose (context
+  high-water mark, active requests, cache tokens) stay unavailable (`—`) rather
+  than a fabricated zero, and every llama.cpp monitoring behaviour is
+  unchanged.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added
