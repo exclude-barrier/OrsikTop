@@ -4,6 +4,30 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Context **occupancy** is no longer derived from request-processing progress.
+  The CTX `used` figure comes only from a slot's direct `n_prompt_tokens` field
+  (reported by llama.cpp and by newer Strata as the slot context in use); the
+  `n_prompt_tokens_processed` + decoded progress counters are no longer summed
+  into it. A slot that reports no direct occupancy leaves CTX `used` unavailable
+  (`—`), never a fabricated value, while the progress counters still feed the
+  REQUEST row and live throughput. A present `n_prompt_tokens: 0` is kept as a
+  real zero.
+
+### Added
+
+- Strata context support for the newer `/slots` schema, which adds
+  `n_prompt_tokens` (the slot's context in use, retained after a request ends) —
+  OrsikTop now shows `used / capacity` from it. Strata 0.1.40 predates that
+  field and reports only `id`, `n_ctx` and `is_processing`, so its CTX `used`
+  stays unavailable (`— / 196608`) rather than fabricated; this is an upstream
+  API limitation. On such a version the active request's prompt length and
+  generated progress are shown in the REQUEST row, reusing the already-fetched
+  `/metrics` `live.prompt_tokens` / `live.generated` — never as CTX occupancy.
+  Context capacity can also fall back to Strata's `engine.max_context` when
+  `/props` omits `n_ctx`.
+
 ## [0.3.1] - 2026-10-09
 
 ### Added

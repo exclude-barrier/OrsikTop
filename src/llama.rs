@@ -327,6 +327,7 @@ impl LlamaMonitor {
                 format: None,
                 strata_since: None,
                 strata_live: None,
+                strata_capacity: None,
                 json: false,
             });
         let metrics = parsed.samples;
@@ -344,6 +345,14 @@ impl LlamaMonitor {
             } else {
                 "/metrics returned no metrics".to_string()
             };
+        }
+        // Capacity fallback: if /props did not supply n_ctx, a recognised Strata
+        // engine reports its configured context; use it as the CTX denominator
+        // (capacity only — never occupancy). /slots n_ctx still refines it below.
+        if stats.context_size == 0 {
+            if let Some(capacity) = parsed.strata_capacity {
+                stats.context_size = capacity;
+            }
         }
 
         // Slot state is served by its own endpoint and stays valid (and
@@ -496,6 +505,15 @@ impl LlamaMonitor {
             stats.prompt_tps = None;
             stats.generation_tps = live.decode_tps;
             stats.strata_phase = live.phase;
+            // Reuse the already-fetched /metrics for active request progress on
+            // a version whose /slots carries no progress counters (Strata
+            // 0.1.40). Only fills a gap; a newer /slots value is not overridden.
+            if stats.request_prompt_tokens.is_none() {
+                stats.request_prompt_tokens = live.request_prompt_tokens;
+            }
+            if stats.request_generated_tokens.is_none() {
+                stats.request_generated_tokens = live.request_generated;
+            }
         }
 
         if stats.model.is_empty() {
@@ -764,9 +782,12 @@ struct ParsedMetrics {
     samples: Vec<MetricSample>,
     format: Option<MetricsFormat>,
     strata_since: Option<f64>,
-    /// Strata's live phase / authoritative windowed decode rate, when the body
-    /// was a recognised Strata object.
+    /// Strata's live phase / authoritative windowed decode rate / active
+    /// request progress, when the body was a recognised Strata object.
     strata_live: Option<crate::strata::StrataLive>,
+    /// Strata's configured context capacity (`engine.max_context`), used only to
+    /// seed the CTX denominator when `/props` did not supply `n_ctx`.
+    strata_capacity: Option<u64>,
     json: bool,
 }
 
@@ -785,6 +806,7 @@ fn parse_metrics_body(text: &str) -> ParsedMetrics {
                 format: Some(MetricsFormat::Strata),
                 strata_since: crate::strata::totals_since(&value),
                 strata_live: Some(crate::strata::live_rates(&value)),
+                strata_capacity: crate::strata::engine_capacity(&value),
                 json: true,
             },
             _ => ParsedMetrics {
@@ -792,6 +814,7 @@ fn parse_metrics_body(text: &str) -> ParsedMetrics {
                 format: None,
                 strata_since: None,
                 strata_live: None,
+                strata_capacity: None,
                 json: true,
             },
         }
@@ -801,6 +824,7 @@ fn parse_metrics_body(text: &str) -> ParsedMetrics {
             format: Some(MetricsFormat::Prometheus),
             strata_since: None,
             strata_live: None,
+            strata_capacity: None,
             json: false,
         }
     }
@@ -892,6 +916,18 @@ fn fetch_json(client: &Client, url: String) -> JsonOutcome {
     }
 }
 
+/// Parse a `/slots` array into per-slot counters and the displayed context
+/// pair.
+///
+/// Context **occupancy** (`context_used`) is taken only from a slot's direct
+/// `n_prompt_tokens` field, which both llama.cpp and newer Strata report as the
+/// slot's context in use (Strata keeps it after a request ends; its front-end
+/// meter divides it by `n_ctx`). It is never derived from the progress counters
+/// (`n_prompt_tokens_processed` / decoded) — that would present request
+/// processing progress as if it were KV occupancy. A present `n_prompt_tokens`
+/// is authoritative, **including a real `0`**; an absent one leaves occupancy
+/// unknown (`None`), never a fabricated zero. The progress counters are still
+/// collected for the REQUEST row and live throughput.
 fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCounter>, String> {
     let slots = value
         .as_array()
@@ -973,20 +1009,14 @@ fn apply_slots_json(stats: &mut LlmStats, value: &Value) -> Result<Vec<SlotCount
             }
         }
 
-        // Current llama.cpp exposes n_prompt_tokens as the slot's current prompt/context
-        // token count. Older responses may only expose processed prompt + decoded
-        // tokens. A present-but-zero n_prompt_tokens still falls back to the
-        // retained occupancy (validated CTX selection semantics). When the slot
-        // reports none of them, the occupancy stays unknown (None) so the
-        // per-slot overview does not print a fake zero.
-        let used_opt = match prompt_tokens {
-            Some(value) if value > 0 => Some(value),
-            _ => match (prompt_processed, decoded) {
-                (Some(processed), decoded) => Some(processed.saturating_add(decoded.unwrap_or(0))),
-                (None, Some(decoded)) => Some(decoded),
-                (None, None) => None,
-            },
-        };
+        // `n_prompt_tokens` is the slot's direct context figure in both
+        // llama.cpp and newer Strata, so it is used verbatim (a real `0`
+        // included). It is deliberately NOT derived from the progress counters
+        // (`n_prompt_tokens_processed` / decoded): those measure request
+        // progress, not occupied KV, and must not masquerade as occupancy. A
+        // slot that reports no `n_prompt_tokens` leaves occupancy unknown
+        // (`None`), never a fabricated zero.
+        let used_opt = prompt_tokens;
         // Only a known occupancy may win the CTX row; an unknown slot can at
         // most supply the capacity/id via `fallback_*`.
         if let Some(used) = used_opt {
@@ -2109,6 +2139,71 @@ mod tests {
     }
 
     #[test]
+    fn sample_keeps_strata_context_occupancy_unknown_but_tracks_progress() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line);
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        // /props has no n_ctx and /slots is Strata 0.1.40-shaped
+                        // (no counters, no occupancy); /metrics carries the
+                        // engine capacity and live active-request progress.
+                        let body = if path.contains("/props") {
+                            r#"{"total_slots":1,"model_alias":"strata-model"}"#.to_string()
+                        } else if path.contains("/slots") {
+                            r#"[{"id":0,"is_processing":true}]"#.to_string()
+                        } else if path.contains("/metrics") {
+                            r#"{"engine":{"max_context":196608},"live":{"state":"generating","prompt_tokens":500,"generated":20,"tok_s":42.0},"requests_kept":1,"totals":{"since":1.0,"prompt_tokens":5,"output_tokens":5,"prompt_ms":1000.0,"decode_ms":1000.0}}"#.to_string()
+                        } else {
+                            "{}".to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut monitor = LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+        let stats = monitor.sample();
+        assert!(stats.connected && stats.metrics_available);
+        // Capacity comes from the Strata engine when /props omitted n_ctx.
+        assert_eq!(stats.context_size, 196608);
+        // Occupancy is not fabricated from the active request length.
+        assert_eq!(stats.context_used, None);
+        // Active request progress is surfaced from the already-fetched /metrics.
+        assert_eq!(stats.request_prompt_tokens, Some(500));
+        assert_eq!(stats.request_generated_tokens, Some(20));
+        assert_eq!(stats.generation_tps, Some(42.0));
+
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
     fn parses_current_llama_metrics_fixture() {
         let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_current.prom"));
 
@@ -2328,16 +2423,24 @@ mod tests {
     }
 
     #[test]
-    fn slot_fallback_uses_processed_plus_decoded() {
+    fn context_occupancy_is_not_derived_from_progress_counters() {
+        // A slot that reports only progress counters (no `n_prompt_tokens`) has
+        // no trustworthy occupancy: CTX must stay unknown, never become the
+        // processed + decoded progress sum (that is request progress, not KV).
         let mut stats = LlmStats::default();
         let slots = json!([{
             "n_ctx": 8192,
+            "is_processing": true,
             "n_prompt_tokens_processed": 4000,
             "next_token": [{"n_decoded": 250}]
         }]);
 
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, Some(4250));
+        assert_eq!(stats.context_used, None, "progress is not occupancy");
+        assert_eq!(stats.context_size, 8192);
+        // The same counters still feed the REQUEST progress row and throughput.
+        assert_eq!(stats.request_prompt_tokens, Some(4000));
+        assert_eq!(stats.request_generated_tokens, Some(250));
         // The slot reports no `id`; the display identity stays unknown.
         assert_eq!(stats.context_slot_id, None);
     }
@@ -2622,19 +2725,24 @@ mod tests {
     }
 
     #[test]
-    fn present_zero_prompt_tokens_falls_back_to_retained_occupancy() {
-        // Validated CTX selection semantics: n_prompt_tokens present-but-zero
-        // falls back to the retained processed occupancy. The overview must
-        // inherit the exact same value the main CTX row shows.
+    fn present_zero_prompt_tokens_is_a_real_zero_not_the_progress() {
+        // `n_prompt_tokens: 0` is the slot's direct occupancy saying zero. The
+        // retained `n_prompt_tokens_processed` progress must not override it.
         let mut stats = LlmStats::default();
         let slots = json!([
             { "id": 0, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 0, "n_prompt_tokens_processed": 37943 },
             { "id": 1, "n_ctx": 115200, "is_processing": false, "n_prompt_tokens": 100 }
         ]);
         apply_slots_json(&mut stats, &slots).unwrap();
-        assert_eq!(stats.context_used, Some(37943));
-        assert_eq!(stats.context_slot_id, Some(0));
-        assert_eq!(stats.slot_overview[0].context_used, Some(37943));
+        // The most-used slot (100) wins the main CTX pair, not the slot whose
+        // only large number is processing progress.
+        assert_eq!(stats.context_used, Some(100));
+        assert_eq!(stats.context_slot_id, Some(1));
+        assert_eq!(
+            stats.slot_overview[0].context_used,
+            Some(0),
+            "a present zero is a real zero, not the retained progress"
+        );
         assert_eq!(stats.slot_overview[1].context_used, Some(100));
     }
 
@@ -2644,6 +2752,44 @@ mod tests {
         // No apply_slots_json call at all: /slots failed -> default is empty.
         assert!(!stats.slots_available);
         assert!(stats.slot_overview.is_empty());
+    }
+
+    #[test]
+    fn strata_old_slots_report_capacity_only_never_occupancy() {
+        // Strata 0.1.40 /slots: id, n_ctx, is_processing only. Capacity is
+        // known; occupancy stays unavailable (never a fabricated zero).
+        let mut stats = LlmStats {
+            context_size: 196608,
+            ..Default::default()
+        };
+        let slots: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/slots_strata_old.json")).unwrap();
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert!(stats.slots_available);
+        assert_eq!(stats.slot_count, 1);
+        assert_eq!(stats.context_size, 196608);
+        assert_eq!(stats.context_used, None);
+        assert_eq!(stats.context_slot_id, Some(0));
+        assert_eq!(stats.slot_overview[0].context_used, None);
+        assert_eq!(stats.slot_overview[0].context_size, Some(196608));
+    }
+
+    #[test]
+    fn strata_new_slots_report_direct_occupancy() {
+        // Newer Strata /slots adds n_prompt_tokens: the slot's context in use,
+        // which is the direct occupancy field (a real figure, not derived).
+        let mut stats = LlmStats {
+            context_size: 196608,
+            ..Default::default()
+        };
+        let slots: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/slots_strata_new.json")).unwrap();
+        apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, Some(113274));
+        assert_eq!(stats.context_slot_id, Some(0));
+        assert_eq!(stats.slot_overview[0].context_used, Some(113274));
+        // The same field (as prompt_processed) feeds the busy REQUEST row.
+        assert_eq!(stats.request_prompt_tokens, Some(113274));
     }
 
     #[test]

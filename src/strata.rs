@@ -203,6 +203,25 @@ pub(crate) struct StrataLive {
     /// still reading the prompt, so a previous request's speed is never shown
     /// as current.
     pub decode_tps: Option<f64>,
+    /// Active request prompt length (`live.prompt_tokens`). This is the current
+    /// request's prompt size — request progress, **not** retained KV occupancy.
+    /// `None` when no request is active.
+    pub request_prompt_tokens: Option<u64>,
+    /// Active request generated-token progress (`live.generated`). `None` when
+    /// no request is active.
+    pub request_generated: Option<u64>,
+}
+
+/// Strata's configured context capacity (`engine.max_context`, falling back to
+/// `engine.context`). This is capacity only — never occupancy. Used to seed the
+/// CTX denominator when `/props` did not supply `n_ctx`.
+pub(crate) fn engine_capacity(value: &Value) -> Option<u64> {
+    let engine = value.get("engine")?;
+    engine
+        .get("max_context")
+        .and_then(Value::as_u64)
+        .or_else(|| engine.get("context").and_then(Value::as_u64))
+        .filter(|capacity| *capacity > 0)
 }
 
 /// Read Strata's live state and the authoritative windowed decode rate.
@@ -233,10 +252,22 @@ pub(crate) fn live_rates(value: &Value) -> StrataLive {
     } else {
         None
     };
+    // Active-request progress only while a request is genuinely in flight; the
+    // idle values are null, and gating on the state prevents any retained
+    // number from being read as a current request.
+    let active = matches!(state.as_deref(), Some("reading") | Some("generating"));
+    let read_u64 = |key: &str| live.and_then(|live| live.get(key)).and_then(Value::as_u64);
+    let (request_prompt_tokens, request_generated) = if active {
+        (read_u64("prompt_tokens"), read_u64("generated"))
+    } else {
+        (None, None)
+    };
     StrataLive {
         state,
         phase,
         decode_tps,
+        request_prompt_tokens,
+        request_generated,
     }
 }
 
@@ -645,5 +676,53 @@ mod tests {
         assert_eq!(live_rates(&unknown).phase, None);
         let absent = json!({ "engine": {}, "totals": {}, "live": {} });
         assert_eq!(live_rates(&absent).phase, None);
+    }
+
+    #[test]
+    fn engine_capacity_prefers_max_context_then_context() {
+        assert_eq!(
+            engine_capacity(&json!({ "engine": { "max_context": 196608, "context": 1 } })),
+            Some(196608)
+        );
+        assert_eq!(
+            engine_capacity(&json!({ "engine": { "context": 4096 } })),
+            Some(4096)
+        );
+        // Zero or missing is not a capacity.
+        assert_eq!(
+            engine_capacity(&json!({ "engine": { "max_context": 0 } })),
+            None
+        );
+        assert_eq!(engine_capacity(&json!({ "engine": {} })), None);
+        assert_eq!(engine_capacity(&json!({})), None);
+    }
+
+    #[test]
+    fn live_rates_expose_active_request_progress_only_while_active() {
+        let generating = json!({
+            "engine": {}, "totals": {},
+            "live": { "state": "generating", "prompt_tokens": 27281, "generated": 546 }
+        });
+        let live = live_rates(&generating);
+        assert_eq!(live.request_prompt_tokens, Some(27281));
+        assert_eq!(live.request_generated, Some(546));
+
+        let reading = json!({
+            "engine": {}, "totals": {},
+            "live": { "state": "reading", "prompt_tokens": 1000 }
+        });
+        let live = live_rates(&reading);
+        assert_eq!(live.request_prompt_tokens, Some(1000));
+        assert_eq!(live.request_generated, None);
+
+        // Idle values (even if the server left numbers behind) are not a live
+        // request and must not be shown as current progress.
+        let idle = json!({
+            "engine": {}, "totals": {},
+            "live": { "state": "idle", "prompt_tokens": 9999, "generated": 999 }
+        });
+        let live = live_rates(&idle);
+        assert_eq!(live.request_prompt_tokens, None);
+        assert_eq!(live.request_generated, None);
     }
 }

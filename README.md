@@ -91,6 +91,16 @@ restarts the baseline instead of reporting a false spike. Fields Strata does
 not expose — the context high-water mark, an active-request count and
 cache-token counters — stay unavailable (`—`) rather than a fabricated zero.
 
+Strata context: the CTX `used` figure comes only from a slot's direct
+`n_prompt_tokens` field (a newer Strata addition — the slot's context in use,
+retained after a request ends). Strata 0.1.40 predates that field and reports
+only `id`, `n_ctx` and `is_processing`, so its CTX `used` stays `—` against the
+configured capacity rather than being inferred from prompt or generated counts
+(an upstream API limitation, fixed in newer Strata). On such a version the
+active request's prompt length and generated-token progress appear in the
+REQUEST row instead, taken from the already-fetched `/metrics` `live` fields —
+never presented as KV occupancy.
+
 ### GPU
 
 GPU telemetry is read through a vendor-neutral provider layer: NVIDIA via NVML
