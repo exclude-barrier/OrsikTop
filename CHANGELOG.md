@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
 ### Added
 
 - Multi-server diagnostics: `orsiktop diag --servers` prints a read-only
@@ -73,6 +75,11 @@ All notable changes to OrsikTop will be documented here.
   inject escape sequences or forge report lines. Server-supplied model names
   were already sanitized this way, and URLs in endpoints and errors remain
   redacted separately.
+- Stale telemetry is rejected: a GPU mapping or LLM sample produced for a
+  previous server session is tagged with a generation and is not applied to the
+  newly selected server, and a same-port restart that reuses a PID does not
+  inherit the earlier process's GPU association (`(pid, start_time)` is
+  revalidated).
 
 ## [0.2.10] - 2026-10-08
 
