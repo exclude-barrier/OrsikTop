@@ -36,6 +36,10 @@ All notable changes to OrsikTop will be documented here.
   - **Averages (counter-derived):** the AVG (LIFE) prompt/generation rates are
     derived from Strata's cumulative `totals` tokens and millisecond timings, as
     for llama.cpp.
+  - **Phase labeling:** Strata's own `live.state` drives the STATE label —
+    `PREFILL` while the prompt is being read and `GENERATING` while decoding,
+    even when the windowed rate momentarily reads zero. An unrecognised or
+    absent state leaves llama.cpp's activity heuristics unchanged.
   - **Unchanged:** llama.cpp Prometheus telemetry, its counter-delta live rates
     and all existing behaviour are untouched.
 

@@ -90,6 +90,10 @@ pub struct LlmStats {
     pub generation_avg_tps: Option<f64>,
     pub active_requests: Option<f64>,
     pub deferred_requests: Option<f64>,
+    /// Explicit request phase reported by the server (Strata's `live.state`),
+    /// normalized. `None` for llama.cpp and for an absent/unrecognised state,
+    /// so the existing activity heuristics apply unchanged.
+    pub strata_phase: Option<crate::strata::StrataPhase>,
     pub spec_drafts_total: Option<f64>,
     pub spec_draft_tokens: Option<f64>,
     pub spec_accepted_tokens: Option<f64>,
@@ -491,6 +495,7 @@ impl LlamaMonitor {
             let live = strata_live.unwrap_or_default();
             stats.prompt_tps = None;
             stats.generation_tps = live.decode_tps;
+            stats.strata_phase = live.phase;
         }
 
         if stats.model.is_empty() {

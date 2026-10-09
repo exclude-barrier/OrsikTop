@@ -176,12 +176,28 @@ pub(crate) fn totals_since(value: &Value) -> Option<f64> {
     value.get("totals")?.get("since")?.as_f64()
 }
 
+/// Strata's request phase, normalized from `live.state` to a small closed set
+/// so the TUI can label activity without parsing server text. An unrecognised
+/// or absent state maps to `None`, leaving the existing activity heuristics in
+/// charge (no new state machine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrataPhase {
+    /// Model is loaded and no request is in flight.
+    Idle,
+    /// The prompt is being read (prefill).
+    Reading,
+    /// Tokens are being generated (decode).
+    Generating,
+}
+
 /// Strata's live-phase fields relevant to throughput presentation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StrataLive {
     /// `live.state` lower-cased (`idle`, `reading`, `generating`, ...), or
     /// `None` when the field is absent.
     pub state: Option<String>,
+    /// Normalized phase derived from `state`; `None` when absent/unrecognised.
+    pub phase: Option<StrataPhase>,
     /// Authoritative **windowed** decode rate (`live.tok_s`, tok/s), reported
     /// only while Strata is actually generating. `None` when Strata is idle or
     /// still reading the prompt, so a previous request's speed is never shown
@@ -204,6 +220,12 @@ pub(crate) fn live_rates(value: &Value) -> StrataLive {
         .and_then(|live| live.get("state"))
         .and_then(Value::as_str)
         .map(|state| state.to_ascii_lowercase());
+    let phase = state.as_deref().and_then(|state| match state {
+        "idle" => Some(StrataPhase::Idle),
+        "reading" => Some(StrataPhase::Reading),
+        "generating" => Some(StrataPhase::Generating),
+        _ => None,
+    });
     let decode_tps = if state.as_deref() == Some("generating") {
         live.and_then(|live| live.get("tok_s"))
             .and_then(Value::as_f64)
@@ -211,7 +233,11 @@ pub(crate) fn live_rates(value: &Value) -> StrataLive {
     } else {
         None
     };
-    StrataLive { state, decode_tps }
+    StrataLive {
+        state,
+        phase,
+        decode_tps,
+    }
 }
 
 /// Normalise a Strata `/metrics` object into canonical `MetricSample`s. The
@@ -600,5 +626,24 @@ mod tests {
             "live": { "state": "generating", "tok_s": "120.3" }
         });
         assert_eq!(live_rates(&value).decode_tps, None);
+    }
+
+    #[test]
+    fn live_rates_normalize_the_phase() {
+        for (state, expected) in [
+            ("idle", StrataPhase::Idle),
+            ("reading", StrataPhase::Reading),
+            ("Generating", StrataPhase::Generating),
+        ] {
+            let value = json!({ "engine": {}, "totals": {}, "live": { "state": state } });
+            assert_eq!(live_rates(&value).phase, Some(expected), "state={state}");
+        }
+
+        // An unknown or absent state stays unmapped so the existing activity
+        // heuristics apply rather than a guessed phase.
+        let unknown = json!({ "engine": {}, "totals": {}, "live": { "state": "sleeping" } });
+        assert_eq!(live_rates(&unknown).phase, None);
+        let absent = json!({ "engine": {}, "totals": {}, "live": {} });
+        assert_eq!(live_rates(&absent).phase, None);
     }
 }

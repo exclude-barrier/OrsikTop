@@ -2210,11 +2210,20 @@ fn grouped_f64(value: f64) -> String {
 }
 
 fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
+    // A server-reported phase (Strata) is authoritative for the request phase:
+    // PREFILL while reading the prompt, and GENERATING even when the windowed
+    // rate momentarily reads zero. An absent/unknown phase falls through to the
+    // existing activity heuristics, so llama.cpp is unchanged.
+    let strata_phase = llm.strata_phase;
+    let generating = strata_phase == Some(crate::strata::StrataPhase::Generating)
+        || llm.generation_tps.is_some_and(|value| value > 0.05);
+    let reading = strata_phase == Some(crate::strata::StrataPhase::Reading)
+        || llm.prompt_tps.is_some_and(|value| value > 0.05);
     if llm.reconnecting {
         ("RECONNECTING", YELLOW)
-    } else if llm.generation_tps.is_some_and(|value| value > 0.05) {
+    } else if generating {
         ("GENERATING", ORK_GREEN)
-    } else if llm.prompt_tps.is_some_and(|value| value > 0.05) {
+    } else if reading {
         ("PREFILL", CYAN)
     } else if llm.busy_slots > 0 || llm.active_requests.is_some_and(|value| value > 0.0) {
         ("PROCESSING", YELLOW)
@@ -6212,6 +6221,39 @@ mod tests {
         let (phase, color) = llm_phase(&stats);
         assert_eq!(phase, "IDLE");
         assert_eq!(color, MUTED);
+    }
+
+    #[test]
+    fn llm_phase_uses_a_reported_server_phase() {
+        use crate::strata::StrataPhase;
+
+        // Prefill is labeled PREFILL even though Strata reports no live prefill
+        // rate; generating is GENERATING without needing a live rate.
+        let reading = LlmStats {
+            strata_phase: Some(StrataPhase::Reading),
+            ..LlmStats::default()
+        };
+        assert_eq!(llm_phase(&reading).0, "PREFILL");
+
+        let generating = LlmStats {
+            strata_phase: Some(StrataPhase::Generating),
+            ..LlmStats::default()
+        };
+        assert_eq!(llm_phase(&generating).0, "GENERATING");
+
+        // An idle phase falls through to the existing heuristics (no activity
+        // reported -> IDLE), and a programmatic rate still wins when there is
+        // no phase.
+        let idle = LlmStats {
+            strata_phase: Some(StrataPhase::Idle),
+            ..LlmStats::default()
+        };
+        assert_eq!(llm_phase(&idle).0, "IDLE");
+        let rate_only = LlmStats {
+            generation_tps: Some(50.0),
+            ..LlmStats::default()
+        };
+        assert_eq!(llm_phase(&rate_only).0, "GENERATING");
     }
 
     #[test]
