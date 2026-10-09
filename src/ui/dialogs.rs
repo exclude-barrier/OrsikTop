@@ -1,0 +1,419 @@
+//! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
+use super::*;
+
+pub(super) fn draw_help_popup(frame: &mut Frame, area: Rect) {
+    let width = area.width.saturating_sub(6).min(72);
+    let height = area.height.saturating_sub(4).min(22);
+    if width < 48 || height < 16 {
+        return;
+    }
+
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" HELP · OrsikTop ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let key = |text: &'static str| {
+        Span::styled(
+            format!(" {text:<15}"),
+            Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
+        )
+    };
+    let desc = |text: &'static str| Span::styled(text, Style::default().fg(WHITE));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " KEYBOARD",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![key("Esc"), desc("Quit")]),
+        Line::from(vec![key("h"), desc("Toggle this help")]),
+        Line::from(vec![key("q"), desc("Open settings")]),
+        Line::from(vec![key("s"), desc("Server selector (multi-server)")]),
+        Line::from(vec![key("/"), desc("Search / filter processes")]),
+        Line::from(vec![
+            key("- / +"),
+            desc("Decrease / increase refresh interval"),
+        ]),
+        Line::from(vec![key("↑ / k"), desc("Select previous visible row")]),
+        Line::from(vec![key("↓ / j"), desc("Select next visible row")]),
+        Line::from(vec![key("PgUp / PgDn"), desc("Jump 10 processes")]),
+        Line::from(vec![key("Home / End"), desc("First / last process")]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " MOUSE",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![key("Left click"), desc("Select process or group")]),
+        Line::from(vec![key("Double click"), desc("Pin process or group")]),
+        Line::from(vec![key("Right click"), desc("Expand / collapse group")]),
+        Line::from(vec![key("Header click"), desc("Sort process table")]),
+        Line::from(vec![key("Mouse wheel"), desc("Scroll process table")]),
+        Line::from(vec![key("[-] / [+]"), desc("Change refresh interval")]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Compact notice shown when the terminal is too small for the settings
+/// popup; nothing is rendered when the area cannot fit the notice itself.
+pub(super) fn draw_settings_too_small(frame: &mut Frame, area: Rect) {
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let width = 48.min(area.width);
+    let height = 3.min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" SETTINGS ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Terminal too small for settings (need 54x15)",
+            Style::default().fg(MUTED),
+        ))),
+        inner,
+    );
+}
+
+/// Multi-server selector/overview popup. Lists every known server with its
+/// state, slot counts, context and throughput; the selected server is marked
+/// `*` and the highlighted row `>`. Endpoints are redacted before display.
+pub(super) fn draw_server_selector(
+    frame: &mut Frame,
+    area: Rect,
+    servers: &[ServerSummary],
+    selected_server: &str,
+    highlight: usize,
+    overflow: &[crate::app::ServerSpec],
+) {
+    let overflow_rows = if overflow.is_empty() {
+        0
+    } else {
+        overflow.len() as u16 + 1
+    };
+    let width = area.width.saturating_sub(6).min(78);
+    let height = (servers.len() as u16 + overflow_rows + 4)
+        .min(area.height.saturating_sub(4))
+        .max(5);
+    if width < 48 || height < 5 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" LLM SERVERS · Up/Down · Enter select · Esc close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let highlight = if servers.is_empty() {
+        0
+    } else {
+        highlight.min(servers.len() - 1)
+    };
+    let mut lines: Vec<Line> = Vec::with_capacity(servers.len());
+    for (index, server) in servers.iter().enumerate() {
+        let is_selected = server.key == selected_server;
+        let marker = if index == highlight { ">" } else { " " };
+        let star = if is_selected { "*" } else { " " };
+        let (state, state_color) = if server.connected {
+            ("connected", ORK_GREEN)
+        } else if server.reconnecting {
+            ("reconnecting", YELLOW)
+        } else {
+            ("offline", MUTED)
+        };
+        let ctx = match (server.context_used, server.context_size) {
+            (Some(used), size) if size > 0 => format!("{used}/{size}"),
+            (None, size) if size > 0 => format!("—/{size}"),
+            _ => "—".to_string(),
+        };
+        let tps = server.generation_tps.map_or_else(
+            || "— tok/s".to_string(),
+            |value| format!("{value:.1} tok/s"),
+        );
+        // A missing `/slots` endpoint means the busy count is unknown: render
+        // `—/—` (or `—/N` when `/props` still knows the total) rather than a
+        // fabricated `0/0`. A real empty `/slots` array stays `0/0`, and a
+        // valid array shows its actual busy/total.
+        let slots = if server.slots_available {
+            format!("{}/{}", server.busy_slots, server.slot_count)
+        } else if server.props_slot_count > 0 {
+            format!("—/{}", server.props_slot_count)
+        } else {
+            "—/—".to_string()
+        };
+        let label = fit_cell(&server.label, 20);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{star} "),
+                Style::default().fg(if index == highlight { CYAN } else { MUTED }),
+            ),
+            Span::styled(format!("{label:<20} "), Style::default().fg(WHITE)),
+            Span::styled(format!("{state:<12} "), Style::default().fg(state_color)),
+            Span::styled(format!("S {slots}  "), Style::default().fg(MUTED)),
+            Span::styled(format!("CTX {ctx:<13} "), Style::default().fg(MUTED)),
+            Span::styled(format!("{tps:<12} "), Style::default().fg(MUTED)),
+            Span::styled(
+                compact_endpoint(&server.endpoint),
+                Style::default().fg(DIM_GREEN),
+            ),
+        ]));
+    }
+    if servers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no servers known",
+            Style::default().fg(MUTED),
+        )));
+    }
+    // Configured endpoints beyond the monitoring cap are shown explicitly so
+    // they are never silently dropped. They are not polled; endpoints are
+    // redacted (no credentials/query tokens).
+    if !overflow.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "── NOT MONITORED · server limit reached ({}) ──",
+                overflow.len()
+            ),
+            Style::default().fg(YELLOW),
+        )));
+        for spec in overflow {
+            lines.push(Line::from(vec![
+                Span::styled("  ✗ ", Style::default().fg(YELLOW)),
+                Span::styled(
+                    fit_cell(&compact_endpoint(&spec.endpoint), 40),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(
+                    "  not monitored — limit reached",
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub(super) fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let width = area.width.saturating_sub(6).min(74);
+    let height = 18.min(area.height.saturating_sub(4));
+    if width < 54 || height < 15 {
+        draw_settings_too_small(frame, area);
+        return;
+    }
+
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" SETTINGS · OrsikTop ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let field_line = |field: SettingsField, label: &str, value: String| {
+        let selected = state.settings_field == field;
+        let value_style = if selected {
+            Style::default()
+                .fg(BRIGHT_GREEN)
+                .bg(PROCESS_SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(WHITE)
+        };
+        Line::from(vec![
+            Span::styled(
+                format!(" {label:<18}"),
+                Style::default().fg(if selected { CYAN } else { MUTED }),
+            ),
+            Span::styled(format!(" {value:<42}"), value_style),
+        ])
+    };
+
+    // Preview the endpoint that would actually be saved, so an `https` (or
+    // custom-scheme) URL is not misrepresented as `http`.
+    let preview = state
+        .settings_endpoint()
+        .unwrap_or_else(|_| "…".to_string());
+    let auto = if state.settings_auto_discovery {
+        "ON"
+    } else {
+        "OFF"
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " RUNTIME / CONNECTION",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        field_line(
+            SettingsField::Host,
+            "LLM Host/IP",
+            fit_cell(&state.settings_host, 40),
+        ),
+        field_line(SettingsField::Port, "LLM Port", state.settings_port.clone()),
+        field_line(SettingsField::Gpu, "GPU", state.settings_gpu.clone()),
+        field_line(
+            SettingsField::Refresh,
+            "Refresh",
+            format!("{} ms", state.settings_refresh_ms),
+        ),
+        field_line(
+            SettingsField::ProcessRefresh,
+            "Process refresh",
+            format!("{} ms", state.settings_process_refresh_ms),
+        ),
+        field_line(
+            SettingsField::OfflineGrace,
+            "Offline grace",
+            format!("{} ms", state.settings_offline_grace_ms),
+        ),
+        field_line(
+            SettingsField::AutoDiscovery,
+            "Auto discovery",
+            auto.to_string(),
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Endpoint          ", Style::default().fg(MUTED)),
+            Span::styled(preview, Style::default().fg(CYAN)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Tab / ↑↓ select   Type to edit   Space / ←→ toggle   Enter apply + save",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            " Esc cancel   Auto discovery uses a detected local llama server first",
+            Style::default().fg(MUTED),
+        )),
+    ];
+
+    if let Some(error) = state.settings_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" {error}"),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub(super) fn endpoint_parts(server: &str) -> (String, u16) {
+    // Prefer the URL parser: it is scheme-aware (https without an explicit
+    // port shows 443, not a made-up 8080) and keeps IPv6 hosts readable.
+    if let Ok(url) = reqwest::Url::parse(server.trim()) {
+        if let Some(host) = url.host_str() {
+            return (
+                host.to_string(),
+                url.port_or_known_default().unwrap_or(8080),
+            );
+        }
+    }
+
+    let compact = server
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+
+    if let Some(rest) = compact.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after
+                .strip_prefix(':')
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(8080);
+            return (host.to_string(), port);
+        }
+    }
+
+    if let Some((host, port)) = compact.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return (host.to_string(), port);
+        }
+    }
+    (compact.to_string(), 8080)
+}
+
+pub(super) fn parse_setting_u64(
+    value: &str,
+    label: &str,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{label} must be a number"))?;
+    if !(min..=max).contains(&parsed) {
+        return Err(format!("{label} must be between {min} and {max}"));
+    }
+    Ok(parsed)
+}
+
+/// The implicit port of a well-known URL scheme, used to decide whether a
+/// port must be written out or can stay implicit in the saved endpoint.
+pub(super) fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
+    }
+}
+
+pub(super) fn build_endpoint(host: &str, port: &str) -> Result<String, String> {
+    let host = host
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    if host.is_empty() {
+        return Err("Host / IP must not be empty".to_string());
+    }
+    if host.contains('/') || host.chars().any(char::is_whitespace) {
+        return Err("Host / IP contains invalid characters".to_string());
+    }
+    let port = port
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Port must be between 1 and 65535".to_string())?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!("http://{host}:{port}"))
+}
