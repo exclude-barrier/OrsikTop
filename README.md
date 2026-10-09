@@ -92,8 +92,10 @@ not expose — the context high-water mark, an active-request count and
 cache-token counters — stay unavailable (`—`) rather than a fabricated zero.
 
 Strata context: the CTX `used` figure comes only from a slot's direct
-`n_prompt_tokens` field (a newer Strata addition — the slot's context in use,
-retained after a request ends). Strata 0.1.40 predates that field and reports
+`n_prompt_tokens` field (a newer Strata addition — the slot's reported
+prompt-context footprint, retained after a request ends; it is the server's
+reported figure, not an exact physical KV-cache measurement). Strata 0.1.40
+predates that field and reports
 only `id`, `n_ctx` and `is_processing`, so its CTX `used` stays `—` against the
 configured capacity rather than being inferred from prompt or generated counts
 (an upstream API limitation, fixed in newer Strata). On such a version the
@@ -187,7 +189,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.3.1 x86_64-unknown-linux-gnu
+downloading orsiktop 0.3.2 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -215,7 +217,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.3.1
+orsiktop 0.3.2
 ```
 
 You can then start OrsikTop with `orsiktop`.
