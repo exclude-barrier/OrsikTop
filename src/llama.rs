@@ -188,6 +188,14 @@ pub struct LlamaMonitor {
     /// instead of running on every 250 ms sample.
     local_spec: Option<LocalSpeculativeConfig>,
     local_spec_scanned_at: Option<Instant>,
+    /// Which `/metrics` wire format the endpoint answered with last sample.
+    /// A change means the endpoint switched implementation (llama.cpp ↔
+    /// Strata), so the counter baseline is reset rather than diffed across
+    /// incomparable values.
+    last_metrics_format: Option<MetricsFormat>,
+    /// Strata `totals.since` from the last sample. A change means the Strata
+    /// process restarted its counters, so the baseline is dropped.
+    last_strata_since: Option<f64>,
 }
 
 impl LlamaMonitor {
@@ -221,6 +229,8 @@ impl LlamaMonitor {
             props_dirty: true,
             local_spec: None,
             local_spec_scanned_at: None,
+            last_metrics_format: None,
+            last_strata_since: None,
         })
     }
 
@@ -301,12 +311,33 @@ impl LlamaMonitor {
                 None
             }
         };
-        // A 2xx with no parseable sample carries no metric data, so it must
+        // A 2xx body carries metric data only when it parses to samples, or is
+        // a recognised Strata JSON telemetry object whose cumulative counters
+        // are normalised by the adapter. A body with no usable telemetry must
         // not be presented as a real set of zeroes.
-        let metrics = parse_prometheus(metrics_text.as_deref().unwrap_or_default());
-        stats.metrics_available = metrics_text.is_some() && !metrics.is_empty();
+        let parsed = metrics_text
+            .as_deref()
+            .map(parse_metrics_body)
+            .unwrap_or_else(|| ParsedMetrics {
+                samples: Vec::new(),
+                format: None,
+                strata_since: None,
+                json: false,
+            });
+        let metrics = parsed.samples;
+        stats.metrics_available = match parsed.format {
+            // A recognised Strata endpoint is available even when a particular
+            // sample exposes no counters: the fields stay `—`, not fabricated.
+            Some(MetricsFormat::Strata) => true,
+            Some(MetricsFormat::Prometheus) => metrics_text.is_some() && !metrics.is_empty(),
+            None => false,
+        };
         if metrics_text.is_some() && !stats.metrics_available {
-            stats.error = "/metrics returned no metrics".to_string();
+            stats.error = if parsed.json {
+                "/metrics returned an unrecognized JSON format".to_string()
+            } else {
+                "/metrics returned no metrics".to_string()
+            };
         }
 
         // Slot state is served by its own endpoint and stays valid (and
@@ -400,6 +431,23 @@ impl LlamaMonitor {
             || stats.spec_accepted_tokens.is_some_and(|value| value > 0.0)
         {
             stats.spec_enabled = true;
+        }
+
+        // A wire-format switch (llama.cpp ↔ Strata) or a Strata counter reset
+        // (`totals.since` change) makes the stored baseline incomparable, so
+        // drop it instead of diffing across implementations or a restart.
+        let format_changed =
+            self.last_metrics_format.is_some() && self.last_metrics_format != parsed.format;
+        let since_changed = parsed.format == Some(MetricsFormat::Strata)
+            && parsed.strata_since.is_some()
+            && self.last_strata_since.is_some()
+            && parsed.strata_since != self.last_strata_since;
+        if format_changed || since_changed {
+            self.previous_metrics = PreviousMetricCounters::default();
+        }
+        self.last_metrics_format = parsed.format;
+        if parsed.format == Some(MetricsFormat::Strata) {
+            self.last_strata_since = parsed.strata_since;
         }
 
         let metric_live = if stats.metrics_available {
@@ -677,6 +725,59 @@ enum MetricsOutcome {
     Http(StatusCode),
     Body(String),
     Unreachable(String),
+}
+
+/// The wire format a successful `/metrics` body was parsed as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetricsFormat {
+    /// llama.cpp Prometheus text exposition.
+    Prometheus,
+    /// Strata JSON telemetry object.
+    Strata,
+}
+
+/// A parsed `/metrics` body: the canonical samples plus enough metadata to
+/// decide availability and to reset counter baselines on a format/identity
+/// change. `json` records that the body was JSON even when it was not a
+/// recognised Strata object, so the error message can be format-specific.
+struct ParsedMetrics {
+    samples: Vec<MetricSample>,
+    format: Option<MetricsFormat>,
+    strata_since: Option<f64>,
+    json: bool,
+}
+
+/// Dispatch a `/metrics` body by its actual shape instead of assuming
+/// Prometheus. A body that starts with `{`/`[` is JSON: it is parsed once and
+/// accepted only when it is a recognised Strata object, so pretty-printed JSON
+/// can never reach the line-oriented Prometheus parser (which would otherwise
+/// manufacture bogus samples from `"key": value` lines). Everything else is
+/// treated as Prometheus text.
+fn parse_metrics_body(text: &str) -> ParsedMetrics {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) if crate::strata::is_strata_metrics(&value) => ParsedMetrics {
+                samples: crate::strata::extract_samples(&value),
+                format: Some(MetricsFormat::Strata),
+                strata_since: crate::strata::totals_since(&value),
+                json: true,
+            },
+            _ => ParsedMetrics {
+                samples: Vec::new(),
+                format: None,
+                strata_since: None,
+                json: true,
+            },
+        }
+    } else {
+        ParsedMetrics {
+            samples: parse_prometheus(text),
+            format: Some(MetricsFormat::Prometheus),
+            strata_since: None,
+            json: false,
+        }
+    }
 }
 
 /// The outcome of a JSON endpoint fetch (/props, /slots): the parsed value on
@@ -1744,6 +1845,136 @@ mod tests {
         assert!(stats.slots_available);
         assert_eq!(stats.slot_count, 1);
         assert!(stats.slots_error.is_empty());
+    }
+
+    #[test]
+    fn parse_metrics_body_dispatches_by_shape() {
+        // Prometheus text stays on the Prometheus path.
+        let parsed = parse_metrics_body("# fixture\nfixture_queued 0\n");
+        assert_eq!(parsed.format, Some(MetricsFormat::Prometheus));
+        assert!(!parsed.json);
+        assert_eq!(parsed.samples.len(), 1);
+
+        // A Strata JSON object is recognised and normalised (ms → s).
+        let strata = r#"{"engine":{"model":"m"},"totals":{"prompt_tokens":5,"output_tokens":2,"prompt_ms":2000.0,"decode_ms":500.0},"requests_kept":1}"#;
+        let parsed = parse_metrics_body(strata);
+        assert_eq!(parsed.format, Some(MetricsFormat::Strata));
+        assert!(parsed.json);
+        assert!(parsed
+            .samples
+            .iter()
+            .any(|s| s.name == "llamacpp:prompt_tokens_total" && s.value == 5.0));
+        assert!(parsed
+            .samples
+            .iter()
+            .any(|s| s.name == "llamacpp:prompt_seconds_total" && s.value == 2.0));
+        assert!(parsed
+            .samples
+            .iter()
+            .any(|s| s.name == "llamacpp:tokens_predicted_seconds_total" && s.value == 0.5));
+    }
+
+    #[test]
+    fn pretty_printed_json_never_reaches_the_prometheus_parser() {
+        // The line-oriented Prometheus parser would read `"prompt_tokens": 5`
+        // as a bogus sample. Dispatch by shape prevents that.
+        let pretty =
+            "{\n  \"engine\": {},\n  \"totals\": {\n    \"prompt_tokens\": 5\n  },\n  \"live\": {}\n}\n";
+        let parsed = parse_metrics_body(pretty);
+        assert_eq!(parsed.format, Some(MetricsFormat::Strata));
+        assert_eq!(parsed.samples.len(), 1);
+        assert_eq!(parsed.samples[0].name, "llamacpp:prompt_tokens_total");
+        assert_eq!(parsed.samples[0].value, 5.0);
+
+        // JSON that is not a Strata telemetry object is JSON, not metrics.
+        let other = "{\n  \"foo\": 1\n}\n";
+        let parsed = parse_metrics_body(other);
+        assert_eq!(parsed.format, None);
+        assert!(parsed.json);
+        assert!(parsed.samples.is_empty());
+    }
+
+    #[test]
+    fn sample_reads_strata_json_metrics_end_to_end() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let metrics_calls = Arc::new(AtomicU32::new(0));
+        let calls = Arc::clone(&metrics_calls);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line);
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let body = if path.contains("/props") {
+                            r#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1,"model_alias":"strata-model"}"#.to_string()
+                        } else if path.contains("/slots") {
+                            r#"[{"id":0,"n_ctx":4096,"is_processing":false}]"#.to_string()
+                        } else if path.contains("/metrics") {
+                            let n = u64::from(calls.fetch_add(1, Ordering::SeqCst) + 1);
+                            format!(
+                                r#"{{"engine":{{"model":"strata"}},"live":{{"queued":0}},"requests_kept":1,"totals":{{"since":1.0,"prompt_tokens":{},"output_tokens":{},"prompt_ms":1000.0,"decode_ms":500.0,"drafts_offered":40,"drafts_accepted":30}}}}"#,
+                                1000 * n,
+                                250 * n
+                            )
+                        } else {
+                            "{}".to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut monitor = LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+        let first = monitor.sample();
+        assert!(first.connected, "strata server must be connected");
+        assert!(
+            first.metrics_available,
+            "strata JSON /metrics must be available, error={:?}",
+            first.error
+        );
+        assert_eq!(first.error, "", "no metrics-off error expected");
+        assert_eq!(first.model, "strata-model");
+        assert_eq!(first.prompt_total, Some(1000.0));
+        assert_eq!(first.generated_total, Some(250.0));
+        // Lifetime averages from totals + ms-derived seconds.
+        assert_eq!(first.prompt_avg_tps, Some(1000.0));
+        assert_eq!(first.generation_avg_tps, Some(500.0));
+        assert!(first.slots_available);
+        assert_eq!(first.slot_count, 1);
+
+        let second = monitor.sample();
+        assert!(second.metrics_available);
+        assert_eq!(second.prompt_total, Some(2000.0));
+        // A later sample derives a live delta rate without a fabricated zero.
+        assert!(second
+            .generation_tps
+            .is_some_and(|value| value.is_finite() && value >= 0.0));
+
+        stop.store(true, Ordering::Relaxed);
     }
 
     #[test]

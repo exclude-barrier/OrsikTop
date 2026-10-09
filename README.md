@@ -74,6 +74,17 @@ With a `--parallel` server (multiple slots) the panel aggregates across slots: `
 
 `/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
 
+Both llama.cpp's Prometheus `/metrics` text format and the Strata inference
+server's JSON `/metrics` format are supported. Strata's cumulative `totals`
+counters (prompt/generated tokens and prompt/decode milliseconds) are mapped
+into the same throughput pipeline, and a counter reset or a switch between the
+two formats restarts the baseline instead of reporting a false spike. Fields
+Strata does not expose — the context high-water mark, an active-request count
+and cache-token counters — stay unavailable (`—`) rather than a fabricated
+zero. A Strata server is monitored when it is configured explicitly with
+`server=`/`servers=`; local auto discovery continues to match llama.cpp
+processes only.
+
 ### GPU
 
 GPU telemetry is read through a vendor-neutral provider layer: NVIDIA via NVML
@@ -130,7 +141,8 @@ OrsikTop targets a deliberately focused setup:
 - NVIDIA GPUs through NVML, AMD GPUs/APUs through the amdgpu kernel
   interface, Intel GPUs/APUs through i915/xe and hwmon
 - `llama.cpp` (`llama-server` or `llama serve`)
-- local or manually configured llama.cpp endpoints
+- the Strata inference server, when configured explicitly (JSON `/metrics`)
+- local or manually configured endpoints
 - terminal-first, low-overhead monitoring
 
 The GPU layer runs behind a vendor-neutral provider interface: discovery
