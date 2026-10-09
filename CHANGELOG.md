@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-09
+
 ### Added
 
 - Native support for the Strata inference server's JSON `/metrics` API
@@ -16,8 +18,8 @@ All notable changes to OrsikTop will be documented here.
   change) or a wire-format switch resets the counter baseline instead of
   reporting a false spike. Fields Strata does not expose (context
   high-water mark, active requests, cache tokens) stay unavailable (`—`) rather
-  than a fabricated zero, and every llama.cpp monitoring behaviour is
-  unchanged.
+  than a fabricated zero; llama.cpp Prometheus telemetry and its counter-delta
+  live rates are unchanged.
 
   Strata live throughput is reported as follows:
 
@@ -40,8 +42,12 @@ All notable changes to OrsikTop will be documented here.
     `PREFILL` while the prompt is being read and `GENERATING` while decoding,
     even when the windowed rate momentarily reads zero. An unrecognised or
     absent state leaves llama.cpp's activity heuristics unchanged.
-  - **Unchanged:** llama.cpp Prometheus telemetry, its counter-delta live rates
-    and all existing behaviour are untouched.
+  - **Model and detection:** a Strata endpoint is identified from its JSON
+    `/metrics` shape, and its model alias is read from `/props` as for
+    llama.cpp. llama.cpp Prometheus telemetry and its counter-delta live rates
+    are untouched. (The generic slot-counter abstention below also benefits a
+    llama.cpp server whose slots omit token counters, replacing a previously
+    fabricated `0.0` with unavailable.)
 
 ### Fixed
 
