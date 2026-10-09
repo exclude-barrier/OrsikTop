@@ -544,8 +544,12 @@ fn build_server_summaries(
                 label,
                 connected: stats.is_some_and(|stats| stats.connected && !stats.reconnecting),
                 reconnecting: stats.is_some_and(|stats| stats.reconnecting),
+                // Slot availability is propagated explicitly so an absent or
+                // failed `/slots` never collapses to a fabricated `0/0`.
+                slots_available: stats.is_some_and(|stats| stats.slots_available),
                 slot_count: stats.map_or(0, |stats| stats.slot_count),
                 busy_slots: stats.map_or(0, |stats| stats.busy_slots),
+                props_slot_count: stats.map_or(0, |stats| stats.props_slot_count),
                 context_used: stats.and_then(|stats| stats.context_used),
                 context_size: stats.map_or(0, |stats| stats.context_size),
                 generation_tps: stats.and_then(|stats| stats.generation_tps),
@@ -2542,6 +2546,7 @@ mod tests {
             LlmStats {
                 connected: true,
                 model: "model-A".to_string(),
+                slots_available: true,
                 slot_count: 2,
                 busy_slots: 1,
                 context_used: Some(10),
@@ -2554,12 +2559,95 @@ mod tests {
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].label, "model-A");
         assert!(summaries[0].connected);
+        assert!(summaries[0].slots_available);
+        assert_eq!(summaries[0].slot_count, 2);
         assert_eq!(summaries[0].busy_slots, 1);
         assert_eq!(summaries[0].context_used, Some(10));
         // Server B has no telemetry yet: offline with no fabricated zeros.
         assert!(!summaries[1].connected);
+        assert!(!summaries[1].slots_available);
         assert_eq!(summaries[1].slot_count, 0);
         assert_eq!(summaries[1].context_used, None);
+    }
+
+    #[test]
+    fn build_server_summaries_distinguishes_unavailable_slots_from_real_zero() {
+        // The reported M4 bug: a connected server whose /slots endpoint is down
+        // (but /metrics answers) must not collapse to "0/0" slots. Availability
+        // is propagated explicitly and never confused with a real empty array.
+        let order = vec![
+            "http://metrics-only:1/".to_string(),
+            "http://empty:2/".to_string(),
+            "http://healthy:3/".to_string(),
+            "http://dead:4/".to_string(),
+        ];
+        let mut endpoints = BTreeMap::new();
+        for key in &order {
+            endpoints.insert(key.clone(), key.trim_end_matches('/').to_string());
+        }
+        let mut registry = BTreeMap::new();
+        // /metrics up, /slots down: connected, but the slot count is unknown.
+        registry.insert(
+            "http://metrics-only:1/".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                slots_available: false,
+                props_slot_count: 3,
+                ..Default::default()
+            },
+        );
+        // /slots answered a valid, explicitly empty array: this is a real zero.
+        registry.insert(
+            "http://empty:2/".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                slots_available: true,
+                slot_count: 0,
+                busy_slots: 0,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "http://healthy:3/".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                slots_available: true,
+                slot_count: 4,
+                busy_slots: 2,
+                ..Default::default()
+            },
+        );
+        // No telemetry at all (unreachable): also unavailable, never zero.
+        registry.insert(
+            "http://dead:4/".to_string(),
+            LlmStats {
+                connected: false,
+                error: "connection refused".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        assert!(!summaries[0].slots_available, "metrics-only slots unknown");
+        assert!(summaries[0].connected, "metrics-only server is connected");
+        assert_eq!(
+            summaries[0].props_slot_count, 3,
+            "a known /props total is preserved even while /slots is down"
+        );
+        assert!(
+            summaries[1].slots_available,
+            "an explicit empty /slots array is a real zero"
+        );
+        assert_eq!(summaries[1].slot_count, 0);
+        assert!(summaries[2].slots_available);
+        assert_eq!((summaries[2].busy_slots, summaries[2].slot_count), (2, 4));
+        assert!(!summaries[3].connected);
+        assert!(!summaries[3].slots_available);
+        // No cross-server contamination: each summary reflects only its own key.
+        assert_ne!(summaries[2].slot_count, summaries[1].slot_count);
     }
 
     #[test]
