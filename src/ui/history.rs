@@ -1,5 +1,23 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
+};
+
+use super::widgets::{clamp_percent, compact_rate, fit_cell};
+use super::{
+    LlmHistory, TimedSample, UiState, CYAN, DIM_GREEN, HISTORY_MAX_SAMPLES, HISTORY_WINDOW,
+    INNER_GREEN, MUTED, ORK_GREEN,
+};
+use crate::domain::LlmStats;
 
 pub(super) fn smooth_llm_sample_interval(previous_ms: Option<f64>, current_ms: f64) -> Option<f64> {
     const ALPHA: f64 = 0.2;

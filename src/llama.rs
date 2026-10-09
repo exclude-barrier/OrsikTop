@@ -1,6 +1,4 @@
 use std::{
-    fs,
-    path::Path,
     thread,
     time::{Duration, Instant},
 };
@@ -14,16 +12,19 @@ mod metrics;
 mod props;
 mod slots;
 mod speculative;
-#[allow(unused_imports)]
-use http::*;
-#[allow(unused_imports)]
-use metrics::*;
-#[allow(unused_imports)]
-use props::*;
-#[allow(unused_imports)]
-use slots::*;
-#[allow(unused_imports)]
-use speculative::*;
+use http::{endpoint_url, fetch_json, fetch_raw, join_or};
+use metrics::{
+    average_over_seconds, counter_delta_opt, counter_rate, parse_metrics_body, pick_metric_opt,
+};
+use props::{json_string, json_u64_path, model_display_name, sanitize_error_text};
+use slots::{apply_slots_json, choose_live_throughput, slot_delta_tps};
+use speculative::{
+    apply_local_spec_fallback, local_speculative_process_config, speculative_config,
+};
+#[cfg(test)]
+use speculative::{
+    command_targets_port, is_llama_server_process, is_loopback_host, speculative_from_process,
+};
 
 const PROPS_REFRESH: Duration = Duration::from_secs(30);
 const SPEC_ACCEPTANCE_HOLD: Duration = Duration::from_secs(3);

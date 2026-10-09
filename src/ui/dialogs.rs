@@ -1,5 +1,20 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use std::time::Duration;
+
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
+};
+
+use super::widgets::{compact_endpoint, fit_cell, format_sample_age};
+use super::{
+    SettingsField, UiState, BRIGHT_GREEN, CYAN, DIM_GREEN, MUTED, ORK_GREEN, PROCESS_SELECTED_BG,
+    RED, WHITE, YELLOW,
+};
+use crate::domain::{ActivityPhase, ServerSummary};
 
 pub(super) fn draw_help_popup(frame: &mut Frame, area: Rect) {
     let width = area.width.saturating_sub(6).min(72);

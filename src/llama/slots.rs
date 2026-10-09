@@ -1,5 +1,8 @@
 //! Extracted from the former monolithic `llama.rs`. Behavior-preserving split.
-use super::*;
+use serde_json::Value;
+
+use super::speculative::speculative_config;
+use super::{LlmSlotInfo, LlmStats, SlotCounter};
 
 /// Parse a `/slots` array into per-slot counters and the displayed context
 /// pair.

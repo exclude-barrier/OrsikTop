@@ -1,5 +1,9 @@
 //! Extracted from the former monolithic `llama.rs`. Behavior-preserving split.
-use super::*;
+use std::path::Path;
+
+use serde_json::Value;
+
+use super::{LlmStats, MAX_MODEL_DISPLAY_CHARS};
 
 /// Apply the display-safe text boundary to the free-text error fields of a
 /// sample. This is the single place server-influenced error text enters
