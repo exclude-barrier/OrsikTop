@@ -75,15 +75,21 @@ With a `--parallel` server (multiple slots) the panel aggregates across slots: `
 `/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
 
 Both llama.cpp's Prometheus `/metrics` text format and the Strata inference
-server's JSON `/metrics` format are supported. Strata's cumulative `totals`
-counters (prompt/generated tokens and prompt/decode milliseconds) are mapped
-into the same throughput pipeline, and a counter reset or a switch between the
-two formats restarts the baseline instead of reporting a false spike. Fields
-Strata does not expose — the context high-water mark, an active-request count
-and cache-token counters — stay unavailable (`—`) rather than a fabricated
-zero. A Strata server is monitored when it is configured explicitly with
-`server=`/`servers=`; local auto discovery continues to match llama.cpp
-processes only.
+server's JSON `/metrics` format are recognised automatically from the response
+body. llama.cpp support is unchanged; a Strata server is monitored when it is
+configured explicitly with `server=`/`servers=` (local auto discovery still
+matches llama.cpp processes only).
+
+For Strata, the LIVE decode rate is the server's own short-windowed
+`live.tok_s`, shown only while Strata reports it is generating. When idle or
+reading the prompt the live rate is unavailable (`—`) rather than a stale
+value, and Strata exposes no instantaneous prefill rate, so LIVE PP stays
+unavailable. Per-request means are never shown as instantaneous, and the
+AVG (LIFE) row is derived separately from Strata's cumulative `totals` tokens
+and millisecond timings. A counter reset or a switch between the two formats
+restarts the baseline instead of reporting a false spike. Fields Strata does
+not expose — the context high-water mark, an active-request count and
+cache-token counters — stay unavailable (`—`) rather than a fabricated zero.
 
 ### GPU
 
@@ -171,7 +177,7 @@ The installer is generated with `dist` and installs two executables into:
 A successful installation currently ends with output similar to:
 
 ```text
-downloading orsiktop 0.3.0 x86_64-unknown-linux-gnu
+downloading orsiktop 0.3.1 x86_64-unknown-linux-gnu
 installing to /home/user/.local/bin
   orsiktop
   orsiktop-update
@@ -199,7 +205,7 @@ Expected output is similar to:
 
 ```text
 /home/user/.local/bin/orsiktop
-orsiktop 0.3.0
+orsiktop 0.3.1
 ```
 
 You can then start OrsikTop with `orsiktop`.
