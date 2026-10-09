@@ -3379,6 +3379,33 @@ mod tests {
     }
 
     #[test]
+    fn watermark_is_not_shown_as_current_context_occupancy() {
+        // /slots is down but /metrics answered: the CTX row must render the
+        // occupancy as unknown (`— / capacity`) instead of presenting the
+        // historical high-water mark as the current context.
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            slots_available: false,
+            model: "test-model".to_string(),
+            context_size: 4096,
+            context_used: None,
+            context_high_watermark: Some(2048),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            text.contains("— / 4,096 tok"),
+            "unknown occupancy must stay unknown, got:\n{text}"
+        );
+        assert!(
+            !text.contains("2,048"),
+            "the historical watermark must not appear as current CTX, got:\n{text}"
+        );
+        assert!(!text.contains("0.0%"), "unknown is not 0.0%:\n{text}");
+    }
+
+    #[test]
     fn absent_metrics_render_as_unavailable_not_zero() {
         // Reachable server, but every /metrics-derived metric is absent: the
         // panel must show `—`, never a fabricated 0 / 0.0 / 0 tok/s.
