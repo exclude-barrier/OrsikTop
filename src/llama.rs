@@ -64,12 +64,17 @@ pub struct LlmStats {
     pub reconnecting: bool,
     pub model: String,
     pub context_size: u64,
-    /// Tokens the selected slot is using, or the `/metrics` high-water mark
-    /// without `/slots`. `None` when `/slots` reports no usable occupancy:
-    /// unknown, rendered `—`, never a fabricated `0`.
+    /// Tokens the currently selected slot is using (the slot's own
+    /// `n_prompt_tokens`). `None` when `/slots` reports no usable occupancy or
+    /// is unavailable: unknown, rendered `—`, never a fabricated `0`. The
+    /// historical `/metrics` high-water mark is deliberately not substituted
+    /// here (see `context_high_watermark`).
     pub context_used: Option<u64>,
-    /// `/metrics` context high-water mark. `None` when the metric is absent, so
-    /// a missing watermark can never be mistaken for a real `0` occupancy.
+    /// `/metrics` context high-water mark: the lifetime peak occupancy — a
+    /// **historical** value, reported separately (labelled `watermark`) and
+    /// never presented as the current CTX occupancy. `None` when the metric is
+    /// absent or `/metrics` is unavailable, so a missing watermark can never be
+    /// mistaken for a real `0`.
     pub context_high_watermark: Option<u64>,
     /// ID of the slot the displayed (context_used, context_size) pair comes
     /// from, per the slot's own `id` field in /slots. `None` when /slots is

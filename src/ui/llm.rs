@@ -54,11 +54,11 @@ pub(super) fn draw_llm(
         return;
     }
 
-    let context_used = if llm.slots_available {
-        llm.context_used
-    } else {
-        llm.context_high_watermark
-    };
+    // The CTX row shows current occupancy only. Without `/slots` the occupancy
+    // is unknown (`— / capacity`); the `/metrics` high-water mark is a
+    // historical lifetime peak and must never stand in as the current value.
+    // It stays available, explicitly labelled, in `orsiktop diag`.
+    let context_used = llm.context_used;
     let context_pct = match (context_used, llm.context_size) {
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
         _ => 0.0,
@@ -389,11 +389,9 @@ pub(super) fn draw_llm_metrics_unavailable(
     llm: &LlmStats,
     state: &UiState,
 ) {
-    let context_used = if llm.slots_available {
-        llm.context_used
-    } else {
-        llm.context_high_watermark
-    };
+    // Current occupancy only: the high-water mark is historical and is not the
+    // current context value (see `draw_llm`).
+    let context_used = llm.context_used;
     let context_pct = match (context_used, llm.context_size) {
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
         _ => 0.0,

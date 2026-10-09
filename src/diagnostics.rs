@@ -605,14 +605,10 @@ fn slots_line(stats: &LlmStats) -> String {
 }
 
 fn context_line(stats: &LlmStats) -> String {
-    // Mirror the TUI: when /slots is unavailable the /metrics high-water mark
-    // is the best known occupancy. Unknown capacity renders `—`, never `/0`.
-    let used = if stats.slots_available {
-        stats.context_used
-    } else {
-        stats.context_high_watermark
-    };
-    match (used, stats.context_size) {
+    // Current occupancy only. The `/metrics` high-water mark is a historical
+    // lifetime peak, reported separately as `watermark`, and is never the
+    // current value. Unknown capacity renders `—`, never `/0`.
+    match (stats.context_used, stats.context_size) {
         (Some(used), size) if size > 0 => format!("{used}/{size}"),
         (None, size) if size > 0 => format!("—/{size}"),
         _ => "—".to_string(),
@@ -1111,7 +1107,9 @@ mod tests {
     }
 
     #[test]
-    fn context_line_falls_back_to_the_metrics_watermark_without_slots() {
+    fn context_line_does_not_use_the_watermark_as_current_occupancy() {
+        // Without /slots the current occupancy is unknown; the /metrics
+        // high-water mark is historical and must not stand in as `used`.
         let stats = LlmStats {
             connected: true,
             metrics_available: true,
@@ -1121,7 +1119,20 @@ mod tests {
             context_size: 4096,
             ..Default::default()
         };
-        assert_eq!(context_line(&stats), "2048/4096");
+        assert_eq!(context_line(&stats), "—/4096");
+
+        // A known /slots occupancy is the current value, independent of the
+        // (larger) historical watermark.
+        let with_slots = LlmStats {
+            connected: true,
+            metrics_available: true,
+            slots_available: true,
+            context_used: Some(1024),
+            context_high_watermark: Some(2048),
+            context_size: 4096,
+            ..Default::default()
+        };
+        assert_eq!(context_line(&with_slots), "1024/4096");
 
         // No evidence at all: unknown, never a fabricated capacity.
         let empty = LlmStats {
