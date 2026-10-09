@@ -857,7 +857,13 @@ mod tests {
             &GpuSelector::Auto,
         );
         for secret in ["demo-user", "demo-password", "supersecret", "fragsecret"] {
-            assert!(!out.contains(secret), "leaked {secret}:\n{out}");
+            // Static failure message: never echo the synthetic secret or the
+            // full report (cleartext-logging risk). The condition still fails
+            // the test if redaction regresses.
+            assert!(
+                !out.contains(secret),
+                "diagnostics output unexpectedly contains sensitive information"
+            );
         }
         // The connection-relevant part is still shown, sanitized.
         assert!(out.contains("http://localhost:8080"), "{out}");
@@ -1086,7 +1092,13 @@ mod tests {
             "overflowsecret",
             "frag",
         ] {
-            assert!(!report.contains(secret), "leaked {secret}:\n{report}");
+            // Static failure message: never echo the synthetic secret or the
+            // full report (cleartext-logging risk). The condition still fails
+            // the test if redaction regresses.
+            assert!(
+                !report.contains(secret),
+                "diagnostic report unexpectedly contains sensitive information"
+            );
         }
         // Connection-relevant, non-secret parts survive.
         assert!(report.contains("http://localhost:8081"), "{report}");
