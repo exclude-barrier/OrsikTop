@@ -61,6 +61,18 @@ All notable changes to OrsikTop will be documented here.
   zero the TUI already avoids. It now shows `—` (or `—/N total` from `/props`
   when known). Likewise an unknown context capacity renders `—` instead of
   `used/0`.
+- The multi-server selector no longer shows a fabricated `S 0/0` for a server
+  whose `/slots` endpoint is unavailable (for example when only `/metrics`
+  answers, or the server is offline). Unknown slots now render `S —/—`, or
+  `S —/N` when `/props` still reports the total, while a valid `/slots` array —
+  including a genuinely empty one — keeps its real `busy/total`.
+- Server-influenced free text (transport/framing error detail) now passes
+  through one display-safe boundary before it can reach the TUI or
+  `orsiktop diag`: terminal control characters (ANSI/ESC, CR, LF, tab, NUL) are
+  removed and the length is bounded, so a malformed or hostile response cannot
+  inject escape sequences or forge report lines. Server-supplied model names
+  were already sanitized this way, and URLs in endpoints and errors remain
+  redacted separately.
 
 ## [0.2.10] - 2026-10-08
 
