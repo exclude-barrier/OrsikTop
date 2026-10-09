@@ -803,8 +803,16 @@ pub struct ServerSummary {
     pub label: String,
     pub connected: bool,
     pub reconnecting: bool,
+    /// True when the server's `/slots` endpoint answered with a valid array in
+    /// this sample. Only then are [`Self::slot_count`] and
+    /// [`Self::busy_slots`] real; otherwise the slot count is unknown and must
+    /// render as unavailable (`—`), never a fabricated `0`.
+    pub slots_available: bool,
     pub slot_count: u64,
     pub busy_slots: u64,
+    /// Total slots reported by `/props`, shown as `—/N` while `/slots` is
+    /// unavailable so a known capacity is not lost. `0` means unknown.
+    pub props_slot_count: u64,
     pub context_used: Option<u64>,
     pub context_size: u64,
     pub generation_tps: Option<f64>,

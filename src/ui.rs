@@ -4247,6 +4247,17 @@ fn draw_server_selector(
             || "— tok/s".to_string(),
             |value| format!("{value:.1} tok/s"),
         );
+        // A missing `/slots` endpoint means the busy count is unknown: render
+        // `—/—` (or `—/N` when `/props` still knows the total) rather than a
+        // fabricated `0/0`. A real empty `/slots` array stays `0/0`, and a
+        // valid array shows its actual busy/total.
+        let slots = if server.slots_available {
+            format!("{}/{}", server.busy_slots, server.slot_count)
+        } else if server.props_slot_count > 0 {
+            format!("—/{}", server.props_slot_count)
+        } else {
+            "—/—".to_string()
+        };
         let label = fit_cell(&server.label, 20);
         lines.push(Line::from(vec![
             Span::styled(
@@ -4255,10 +4266,7 @@ fn draw_server_selector(
             ),
             Span::styled(format!("{label:<20} "), Style::default().fg(WHITE)),
             Span::styled(format!("{state:<12} "), Style::default().fg(state_color)),
-            Span::styled(
-                format!("S {}/{}  ", server.busy_slots, server.slot_count),
-                Style::default().fg(MUTED),
-            ),
+            Span::styled(format!("S {slots}  "), Style::default().fg(MUTED)),
             Span::styled(format!("CTX {ctx:<13} "), Style::default().fg(MUTED)),
             Span::styled(format!("{tps:<12} "), Style::default().fg(MUTED)),
             Span::styled(
@@ -5856,6 +5864,117 @@ mod tests {
         assert_eq!(
             compact_endpoint("localhost:8080?token=demo_secret"),
             crate::redact::UNPARSEABLE_ENDPOINT
+        );
+    }
+
+    fn render_server_selector_text(
+        servers: &[ServerSummary],
+        selected: &str,
+        area: Rect,
+    ) -> String {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_server_selector(frame, area, servers, selected, 0, &[]))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn summary(
+        key: &str,
+        connected: bool,
+        slots_available: bool,
+        busy: u64,
+        total: u64,
+    ) -> ServerSummary {
+        ServerSummary {
+            key: key.to_string(),
+            endpoint: format!("http://127.0.0.1:{}", 8080 + key.len()),
+            label: key.to_string(),
+            connected,
+            slots_available,
+            busy_slots: busy,
+            slot_count: total,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_selector_renders_unavailable_slots_without_a_fake_zero() {
+        // Regression for the M4 report: a connected server whose `/slots`
+        // endpoint is down (metrics-only) appeared as "S 0/0". Unknown slots
+        // must render `—/—`, never a fabricated zero.
+        let area = Rect::new(0, 0, 80, 20);
+        let metrics_only = vec![summary("metrics-only", true, false, 0, 0)];
+        let text = render_server_selector_text(&metrics_only, "metrics-only", area);
+        assert!(
+            text.contains("S —/—"),
+            "unavailable slots must render —/—:\n{text}"
+        );
+        assert!(
+            !text.contains("S 0/0"),
+            "unavailable slots must not fabricate 0/0:\n{text}"
+        );
+
+        // When /props still knows the total, the known capacity survives as
+        // `—/N` rather than being dropped.
+        let mut known_total = summary("metrics-only", true, false, 0, 0);
+        known_total.props_slot_count = 3;
+        let text = render_server_selector_text(&[known_total], "metrics-only", area);
+        assert!(
+            text.contains("S —/3"),
+            "a known /props total must render as —/3:\n{text}"
+        );
+        assert!(!text.contains("S 0/0"), "{text}");
+
+        // A valid empty `/slots` array is a genuine zero and stays numeric.
+        let empty = vec![summary("empty", true, true, 0, 0)];
+        let text = render_server_selector_text(&empty, "empty", area);
+        assert!(
+            text.contains("S 0/0"),
+            "a real empty /slots array is 0/0:\n{text}"
+        );
+    }
+
+    #[test]
+    fn server_selector_shows_real_counts_and_no_cross_server_contamination() {
+        let area = Rect::new(0, 0, 80, 20);
+        let servers = vec![
+            summary("healthy", true, true, 2, 4),
+            summary("metrics-only", true, false, 0, 0),
+            summary("dead", false, false, 0, 0),
+        ];
+        let text = render_server_selector_text(&servers, "healthy", area);
+        assert!(text.contains("S 2/4  "), "healthy count lost:\n{text}");
+        // Two unavailable rows, no fabricated 0/0 anywhere.
+        assert!(!text.contains("S 0/0"), "fabricated zero leaked:\n{text}");
+        assert_eq!(
+            text.matches("S —/—").count(),
+            2,
+            "both unknown rows:\n{text}"
+        );
+
+        // A small but usable terminal still renders the row (the popup is
+        // dropped only below its hard floor of a 48-column popup).
+        let small = Rect::new(0, 0, 56, 10);
+        let text = render_server_selector_text(&servers, "healthy", small);
+        assert!(
+            text.contains("S 2/4"),
+            "small terminal lost the row:\n{text}"
+        );
+
+        // Below the floor it degrades quietly instead of panicking.
+        let tiny = Rect::new(0, 0, 40, 4);
+        let text = render_server_selector_text(&servers, "healthy", tiny);
+        assert!(
+            !text.contains("S 2/4"),
+            "too-small popup should not draw:\n{text}"
         );
     }
 
