@@ -19,6 +19,36 @@ All notable changes to OrsikTop will be documented here.
   than a fabricated zero, and every llama.cpp monitoring behaviour is
   unchanged.
 
+  Strata live throughput is reported as follows:
+
+  - **Live decode (windowed):** while Strata reports `state=generating`, the
+    LIVE decode rate is Strata's own windowed `live.tok_s`
+    (`live.tok_s_window_s` seconds). It is *not* derived from counter deltas —
+    Strata's cumulative `totals` advance only at/near request completion, so a
+    delta over a poll interval would read as zero during generation and spike at
+    completion.
+  - **Idle / prefill:** the live decode rate is unavailable (`—`) rather than a
+    stale value carried over from the previous request. Strata exposes no
+    instantaneous prefill rate.
+  - **Means (not shown as instantaneous):** `live.tok_s_mean` (per-request mean
+    decode rate) and `live.prefill_tok_s_mean` (per-request prefill mean) are
+    deliberately not surfaced as live speeds.
+  - **Averages (counter-derived):** the AVG (LIFE) prompt/generation rates are
+    derived from Strata's cumulative `totals` tokens and millisecond timings, as
+    for llama.cpp.
+  - **Unchanged:** llama.cpp Prometheus telemetry, its counter-delta live rates
+    and all existing behaviour are untouched.
+
+### Fixed
+
+- A server whose `/slots` entries carry no token counters (such as Strata's
+  `/slots`, which exposes only `id`, `is_processing` and `n_ctx`) no longer
+  reports a fabricated live `0.0 tok/s`. The per-slot live-throughput path now
+  abstains for a dimension that no paired slot ever reported, so the rate stays
+  unavailable (`—`) instead of a measured zero, and the aggregate `/metrics`
+  path is used when it can supply the value. This also removes the latent
+  permanent `0.0` the slot path would otherwise have shown for Strata.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added

@@ -322,9 +322,11 @@ impl LlamaMonitor {
                 samples: Vec::new(),
                 format: None,
                 strata_since: None,
+                strata_live: None,
                 json: false,
             });
         let metrics = parsed.samples;
+        let strata_live = parsed.strata_live;
         stats.metrics_available = match parsed.format {
             // A recognised Strata endpoint is available even when a particular
             // sample exposes no counters: the fields stay `—`, not fabricated.
@@ -476,6 +478,19 @@ impl LlamaMonitor {
                     choose_live_throughput((None, None), metric_live);
                 self.previous_slots = PreviousSlotCounters::default();
             }
+        }
+
+        // Strata's cumulative `totals` only advance at/near request completion,
+        // so counter deltas are not a live rate. Use Strata's authoritative
+        // windowed decode rate while it explicitly reports `state=generating`;
+        // otherwise report unavailable (`—`) rather than a stale or fabricated
+        // speed. Strata exposes no instantaneous prefill field (its
+        // `prefill_tok_s_mean` is a per-request mean), so the live prefill rate
+        // stays unavailable; the lifetime averages from `totals` are unaffected.
+        if parsed.format == Some(MetricsFormat::Strata) {
+            let live = strata_live.unwrap_or_default();
+            stats.prompt_tps = None;
+            stats.generation_tps = live.decode_tps;
         }
 
         if stats.model.is_empty() {
@@ -744,6 +759,9 @@ struct ParsedMetrics {
     samples: Vec<MetricSample>,
     format: Option<MetricsFormat>,
     strata_since: Option<f64>,
+    /// Strata's live phase / authoritative windowed decode rate, when the body
+    /// was a recognised Strata object.
+    strata_live: Option<crate::strata::StrataLive>,
     json: bool,
 }
 
@@ -761,12 +779,14 @@ fn parse_metrics_body(text: &str) -> ParsedMetrics {
                 samples: crate::strata::extract_samples(&value),
                 format: Some(MetricsFormat::Strata),
                 strata_since: crate::strata::totals_since(&value),
+                strata_live: Some(crate::strata::live_rates(&value)),
                 json: true,
             },
             _ => ParsedMetrics {
                 samples: Vec::new(),
                 format: None,
                 strata_since: None,
+                strata_live: None,
                 json: true,
             },
         }
@@ -775,6 +795,7 @@ fn parse_metrics_body(text: &str) -> ParsedMetrics {
             samples: parse_prometheus(text),
             format: Some(MetricsFormat::Prometheus),
             strata_since: None,
+            strata_live: None,
             json: false,
         }
     }
@@ -1260,6 +1281,11 @@ fn slot_delta_tps(
     let mut decoded_delta = 0u64;
     let mut prompt_known = true;
     let mut decoded_known = true;
+    // A dimension must be *reported* by at least one paired slot to be a real
+    // measurement. Otherwise an all-`None` pair (e.g. a counter-less `/slots`
+    // server such as Strata) would leave `known` true and fabricate `0.0`.
+    let mut prompt_reported = false;
+    let mut decoded_reported = false;
 
     for current_slot in current {
         let Some(slot_id) = current_slot.slot_id else {
@@ -1301,6 +1327,7 @@ fn slot_delta_tps(
         ) {
             (Some(now), Some(before)) if now >= before => {
                 prompt_delta = prompt_delta.saturating_add(now - before);
+                prompt_reported = true;
             }
             (None, None) => {}
             _ => prompt_known = false,
@@ -1308,6 +1335,7 @@ fn slot_delta_tps(
         match (current_slot.decoded, previous_slot.decoded) {
             (Some(now), Some(before)) if now >= before => {
                 decoded_delta = decoded_delta.saturating_add(now - before);
+                decoded_reported = true;
             }
             (None, None) => {}
             _ => decoded_known = false,
@@ -1335,8 +1363,8 @@ fn slot_delta_tps(
     }
 
     (
-        prompt_known.then(|| prompt_delta as f64 / seconds),
-        decoded_known.then(|| decoded_delta as f64 / seconds),
+        (prompt_known && prompt_reported).then(|| prompt_delta as f64 / seconds),
+        (decoded_known && decoded_reported).then(|| decoded_delta as f64 / seconds),
     )
 }
 
@@ -1924,8 +1952,16 @@ mod tests {
                             r#"[{"id":0,"n_ctx":4096,"is_processing":false}]"#.to_string()
                         } else if path.contains("/metrics") {
                             let n = u64::from(calls.fetch_add(1, Ordering::SeqCst) + 1);
+                            // First sample reports an active decode phase; the
+                            // second is idle. The phase gates whether a live
+                            // decode rate is surfaced at all.
+                            let (state, tok_s) = if n == 1 {
+                                ("generating", "42.0")
+                            } else {
+                                ("idle", "null")
+                            };
                             format!(
-                                r#"{{"engine":{{"model":"strata"}},"live":{{"queued":0}},"requests_kept":1,"totals":{{"since":1.0,"prompt_tokens":{},"output_tokens":{},"prompt_ms":1000.0,"decode_ms":500.0,"drafts_offered":40,"drafts_accepted":30}}}}"#,
+                                r#"{{"engine":{{"model":"strata"}},"live":{{"state":"{state}","queued":0,"tok_s":{tok_s}}},"requests_kept":1,"totals":{{"since":1.0,"prompt_tokens":{},"output_tokens":{},"prompt_ms":1000.0,"decode_ms":500.0,"drafts_offered":40,"drafts_accepted":30}}}}"#,
                                 1000 * n,
                                 250 * n
                             )
@@ -1963,16 +1999,106 @@ mod tests {
         // Lifetime averages from totals + ms-derived seconds.
         assert_eq!(first.prompt_avg_tps, Some(1000.0));
         assert_eq!(first.generation_avg_tps, Some(500.0));
+        // The live decode rate is Strata's authoritative windowed value, not a
+        // counter delta; Strata has no instantaneous prefill rate.
+        assert_eq!(first.generation_tps, Some(42.0));
+        assert_eq!(first.prompt_tps, None);
         assert!(first.slots_available);
         assert_eq!(first.slot_count, 1);
 
+        // Idle: no stale decode speed is carried over.
         let second = monitor.sample();
         assert!(second.metrics_available);
         assert_eq!(second.prompt_total, Some(2000.0));
-        // A later sample derives a live delta rate without a fabricated zero.
-        assert!(second
-            .generation_tps
-            .is_some_and(|value| value.is_finite() && value >= 0.0));
+        assert_eq!(second.generation_tps, None);
+        assert_eq!(second.prompt_tps, None);
+
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_wire_format_switch_resets_the_counter_baseline() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_flag = Arc::clone(&calls);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line);
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        // /slots uses the exact Strata shape (no counters), so
+                        // the slot path must abstain and the counter baseline
+                        // (not a fabricated slot zero) is the only live-rate
+                        // source under test.
+                        let response = if path.contains("/props") {
+                            let body = r#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1,"model_alias":"m"}"#;
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                        } else if path.contains("/slots") {
+                            let body = r#"[{"id":0,"n_ctx":4096,"is_processing":false}]"#;
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                        } else if path.contains("/metrics") {
+                            let n = calls_flag.fetch_add(1, Ordering::SeqCst);
+                            let body = if n == 0 {
+                                // First: a Strata sample with tiny counters.
+                                r#"{"engine":{},"live":{"state":"idle"},"requests_kept":1,"totals":{"since":1.0,"prompt_tokens":5,"output_tokens":5,"prompt_ms":1000.0,"decode_ms":1000.0}}"#.to_string()
+                            } else {
+                                // Then: llama.cpp Prometheus with much larger counters.
+                                "# fixture\nllamacpp:prompt_tokens_total 100000\nllamacpp:tokens_predicted_total 100000\nllamacpp:prompt_seconds_total 10\nllamacpp:tokens_predicted_seconds_total 10\n".to_string()
+                            };
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                                .to_string()
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut monitor = LlamaMonitor::new(&format!("http://{addr}")).unwrap();
+        let strata = monitor.sample();
+        assert!(strata.metrics_available);
+        assert!(strata.slots_available);
+        assert_eq!(strata.prompt_total, Some(5.0));
+        assert_eq!(strata.prompt_tps, None);
+        assert_eq!(strata.generation_tps, None);
+
+        // Switching to Prometheus must not diff the llama counter against the
+        // Strata baseline (which would read as a huge spike). The counter-less
+        // /slots abstains, so a `None` proves the counter baseline was reset; a
+        // leaked baseline would produce `Some(≈100000/seconds)`.
+        let prometheus = monitor.sample();
+        assert!(prometheus.metrics_available);
+        assert_eq!(prometheus.prompt_total, Some(100000.0));
+        assert_eq!(prometheus.generation_avg_tps, Some(10000.0));
+        assert_eq!(
+            prometheus.prompt_tps, None,
+            "baseline must reset across a wire-format switch"
+        );
+        assert_eq!(
+            prometheus.generation_tps, None,
+            "baseline must reset across a wire-format switch"
+        );
 
         stop.store(true, Ordering::Relaxed);
     }
@@ -2549,6 +2675,61 @@ mod tests {
         let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0);
         assert_eq!(prompt_tps, Some(150.0));
         assert_eq!(generation_tps, Some(75.0));
+    }
+
+    #[test]
+    fn slot_delta_tps_abstains_when_no_slot_reports_counters() {
+        // A counter-less /slots (for example Strata's `id,is_processing,n_ctx`)
+        // must abstain, not read as a measured zero rate.
+        let slot = || SlotCounter {
+            slot_id: Some(0),
+            task_id: None,
+            prompt_processed: None,
+            decoded: None,
+        };
+        assert_eq!(
+            slot_delta_tps(&[slot()], &[slot()], 2.0),
+            (None, None),
+            "no reported counter means unavailable, never a fake zero"
+        );
+    }
+
+    #[test]
+    fn slot_delta_tps_uses_the_slots_that_do_report_counters() {
+        // One slot reports both dimensions, another omits them on both sides:
+        // the reporting slot's delta is used and the silent slot does not
+        // invalidate the dimension.
+        let previous = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: Some(100),
+                decoded: Some(10),
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: Some(2),
+                prompt_processed: None,
+                decoded: None,
+            },
+        ];
+        let current = vec![
+            SlotCounter {
+                slot_id: Some(0),
+                task_id: Some(1),
+                prompt_processed: Some(160),
+                decoded: Some(30),
+            },
+            SlotCounter {
+                slot_id: Some(1),
+                task_id: Some(2),
+                prompt_processed: None,
+                decoded: None,
+            },
+        ];
+        let (prompt_tps, generation_tps) = slot_delta_tps(&previous, &current, 2.0);
+        assert_eq!(prompt_tps, Some(30.0));
+        assert_eq!(generation_tps, Some(10.0));
     }
 
     #[test]

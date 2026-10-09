@@ -176,6 +176,44 @@ pub(crate) fn totals_since(value: &Value) -> Option<f64> {
     value.get("totals")?.get("since")?.as_f64()
 }
 
+/// Strata's live-phase fields relevant to throughput presentation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StrataLive {
+    /// `live.state` lower-cased (`idle`, `reading`, `generating`, ...), or
+    /// `None` when the field is absent.
+    pub state: Option<String>,
+    /// Authoritative **windowed** decode rate (`live.tok_s`, tok/s), reported
+    /// only while Strata is actually generating. `None` when Strata is idle or
+    /// still reading the prompt, so a previous request's speed is never shown
+    /// as current.
+    pub decode_tps: Option<f64>,
+}
+
+/// Read Strata's live state and the authoritative windowed decode rate.
+///
+/// Only `state == "generating"` yields a decode rate: `live.tok_s` is the
+/// current `live.tok_s_window_s` window rate. `live.tok_s_mean` (per-request
+/// mean) and `live.prefill_tok_s_mean` (per-request prefill mean) are
+/// deliberately **not** surfaced as instantaneous speeds. A missing/unknown
+/// state yields no rate even when `tok_s` is present, so a value cannot be
+/// shown without phase evidence. A reported `0.0` while generating is kept as
+/// a real zero.
+pub(crate) fn live_rates(value: &Value) -> StrataLive {
+    let live = value.get("live");
+    let state = live
+        .and_then(|live| live.get("state"))
+        .and_then(Value::as_str)
+        .map(|state| state.to_ascii_lowercase());
+    let decode_tps = if state.as_deref() == Some("generating") {
+        live.and_then(|live| live.get("tok_s"))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+    } else {
+        None
+    };
+    StrataLive { state, decode_tps }
+}
+
 /// Normalise a Strata `/metrics` object into canonical `MetricSample`s. The
 /// result may be empty when the counters are absent; callers still treat a
 /// recognised Strata endpoint as available (see `llama::parse_metrics_body`).
@@ -506,5 +544,61 @@ mod tests {
             value_of(&samples, "llamacpp:tokens_predicted_total"),
             Some(4.0)
         );
+    }
+
+    #[test]
+    fn live_rates_report_the_windowed_decode_rate_only_while_generating() {
+        let generating = json!({
+            "engine": {}, "totals": {},
+            "live": {
+                "state": "generating",
+                "tok_s": 120.3,
+                "tok_s_mean": 132.3,
+                "prefill_tok_s_mean": 336.3,
+                "tok_s_window_s": 2.0
+            }
+        });
+        let live = live_rates(&generating);
+        assert_eq!(live.state.as_deref(), Some("generating"));
+        // The instantaneous window rate is used, not the per-request means.
+        assert_eq!(live.decode_tps, Some(120.3));
+    }
+
+    #[test]
+    fn live_rates_never_report_a_rate_while_idle_or_reading() {
+        for state in ["idle", "reading", "Idle"] {
+            let value = json!({
+                "engine": {}, "totals": {},
+                "live": { "state": state, "tok_s": null }
+            });
+            assert_eq!(live_rates(&value).decode_tps, None, "state={state}");
+        }
+
+        // A missing/unknown state yields no rate even when tok_s is present:
+        // the phase must be explicit before a speed is shown.
+        let unknown = json!({
+            "engine": {}, "totals": {}, "live": { "tok_s": 50.0 }
+        });
+        assert_eq!(live_rates(&unknown).decode_tps, None);
+        assert_eq!(live_rates(&unknown).state, None);
+    }
+
+    #[test]
+    fn live_rates_keep_an_explicit_zero_while_generating() {
+        // A genuine measured zero is not the same as unavailable.
+        let zero = json!({
+            "engine": {}, "totals": {},
+            "live": { "state": "generating", "tok_s": 0.0 }
+        });
+        assert_eq!(live_rates(&zero).decode_tps, Some(0.0));
+    }
+
+    #[test]
+    fn live_rates_ignore_non_finite_and_wrongly_typed_values() {
+        let value = json!({
+            "engine": {}, "totals": {},
+            "live": { "state": "generating", "tok_s": "120.3" }
+        });
+        assert_eq!(live_rates(&value).decode_tps, None);
     }
 }
