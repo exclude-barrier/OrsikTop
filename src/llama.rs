@@ -192,6 +192,16 @@ pub struct LlamaMonitor {
 
 impl LlamaMonitor {
     pub fn new(server: &str) -> Result<Self, reqwest::Error> {
+        // Proxy behavior is deliberately left at reqwest's default: the
+        // standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY environment
+        // variables are honored, with no automatic loopback bypass. That keeps
+        // an explicitly configured remote endpoint usable behind a corporate
+        // proxy, at the cost that a user with a proxy env var set (and no
+        // matching NO_PROXY) would route even the default 127.0.0.1 endpoint
+        // through it. Disabling proxies here would break the intentional remote
+        // case, and adding a dedicated setting is not justified by a proven
+        // requirement, so this stays a documented future configurable behavior.
+        // Timeouts and redirect policy below remain fully effective either way.
         let client = Client::builder()
             .connect_timeout(Duration::from_millis(LLM_CONNECT_TIMEOUT_MS))
             .timeout(Duration::from_millis(LLM_REQUEST_TIMEOUT_MS))
@@ -424,6 +434,14 @@ impl LlamaMonitor {
             stats.model = UNKNOWN_MODEL_LABEL.to_string();
         }
 
+        // Free-text errors can carry server-influenced transport/framing detail
+        // (reqwest source chain, malformed-payload diagnostics). Strip terminal
+        // control characters and bound the length here, at the single boundary
+        // where untrusted text enters `LlmStats`, so no consumer (TUI or
+        // `orsiktop diag`) can be injected through the error string. URLs were
+        // already redacted at construction.
+        sanitize_error_text(&mut stats);
+
         stats
     }
 
@@ -633,6 +651,22 @@ impl LlamaMonitor {
             }
         }
     }
+}
+
+/// Apply the display-safe text boundary to the free-text error fields of a
+/// sample. This is the single place server-influenced error text enters
+/// [`LlmStats`], so stripping terminal control characters and bounding the
+/// length here covers every consumer (TUI and `orsiktop diag`). URLs were
+/// already redacted when the error strings were built.
+fn sanitize_error_text(stats: &mut LlmStats) {
+    stats.error = crate::redact::sanitize_display_text(
+        &stats.error,
+        crate::redact::MAX_UNTRUSTED_DISPLAY_CHARS,
+    );
+    stats.slots_error = crate::redact::sanitize_display_text(
+        &stats.slots_error,
+        crate::redact::MAX_UNTRUSTED_DISPLAY_CHARS,
+    );
 }
 
 /// The outcome of a /metrics fetch: the raw body on success, the non-success
@@ -1336,40 +1370,13 @@ fn json_u64_path(value: &Value, path: &[&str]) -> Option<u64> {
 /// truncated to this so it cannot bloat the TUI or `orsiktop diag` output.
 const MAX_MODEL_DISPLAY_CHARS: usize = 120;
 
-/// Make a server-controlled model string safe to display: drop control
-/// characters (ANSI/CR/LF/tab/NUL, ...), collapse whitespace and bound the
-/// length. Ordinary Unicode is preserved. The endpoint used for networking is
-/// never derived from this.
-fn sanitize_model_text(value: &str) -> String {
-    let mut out = String::new();
-    let mut pending_space = false;
-    for ch in value.chars() {
-        if ch.is_control() || ch.is_whitespace() {
-            pending_space = !out.is_empty();
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        out.push(ch);
-    }
-    if out.chars().count() > MAX_MODEL_DISPLAY_CHARS {
-        let mut truncated: String = out.chars().take(MAX_MODEL_DISPLAY_CHARS).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        out
-    }
-}
-
 fn model_display_name(value: &str) -> String {
     let name = Path::new(value)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(value)
         .trim_end_matches(".gguf");
-    sanitize_model_text(name)
+    crate::redact::sanitize_display_text(name, MAX_MODEL_DISPLAY_CHARS)
 }
 
 #[cfg(test)]
@@ -2976,5 +2983,49 @@ mod local_speculative_process_tests {
         assert!(spec.enabled);
         assert!(spec.is_mtp);
         assert_eq!(spec.n_max, Some(3));
+    }
+
+    #[test]
+    fn sanitize_error_text_neutralizes_injected_control_characters() {
+        // The display boundary `sample()` applies to every error field. A
+        // synthetic server-influenced error carries ANSI/CR/LF/tab/NUL; after
+        // the boundary it must be terminal-safe (no injection, no forged report
+        // line) while the useful diagnostic context survives.
+        let mut stats = LlmStats {
+            error: "transport\u{1b}[31mboom\r\nforged line\ttail".to_string(),
+            slots_error: "slots\u{0}error".to_string(),
+            ..Default::default()
+        };
+        sanitize_error_text(&mut stats);
+        for text in [&stats.error, &stats.slots_error] {
+            assert!(
+                !text.chars().any(char::is_control),
+                "control character survived the boundary: {text:?}"
+            );
+        }
+        assert!(stats.error.contains("transport"), "{:?}", stats.error);
+        assert!(stats.error.contains("boom"), "{:?}", stats.error);
+        assert!(stats.error.contains("forged line"), "{:?}", stats.error);
+        assert!(
+            stats.slots_error.contains("slots"),
+            "{:?}",
+            stats.slots_error
+        );
+        assert!(
+            stats.slots_error.contains("error"),
+            "{:?}",
+            stats.slots_error
+        );
+
+        // The length is bounded so a hostile response cannot bloat the output.
+        let mut long = LlmStats {
+            error: "x".repeat(1000),
+            ..Default::default()
+        };
+        sanitize_error_text(&mut long);
+        assert_eq!(
+            long.error.chars().count(),
+            crate::redact::MAX_UNTRUSTED_DISPLAY_CHARS + 1
+        );
     }
 }

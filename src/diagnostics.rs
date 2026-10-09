@@ -387,7 +387,10 @@ fn probe_llama<S: crate::system::Sys>(sys: &S, auto_discovery: bool, server: Opt
         }
         Err(err) => println!(
             "  status     : client init failed ({})",
-            redact_urls(&err.to_string())
+            crate::redact::sanitize_display_text(
+                &redact_urls(&err.to_string()),
+                crate::redact::MAX_UNTRUSTED_DISPLAY_CHARS,
+            )
         ),
     }
 }
@@ -427,8 +430,13 @@ fn probe_servers(servers: &[crate::app::ServerSpec]) -> Vec<LlmStats> {
                     Ok(mut monitor) => monitor.sample(),
                     Err(err) => LlmStats {
                         // A client-construction error is rare; redact any URL
-                        // defensively so an endpoint credential cannot leak.
-                        error: redact_urls(&err.to_string()),
+                        // defensively so an endpoint credential cannot leak, and
+                        // pass it through the same display-safe boundary as the
+                        // normal sample path.
+                        error: crate::redact::sanitize_display_text(
+                            &redact_urls(&err.to_string()),
+                            crate::redact::MAX_UNTRUSTED_DISPLAY_CHARS,
+                        ),
                         ..Default::default()
                     },
                 })
