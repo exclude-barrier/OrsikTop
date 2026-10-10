@@ -15,8 +15,8 @@ use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu, ProcessIdentity,
-        ProcessStats, ServerSummary, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+        ActivityPhase, GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu,
+        ProcessIdentity, ProcessStats, ServerSummary, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
 };
@@ -48,6 +48,18 @@ const HISTORY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_MAX_SAMPLES: usize = 720;
 const REFRESH_CONTROL_WIDTH: u16 = 22;
 const PROCESS_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// Hard floor below which even the reduced layout cannot be drawn usefully.
+/// At or above this size the dashboard stays usable; below it the too-small
+/// notice is shown. The width is the narrowest that still fits the compact
+/// LLM/context summary line (labels plus a model/context value); the height
+/// leaves room for the status line plus that summary.
+const COMPACT_MIN_WIDTH: u16 = 54;
+const COMPACT_MIN_HEIGHT: u16 = 16;
+/// Floor of the full dashboard layout. Between the compact floor and this the
+/// reduced [`draw_compact`] layout is drawn instead of the dead-end notice.
+const FULL_MIN_WIDTH: u16 = 72;
+const FULL_MIN_HEIGHT: u16 = 22;
 
 const BG_BLACK: Color = Color::Rgb(0, 0, 0);
 const BAR_EMPTY: Color = Color::Rgb(48, 52, 48);
@@ -276,6 +288,27 @@ impl UiState {
                 now,
             );
         }
+    }
+
+    /// Milliseconds since this server's last successful measurement, from the
+    /// same per-server history the selected-server panel uses. `None` when the
+    /// server has never answered, so the overview shows `—` rather than `0` or
+    /// a generic connection age.
+    pub fn server_sample_age_ms(&self, key: &str, now: Instant) -> Option<u64> {
+        self.llm_histories
+            .get(key)
+            .and_then(|history| history.last_fresh_at)
+            .map(|at| now.saturating_duration_since(at).as_millis() as u64)
+    }
+
+    /// Smoothed sample interval (ms) for a server while it is connected, from
+    /// its own per-server history (the same value the selected-server panel
+    /// shows). `None` until a second sample has been seen or while offline, so
+    /// the overview falls back to the measurement age instead of a fake value.
+    pub fn server_sample_interval_ms(&self, key: &str) -> Option<f64> {
+        self.llm_histories
+            .get(key)
+            .and_then(|history| history.sample_interval_ema_ms)
     }
 
     /// Make `key`'s own history active (the selected server changed). Other
@@ -1003,8 +1036,28 @@ pub fn draw(
 
     frame.render_widget(Block::default().style(Style::default().bg(BG_BLACK)), area);
 
-    if area.width < 72 || area.height < 22 {
+    if area.width < COMPACT_MIN_WIDTH || area.height < COMPACT_MIN_HEIGHT {
         draw_too_small(frame, area);
+        return;
+    }
+
+    // Between the hard floor and the full-layout floor there is not room for
+    // the whole dashboard, but a dead-end notice wastes a usable terminal.
+    // Draw the reduced layout and still honour any open overlay on top.
+    if area.width < FULL_MIN_WIDTH || area.height < FULL_MIN_HEIGHT {
+        draw_compact(
+            frame,
+            area,
+            llm,
+            system,
+            state,
+            server,
+            refresh_ms,
+            server_auto,
+            servers,
+            selected_server,
+        );
+        draw_overlays(frame, area, servers, selected_server, overflow, state);
         return;
     }
 
@@ -1059,6 +1112,20 @@ pub fn draw(
     }
     draw_footer(frame, rows[4], llm, gpu, state);
 
+    draw_overlays(frame, area, servers, selected_server, overflow, state);
+}
+
+/// Draw whichever modal overlay is open, on top of the dashboard (full or
+/// compact). Only one overlay is shown at a time; the selector wins so an
+/// accidental double-open cannot hide it.
+fn draw_overlays(
+    frame: &mut Frame,
+    area: Rect,
+    servers: &[ServerSummary],
+    selected_server: &str,
+    overflow: &[crate::app::ServerSpec],
+    state: &UiState,
+) {
     if state.server_selector_open {
         draw_server_selector(
             frame,
@@ -1075,9 +1142,141 @@ pub fn draw(
     }
 }
 
+/// Reduced dashboard for terminals between the hard floor (`COMPACT_MIN_*`) and
+/// the full-layout floor (`FULL_MIN_*`). The full layout cannot fit there, but
+/// the essentials still can: the connection-status header and a compact
+/// LLM/context summary, with a system load line when the reduced height leaves
+/// room. GPU, history and the process table are dropped.
+#[allow(clippy::too_many_arguments)]
+fn draw_compact(
+    frame: &mut Frame,
+    area: Rect,
+    llm: &LlmStats,
+    system: &SystemStats,
+    state: &UiState,
+    server: &str,
+    refresh_ms: u64,
+    server_auto: bool,
+    servers: &[ServerSummary],
+    selected_server: &str,
+) {
+    let block = Block::default()
+        .title(" OrsikTop · compact ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DIM_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let (status, status_color) = llm_link_status(state, llm);
+    let mut header = vec![
+        Span::styled(
+            format!(" {status} "),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("· ", Style::default().fg(DIM_GREEN)),
+        Span::styled(compact_endpoint(server), Style::default().fg(MUTED)),
+    ];
+    if server_auto {
+        header.push(Span::styled(" ·auto", Style::default().fg(MUTED)));
+    }
+    let mut lines = vec![Line::from(header)];
+
+    let model = if llm.model.is_empty() {
+        "—".to_string()
+    } else {
+        fit_cell(&llm.model, inner.width.saturating_sub(8) as usize)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" MODEL ", Style::default().fg(MUTED)),
+        Span::styled(model, Style::default().fg(WHITE)),
+    ]));
+
+    let ctx = match (llm.context_used, llm.context_size) {
+        (Some(used), size) if size > 0 => format!("{used}/{size}"),
+        (None, size) if size > 0 => format!("—/{size}"),
+        _ => "—".to_string(),
+    };
+    let tps = llm.generation_tps.map_or_else(
+        || "— tok/s".to_string(),
+        |value| format!("{value:.1} tok/s"),
+    );
+    lines.push(Line::from(vec![
+        Span::styled(" CTX ", Style::default().fg(MUTED)),
+        Span::styled(format!("{ctx:<18}"), Style::default().fg(WHITE)),
+        Span::styled("GEN ", Style::default().fg(MUTED)),
+        Span::styled(tps, Style::default().fg(WHITE)),
+    ]));
+
+    if servers.len() > 1 {
+        let index = servers
+            .iter()
+            .position(|summary| summary.key == selected_server)
+            .map_or(0, |position| position + 1);
+        lines.push(Line::from(Span::styled(
+            format!(" [{index}/{}] servers · s = selector", servers.len()),
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    // A search opened in the compact layout has no process table or footer to
+    // render it, so show its live state here; otherwise typing would vanish
+    // into an invisible mode. The hint below deliberately omits `[/] search`
+    // because the compact layout has no process list to search.
+    if state.process_search_open {
+        lines.push(Line::from(vec![
+            Span::styled(" SEARCH ", Style::default().fg(CYAN)),
+            Span::styled(
+                format!(
+                    "/{}",
+                    fit_cell(
+                        &state.process_search_query,
+                        inner.width.saturating_sub(20) as usize
+                    )
+                ),
+                Style::default().fg(WHITE),
+            ),
+            Span::styled("  · Esc cancel", Style::default().fg(MUTED)),
+        ]));
+    }
+
+    // Keep this short enough to survive the 52-column inner width of the
+    // 54-wide hard floor even with a 5-digit refresh interval.
+    lines.push(Line::from(Span::styled(
+        format!(" {refresh_ms}ms · h help · q settings · esc quit"),
+        Style::default().fg(MUTED),
+    )));
+
+    if inner.height as usize > lines.len() {
+        lines.push(Line::from(vec![
+            Span::styled(" LOAD ", Style::default().fg(MUTED)),
+            Span::styled(load_average_text(system), Style::default().fg(WHITE)),
+            Span::styled("  CPU ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{:.0}%", system.cpu_usage),
+                Style::default().fg(WHITE),
+            ),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Whether the terminal is large enough for the full dashboard layout. The
+/// compact range draws a different header with no refresh buttons, so callers
+/// outside the render path (e.g. mouse hit-testing) use this to avoid acting
+/// on controls that are not on screen.
+pub(crate) fn uses_full_layout(width: u16, height: u16) -> bool {
+    width >= FULL_MIN_WIDTH && height >= FULL_MIN_HEIGHT
+}
+
 fn draw_too_small(frame: &mut Frame, area: Rect) {
     frame.render_widget(
-        Paragraph::new("OrsikTop needs at least 72x22 terminal cells")
+        Paragraph::new("OrsikTop needs at least 54x16 terminal cells")
             .style(Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD))
             .block(
                 Block::default()
@@ -2155,15 +2354,17 @@ mod tests {
         );
     }
 
-    fn render_server_selector_text(
+    fn render_selector(
         servers: &[ServerSummary],
         selected: &str,
+        highlight: usize,
+        overflow: &[crate::app::ServerSpec],
         area: Rect,
     ) -> String {
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_server_selector(frame, area, servers, selected, 0, &[]))
+            .draw(|frame| draw_server_selector(frame, area, servers, selected, highlight, overflow))
             .unwrap();
         terminal
             .backend()
@@ -2172,6 +2373,14 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    fn render_server_selector_text(
+        servers: &[ServerSummary],
+        selected: &str,
+        area: Rect,
+    ) -> String {
+        render_selector(servers, selected, 0, &[], area)
     }
 
     fn summary(
@@ -2264,6 +2473,525 @@ mod tests {
             !text.contains("S 2/4"),
             "too-small popup should not draw:\n{text}"
         );
+    }
+
+    #[test]
+    fn server_selector_scrolls_to_keep_the_highlight_visible() {
+        // 12 servers do not fit the popup inner height at 80x12, so the list
+        // must scroll. Every server stays reachable by moving the highlight,
+        // and the title carries an N/M position indicator throughout.
+        let servers: Vec<ServerSummary> = (0..12)
+            .map(|i| summary(&format!("s{i:02}"), true, true, 1, 4))
+            .collect();
+        let area = Rect::new(0, 0, 80, 12);
+        for index in 0..servers.len() {
+            let text = render_selector(&servers, "s00", index, &[], area);
+            let label = format!("s{index:02}");
+            assert!(
+                text.contains(&label),
+                "highlight {index} must stay visible:\n{text}"
+            );
+            let position = format!("{}/{}", index + 1, servers.len());
+            assert!(
+                text.contains(&position),
+                "position indicator {position} missing:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_selector_keeps_the_not_monitored_block_visible_when_scrolled() {
+        // The overflow block must not be pushed off-screen by the scrolled
+        // server list: it is pinned below the server viewport, so configured
+        // but unmonitored endpoints are never silently cut off.
+        let servers: Vec<ServerSummary> = (0..16)
+            .map(|i| summary(&format!("s{i:02}"), true, true, 1, 4))
+            .collect();
+        let overflow = vec![
+            crate::app::ServerSpec {
+                key: "o1".to_string(),
+                endpoint: "http://10.0.0.9:8080".to_string(),
+                identity: None,
+            },
+            crate::app::ServerSpec {
+                key: "o2".to_string(),
+                endpoint: "http://10.0.0.10:8080".to_string(),
+                identity: None,
+            },
+        ];
+        let area = Rect::new(0, 0, 80, 16);
+        let text = render_selector(&servers, "s00", 15, &overflow, area);
+        assert!(
+            text.contains("s15"),
+            "last server must stay visible:\n{text}"
+        );
+        assert!(
+            text.contains("NOT MONITORED"),
+            "overflow block must stay visible:\n{text}"
+        );
+        assert!(
+            text.contains("16/16"),
+            "position indicator missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn server_selector_keeps_the_highlighted_detail_line_visible_at_odd_heights() {
+        // Regression (F5): each server now renders two lines, which made the
+        // effective viewport odd at many terminal heights. The scroll offset
+        // was rounded down to an even line, dropping the highlighted entry's
+        // *detail* line (slots, CTX, tok/s, age) out of the window — at the
+        // last entry it was not reachable at all. Each server carries a unique
+        // CTX marker, so `contains` proves the detail line itself is on screen,
+        // not merely its header. `render_selector` returns only the drawn
+        // buffer, so an off-screen detail is genuinely absent.
+        let servers: Vec<ServerSummary> = (0..5)
+            .map(|i| {
+                let mut server = summary(&format!("s{i:02}"), true, true, 1, 4);
+                server.context_used = Some(1000 + i);
+                server.context_size = 9999;
+                server
+            })
+            .collect();
+        // 80x15 gives an odd popup inner height (no overflow block).
+        let area = Rect::new(0, 0, 80, 15);
+        for index in 0..servers.len() {
+            let text = render_selector(&servers, "s00", index, &[], area);
+            let marker = format!("CTX {}/9999", 1000 + index);
+            assert!(
+                text.contains(&marker),
+                "highlight {index} detail line ({marker}) must be visible at 80x15:\n{text}"
+            );
+        }
+
+        // Same invariant with a pinned overflow block shrinking the viewport to
+        // an odd height, matching the existing scrolled-overflow configuration
+        // (80x16, 16 servers, 2 overflow endpoints).
+        let servers: Vec<ServerSummary> = (0..16)
+            .map(|i| {
+                let mut server = summary(&format!("s{i:02}"), true, true, 1, 4);
+                server.context_used = Some(1000 + i);
+                server.context_size = 9999;
+                server
+            })
+            .collect();
+        let overflow = vec![
+            crate::app::ServerSpec {
+                key: "o1".to_string(),
+                endpoint: "http://10.0.0.9:8080".to_string(),
+                identity: None,
+            },
+            crate::app::ServerSpec {
+                key: "o2".to_string(),
+                endpoint: "http://10.0.0.10:8080".to_string(),
+                identity: None,
+            },
+        ];
+        let area = Rect::new(0, 0, 80, 16);
+        for index in 0..servers.len() {
+            let text = render_selector(&servers, "s00", index, &overflow, area);
+            let marker = format!("CTX {}/9999", 1000 + index);
+            assert!(
+                text.contains(&marker),
+                "highlight {index} detail line ({marker}) must be visible at 80x16 with overflow:\n{text}"
+            );
+            assert!(
+                text.contains("NOT MONITORED"),
+                "the pinned overflow block must stay visible at highlight {index}:\n{text}"
+            );
+        }
+    }
+
+    /// Render the selector and return it row by row, so a test can assert what
+    /// appears on one server's line (per-server, not merely "somewhere").
+    fn render_selector_rows(servers: &[ServerSummary], selected: &str, area: Rect) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_server_selector(frame, area, servers, selected, 0, &[]))
+            .unwrap();
+        let width = area.width as usize;
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect()
+    }
+
+    /// The two rendered lines (`header`, `detail`) of the selector entry whose
+    /// header carries `label` at the marker/label column.
+    fn selector_entry<'a>(rows: &'a [String], label: &str) -> (&'a str, &'a str) {
+        let pos = rows
+            .iter()
+            .position(|row| {
+                row.find(label).is_some_and(|byte| {
+                    let start = row[..byte].chars().count();
+                    let chars: Vec<char> = row.chars().collect();
+                    start >= 3
+                        && matches!(chars[start - 3], '>' | ' ')
+                        && matches!(chars[start - 2], '*' | ' ')
+                        && chars[start - 1] == ' '
+                })
+            })
+            .unwrap_or_else(|| panic!("no selector entry for {label}: {rows:?}"));
+        (
+            rows[pos].as_str(),
+            rows.get(pos + 1).map(String::as_str).unwrap_or(""),
+        )
+    }
+
+    /// The `width` characters of `header` starting `offset` chars after `label`.
+    /// Used to assert a specific column rather than "somewhere on the row".
+    fn selector_cell_after_label(header: &str, label: &str, offset: usize, width: usize) -> String {
+        let byte = header
+            .find(label)
+            .unwrap_or_else(|| panic!("label {label} not in {header:?}"));
+        let start = header[..byte].chars().count() + offset;
+        header.chars().skip(start).take(width).collect()
+    }
+
+    /// Char offset from the label to the activity-phase column: the label cell
+    /// (16 + 1) plus the state cell (12 + 1).
+    const PHASE_OFFSET: usize = 17 + 13;
+    const PHASE_WIDTH: usize = 12;
+
+    #[test]
+    fn server_selector_shows_activity_phase_per_server() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut generating = summary("gen", true, true, 1, 1);
+        generating.phase = Some(ActivityPhase::Generating);
+        let mut prefilling = summary("prefill", true, true, 1, 1);
+        prefilling.phase = Some(ActivityPhase::Prefill);
+        let mut idle = summary("quiet", true, true, 0, 1);
+        idle.phase = Some(ActivityPhase::Idle);
+        // No telemetry at all: the phase must stay unknown, never `IDLE`.
+        let unknown = summary("unknown", false, false, 0, 0);
+        // A dropped connection keeps an explicit held-state label.
+        let mut reconnecting = summary("recon", false, false, 0, 0);
+        reconnecting.reconnecting = true;
+        reconnecting.phase = Some(ActivityPhase::Reconnecting);
+        let servers = vec![generating, prefilling, idle, unknown, reconnecting];
+        let rows = render_selector_rows(&servers, "gen", area);
+
+        // Check the phase column itself, not just "somewhere on the row".
+        for (label, expected) in [
+            ("gen", "GENERATING"),
+            ("prefill", "PREFILL"),
+            ("quiet", "IDLE"),
+            ("recon", "RECONNECTING"),
+        ] {
+            let (header, _) = selector_entry(&rows, label);
+            let cell = selector_cell_after_label(header, label, PHASE_OFFSET, PHASE_WIDTH);
+            assert_eq!(
+                cell.trim(),
+                expected,
+                "phase column of {label} must read {expected}: {rows:?}"
+            );
+        }
+
+        let (unknown_header, _) = selector_entry(&rows, "unknown");
+        let unknown_cell =
+            selector_cell_after_label(unknown_header, "unknown", PHASE_OFFSET, PHASE_WIDTH);
+        assert_eq!(
+            unknown_cell.trim(),
+            "—",
+            "a missing phase must render — in the phase column: {rows:?}"
+        );
+        assert_ne!(
+            unknown_cell.trim(),
+            "IDLE",
+            "a missing phase must not be guessed as IDLE: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn server_selector_shows_measurement_age_and_interval() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut fresh = summary("fresh", true, true, 1, 1);
+        fresh.sample_interval_ms = Some(100.0);
+        fresh.age_ms = Some(95);
+        // Connected but the interval EMA is not known yet: show the age, not a
+        // fabricated interval or `—`.
+        let mut warming = summary("warming", true, true, 0, 1);
+        warming.age_ms = Some(1_500);
+        let mut stale = summary("stale", false, false, 0, 0);
+        stale.age_ms = Some(2_400);
+        // Never measured: no age, must render `—` rather than `0`. Slot/CTX are
+        // known so the sample is the only `—` on the row.
+        let mut never = summary("never", false, true, 0, 2);
+        never.context_used = Some(1);
+        never.context_size = 2;
+        never.generation_tps = Some(1.0);
+        let rows = render_selector_rows(&[fresh, warming, stale, never], "fresh", area);
+
+        let (_, fresh_detail) = selector_entry(&rows, "fresh");
+        assert!(
+            fresh_detail.contains("~100 ms avg"),
+            "a connected server shows its sample interval: {rows:?}"
+        );
+        let (_, warming_detail) = selector_entry(&rows, "warming");
+        assert!(
+            warming_detail.contains("1.5 s ago"),
+            "a connected server without an interval yet shows its age: {rows:?}"
+        );
+        let (_, stale_detail) = selector_entry(&rows, "stale");
+        assert!(
+            stale_detail.contains("2.4 s ago"),
+            "a stale server shows its measurement age: {rows:?}"
+        );
+        let (_, never_detail) = selector_entry(&rows, "never");
+        assert!(
+            never_detail.contains("—"),
+            "a never-measured server shows —: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn server_selector_keeps_phase_age_ctx_tps_and_backend_visible_at_80_columns() {
+        // Required fields must all be readable on an 80-column terminal without
+        // any value being sliced in half (a truncated CTX would look like a
+        // different, real value).
+        let area = Rect::new(0, 0, 80, 20);
+        let mut server = summary("model", true, true, 1, 4);
+        server.phase = Some(ActivityPhase::Generating);
+        server.backend = crate::domain::ServerBackend::LlamaCpp;
+        server.context_used = Some(32768);
+        server.context_size = 131072;
+        server.generation_tps = Some(20.5);
+        server.sample_interval_ms = Some(100.0);
+        server.age_ms = Some(95);
+        let rows = render_selector_rows(&[server], "model", area);
+        let (header, detail) = selector_entry(&rows, "model");
+
+        assert!(
+            detail.contains("CTX 32768/131072"),
+            "the full CTX value must survive at 80 columns: {rows:?}"
+        );
+        assert!(
+            detail.contains("20.5 tok/s"),
+            "tok/s must be visible at 80 columns: {rows:?}"
+        );
+        assert!(
+            detail.contains("~100 ms avg"),
+            "the measurement age/interval must be visible: {rows:?}"
+        );
+        assert!(
+            detail.contains("S 1/4"),
+            "slot counts must stay visible: {rows:?}"
+        );
+        let phase = selector_cell_after_label(header, "model", PHASE_OFFSET, PHASE_WIDTH);
+        assert_eq!(
+            phase.trim(),
+            "GENERATING",
+            "phase missing at 80 columns: {rows:?}"
+        );
+        assert!(
+            header.contains("llama.cpp"),
+            "the backend label must be visible at 80 columns: {rows:?}"
+        );
+    }
+
+    fn render_dashboard(
+        width: u16,
+        height: u16,
+        refresh_ms: u64,
+        llm: &LlmStats,
+        state: &mut UiState,
+    ) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let system = SystemStats::default();
+        let gpu = GpuStats::default();
+        let servers = vec![summary("only", true, true, 1, 4)];
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &system,
+                    llm,
+                    &gpu,
+                    &GpuMapping::None,
+                    &servers,
+                    "only",
+                    &[],
+                    state,
+                    "http://127.0.0.1:8080",
+                    refresh_ms,
+                    false,
+                )
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn small_terminal_between_floors_draws_the_reduced_layout() {
+        let llm = LlmStats {
+            connected: true,
+            model: "tiny-ork".to_string(),
+            context_size: 4096,
+            context_used: Some(1024),
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+
+        let text = render_dashboard(60, 18, 1000, &llm, &mut state);
+        assert!(
+            !text.contains("needs at least"),
+            "60x18 is above the hard floor and must not be a dead end:\n{text}"
+        );
+        assert!(
+            text.contains("ONLINE"),
+            "connection status missing:\n{text}"
+        );
+        assert!(text.contains("CTX"), "context short info missing:\n{text}");
+        assert!(
+            text.contains("tiny-ork"),
+            "model short info missing:\n{text}"
+        );
+
+        // Exactly the hard floor is still usable, not the dead-end notice.
+        let text = render_dashboard(54, 16, 1000, &llm, &mut state);
+        assert!(
+            !text.contains("needs at least"),
+            "54x16 is the hard floor and stays usable:\n{text}"
+        );
+        assert!(text.contains("ONLINE"), "status lost at the floor:\n{text}");
+    }
+
+    #[test]
+    fn below_the_hard_floor_still_shows_the_notice() {
+        let llm = LlmStats::default();
+        let mut state = UiState::default();
+        let text = render_dashboard(53, 15, 1000, &llm, &mut state);
+        assert!(
+            text.contains("needs at least"),
+            "below the floor must show the notice:\n{text}"
+        );
+        assert!(
+            !text.contains("ONLINE"),
+            "no status below the floor:\n{text}"
+        );
+    }
+
+    #[test]
+    fn full_layout_is_used_from_72x22() {
+        let llm = LlmStats {
+            connected: true,
+            model: "tiny-ork".to_string(),
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        let text = render_dashboard(72, 22, 1000, &llm, &mut state);
+        assert!(
+            !text.contains("compact"),
+            "72x22 uses the full layout, not the compact one:\n{text}"
+        );
+    }
+
+    #[test]
+    fn compact_layout_help_is_visible_at_the_hard_floor() {
+        // `[h]` is advertised by the compact hint, so help must render
+        // something even where the full popup does not fit (heights 16..19).
+        // Regression for the invisible, key-swallowing help mode.
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        assert!(state.is_help_open());
+        let text = render_dashboard(54, 16, 1000, &llm, &mut state);
+        assert!(
+            text.contains("HELP") && text.contains("close help"),
+            "help must be visible at 54x16:\n{text}"
+        );
+        assert!(!text.contains("needs at least"), "{text}");
+    }
+
+    #[test]
+    fn compact_layout_shows_an_open_process_search() {
+        // The compact layout has no process table or footer, so an open search
+        // must still be visible; otherwise typing vanishes into a hidden mode.
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.open_process_search();
+        state.process_search_insert_char('l');
+        state.process_search_insert_char('l');
+        state.process_search_insert_char('a');
+        let text = render_dashboard(60, 18, 1000, &llm, &mut state);
+        assert!(
+            text.contains("SEARCH"),
+            "search mode must be visible:\n{text}"
+        );
+        assert!(text.contains("/lla"), "query must be visible:\n{text}");
+        assert!(text.contains("Esc cancel"), "cancel hint missing:\n{text}");
+    }
+
+    #[test]
+    fn compact_hint_fits_at_the_hard_floor_with_a_five_digit_refresh() {
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        let text = render_dashboard(54, 16, 10_000, &llm, &mut state);
+        assert!(
+            text.contains("10000ms"),
+            "refresh interval missing:\n{text}"
+        );
+        assert!(
+            text.contains("esc quit"),
+            "quit hint must still fit at 54 wide:\n{text}"
+        );
+    }
+
+    #[test]
+    fn server_selector_overflow_continuation_counts_missing_entries_exactly() {
+        // 16 servers + 10 overflow endpoints at 80x16: inner height 10, the
+        // pinned block is capped at half (5 rows = header + 3 entries + the
+        // continuation marker), so exactly 7 endpoint rows are hidden.
+        let servers: Vec<ServerSummary> = (0..16)
+            .map(|i| summary(&format!("s{i:02}"), true, true, 1, 4))
+            .collect();
+        let overflow: Vec<crate::app::ServerSpec> = (0..10)
+            .map(|i| crate::app::ServerSpec {
+                key: format!("o{i}"),
+                endpoint: format!("http://10.0.0.{}:8080", 10 + i),
+                identity: None,
+            })
+            .collect();
+        let area = Rect::new(0, 0, 80, 16);
+        let text = render_selector(&servers, "s00", 0, &overflow, area);
+        assert!(
+            text.contains("NOT MONITORED"),
+            "overflow header must stay visible:\n{text}"
+        );
+        assert!(
+            text.contains("7 more not monitored"),
+            "continuation must count the hidden endpoints exactly:\n{text}"
+        );
+    }
+
+    #[test]
+    fn uses_full_layout_matches_the_compact_thresholds() {
+        assert!(!uses_full_layout(54, 16));
+        assert!(!uses_full_layout(71, 21));
+        assert!(!uses_full_layout(100, 21));
+        assert!(!uses_full_layout(71, 40));
+        assert!(uses_full_layout(72, 22));
+        assert!(uses_full_layout(120, 40));
     }
 
     #[test]
@@ -3376,6 +4104,33 @@ mod tests {
             !text.contains("0.0%"),
             "no capacity means the percentage is unknown:\n{text}"
         );
+    }
+
+    #[test]
+    fn watermark_is_not_shown_as_current_context_occupancy() {
+        // /slots is down but /metrics answered: the CTX row must render the
+        // occupancy as unknown (`— / capacity`) instead of presenting the
+        // historical high-water mark as the current context.
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            slots_available: false,
+            model: "test-model".to_string(),
+            context_size: 4096,
+            context_used: None,
+            context_high_watermark: Some(2048),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            text.contains("— / 4,096 tok"),
+            "unknown occupancy must stay unknown, got:\n{text}"
+        );
+        assert!(
+            !text.contains("2,048"),
+            "the historical watermark must not appear as current CTX, got:\n{text}"
+        );
+        assert!(!text.contains("0.0%"), "unknown is not 0.0%:\n{text}");
     }
 
     #[test]

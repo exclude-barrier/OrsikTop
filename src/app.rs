@@ -26,8 +26,8 @@ use crate::{
     discovery_llm::LocalServerIdentity,
     domain::{
         DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessIdentity, ProcessStats,
-        ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
-        MIN_REFRESH_MS, REFRESH_STEP_MS,
+        ServerBackend, ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS,
+        MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
     drm::{sample_process_gpus, DrmSamplerState},
     gpu::new_gpu_provider,
@@ -49,6 +49,77 @@ const SLOW_SENSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 /// a single `/proc` scan, never per UI frame. Manual endpoints are static, so
 /// no scan happens for them.
 const SERVER_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum time the render loop may go without repainting when nothing changed.
+///
+/// The loop used to repaint in every iteration, and an idle iteration was
+/// bounded by `event::poll(50 ms)` — about 20 full redraws per second with no
+/// new data. A repaint now happens only when the visible state changed or when
+/// this tick elapses. The tick is kept because parts of the view are
+/// wall-clock-relative ("{age} ago", uptime) and the transient CONNECTED flash
+/// must be able to expire; 250 ms bounds that staleness while an idle dashboard
+/// drops to ~4 repaints/s.
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Upper bound on how long `event::poll` may block before the loop re-checks
+/// its channels. This preserves the original ~50 ms data-drain latency, so a
+/// configured 100 ms refresh still reaches the screen promptly; only the
+/// repaint itself is paced, not the collection cadence.
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Paces repaints for the render loop.
+///
+/// A repaint is requested (`mark_dirty`) whenever an applied snapshot/sample or
+/// an input event can change what is on screen; `should_paint` also fires once
+/// per `interval` so time-relative text keeps advancing while idle. Keeping the
+/// decision in one place is what makes the idle redraw rate measurable without
+/// a terminal.
+struct RedrawScheduler {
+    dirty: bool,
+    next_tick: Instant,
+    interval: Duration,
+}
+
+impl RedrawScheduler {
+    fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            dirty: true,
+            next_tick: now,
+            interval,
+        }
+    }
+
+    /// Request a repaint at the next opportunity (state or input changed).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Whether the view must be painted at `now`. Advances the idle tick on
+    /// every paint so a stationary dashboard repaints at a bounded rate.
+    fn should_paint(&mut self, now: Instant) -> bool {
+        if self.dirty || now >= self.next_tick {
+            self.dirty = false;
+            self.next_tick = now + self.interval;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// How long `event::poll` may block. A dirty view returns zero so the
+    /// repaint is not delayed; a clean view waits for the next idle tick but
+    /// never longer than `MAX_POLL_INTERVAL`, so newly arrived samples are
+    /// still drained promptly. Input wakes the poll immediately either way.
+    fn poll_timeout(&self, now: Instant) -> Duration {
+        if self.dirty {
+            Duration::ZERO
+        } else {
+            self.next_tick
+                .saturating_duration_since(now)
+                .min(MAX_POLL_INTERVAL)
+        }
+    }
+}
 
 pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -141,10 +212,15 @@ pub fn run(
     let mut snapshot = DashboardSnapshot::default();
     let mut ui_state = UiState::default();
     let mut last_server_resync = Instant::now();
+    let mut scheduler = RedrawScheduler::new(Instant::now(), IDLE_REDRAW_INTERVAL);
 
     loop {
+        // Each applied fast snapshot can change the overview; repaint on the
+        // next iteration rather than waiting for the idle tick. Fast snapshots
+        // have no rejection path — only LLM samples are filtered (below).
         while let Ok(next) = fast_rx.try_recv() {
             apply_fast_snapshot(&mut snapshot, &mut ui_state, mapping_generation, next);
+            scheduler.mark_dirty();
         }
         while let Ok(next) = llm_rx.try_recv() {
             // Drop results produced for a server set we already replaced, or
@@ -164,8 +240,11 @@ pub fn run(
             if is_selected {
                 snapshot.llm = next.stats;
             }
+            // An accepted sample changes the overview and/or the active view.
+            scheduler.mark_dirty();
         }
-        snapshot.servers = build_server_summaries(&order, &endpoints, &registry);
+        snapshot.servers =
+            build_server_summaries(&order, &endpoints, &registry, &ui_state, Instant::now());
         snapshot.selected_server = selected.clone();
 
         // S16: an auto-discovered server is dynamic — it can restart on the
@@ -193,26 +272,33 @@ pub fn run(
                 &mut ui_state,
             );
             last_server_resync = Instant::now();
+            // A resync can add/remove/replace a monitored server.
+            scheduler.mark_dirty();
         }
 
-        terminal.draw(|frame| {
-            ui::draw(
-                frame,
-                &snapshot.system,
-                &snapshot.llm,
-                &snapshot.gpu,
-                &snapshot.gpu_map,
-                &snapshot.servers,
-                &snapshot.selected_server,
-                &overflow,
-                &mut ui_state,
-                &resolved.endpoint,
-                refresh_ms,
-                resolved.auto,
-            )
-        })?;
+        if scheduler.should_paint(Instant::now()) {
+            terminal.draw(|frame| {
+                ui::draw(
+                    frame,
+                    &snapshot.system,
+                    &snapshot.llm,
+                    &snapshot.gpu,
+                    &snapshot.gpu_map,
+                    &snapshot.servers,
+                    &snapshot.selected_server,
+                    &overflow,
+                    &mut ui_state,
+                    &resolved.endpoint,
+                    refresh_ms,
+                    resolved.auto,
+                )
+            })?;
+        }
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(scheduler.poll_timeout(Instant::now()))? {
+            // Any input/resize can change the rendered view; let the next
+            // iteration repaint promptly instead of waiting for the idle tick.
+            scheduler.mark_dirty();
             match event::read()? {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Repeat
@@ -400,19 +486,28 @@ pub fn run(
                             // Any left-click away from a process row releases the pinned process.
                             ui_state.clear_process_selection();
 
-                            let (width, _) = crossterm::terminal::size()?;
-                            let header = Rect::new(0, 0, width, 3);
+                            let (width, height) = crossterm::terminal::size()?;
                             let mut handled = false;
-                            if let Some(controls) = ui::refresh_controls(header) {
-                                if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
-                                    change_refresh(&mut refresh_ms, false, &refresh_shared);
-                                    settings.refresh_ms = refresh_ms;
-                                    handled = true;
-                                } else if ui::rect_contains(controls.plus, mouse.column, mouse.row)
-                                {
-                                    change_refresh(&mut refresh_ms, true, &refresh_shared);
-                                    settings.refresh_ms = refresh_ms;
-                                    handled = true;
+                            // The refresh buttons only exist in the full
+                            // layout; in the compact range those cells show the
+                            // status line, so a click there must not change the
+                            // interval behind an invisible control.
+                            if ui::uses_full_layout(width, height) {
+                                let header = Rect::new(0, 0, width, 3);
+                                if let Some(controls) = ui::refresh_controls(header) {
+                                    if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
+                                        change_refresh(&mut refresh_ms, false, &refresh_shared);
+                                        settings.refresh_ms = refresh_ms;
+                                        handled = true;
+                                    } else if ui::rect_contains(
+                                        controls.plus,
+                                        mouse.column,
+                                        mouse.row,
+                                    ) {
+                                        change_refresh(&mut refresh_ms, true, &refresh_shared);
+                                        settings.refresh_ms = refresh_ms;
+                                        handled = true;
+                                    }
                                 }
                             }
                             if !handled {
@@ -524,10 +619,17 @@ fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
 }
 
 /// Build the compact per-server summaries for the overview, in `order`.
+///
+/// All new per-server fields are pure derivations from already-collected data:
+/// the activity phase and backend come from that server's `LlmStats`, and the
+/// measurement age / sample interval from its own per-server UI history — no
+/// extra polling and no telemetry-semantics change.
 fn build_server_summaries(
     order: &[String],
     endpoints: &BTreeMap<String, String>,
     registry: &BTreeMap<String, LlmStats>,
+    ui_state: &UiState,
+    now: Instant,
 ) -> Vec<ServerSummary> {
     order
         .iter()
@@ -544,6 +646,12 @@ fn build_server_summaries(
                 label,
                 connected: stats.is_some_and(|stats| stats.connected && !stats.reconnecting),
                 reconnecting: stats.is_some_and(|stats| stats.reconnecting),
+                // Absent telemetry leaves the phase unknown (`—`), never a
+                // guessed `IDLE`; a server with evidence carries its phase.
+                phase: stats.and_then(crate::llama::activity_phase),
+                age_ms: ui_state.server_sample_age_ms(key, now),
+                sample_interval_ms: ui_state.server_sample_interval_ms(key),
+                backend: stats.map_or(ServerBackend::Unknown, |stats| stats.backend),
                 // Slot availability is propagated explicitly so an absent or
                 // failed `/slots` never collapses to a fabricated `0/0`.
                 slots_available: stats.is_some_and(|stats| stats.slots_available),
@@ -2555,7 +2663,13 @@ mod tests {
             },
         );
 
-        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].label, "model-A");
         assert!(summaries[0].connected);
@@ -2630,7 +2744,13 @@ mod tests {
             },
         );
 
-        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
         assert!(!summaries[0].slots_available, "metrics-only slots unknown");
         assert!(summaries[0].connected, "metrics-only server is connected");
         assert_eq!(
@@ -2648,6 +2768,105 @@ mod tests {
         assert!(!summaries[3].slots_available);
         // No cross-server contamination: each summary reflects only its own key.
         assert_ne!(summaries[2].slot_count, summaries[1].slot_count);
+    }
+
+    #[test]
+    fn build_server_summaries_derives_phase_age_and_backend() {
+        use crate::domain::ActivityPhase;
+        use crate::strata::StrataPhase;
+
+        let order = vec![
+            "gen".to_string(),
+            "quiet".to_string(),
+            "strata".to_string(),
+            "offline_reg".to_string(),
+            "off".to_string(),
+        ];
+        let mut endpoints = BTreeMap::new();
+        for key in &order {
+            endpoints.insert(key.clone(), format!("http://{key}:8080"));
+        }
+        let mut registry = BTreeMap::new();
+        registry.insert(
+            "gen".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                generation_tps: Some(20.0),
+                backend: ServerBackend::LlamaCpp,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "quiet".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                backend: ServerBackend::LlamaCpp,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "strata".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                strata_phase: Some(StrataPhase::Reading),
+                backend: ServerBackend::Strata,
+                ..Default::default()
+            },
+        );
+        // A registry entry that is currently not answering: its phase must be
+        // unknown (`None`), never a guessed `IDLE`.
+        registry.insert(
+            "offline_reg".to_string(),
+            LlmStats {
+                connected: false,
+                ..Default::default()
+            },
+        );
+        // "off" has no registry entry at all: never sampled.
+
+        let mut ui_state = UiState::default();
+        for key in ["gen", "quiet", "strata"] {
+            ui_state.record_llm_sample(
+                key,
+                "gen",
+                &LlmStats {
+                    connected: true,
+                    metrics_available: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let now = Instant::now();
+        let summaries = build_server_summaries(&order, &endpoints, &registry, &ui_state, now);
+
+        assert_eq!(summaries[0].phase, Some(ActivityPhase::Generating));
+        assert_eq!(summaries[1].phase, Some(ActivityPhase::Idle));
+        assert_eq!(summaries[2].phase, Some(ActivityPhase::Prefill));
+        assert_eq!(
+            summaries[3].phase, None,
+            "a not-answering registry entry stays unknown, not IDLE"
+        );
+        assert_eq!(
+            summaries[4].phase, None,
+            "never sampled stays unknown, not IDLE"
+        );
+
+        assert_eq!(summaries[0].backend, ServerBackend::LlamaCpp);
+        assert_eq!(summaries[2].backend, ServerBackend::Strata);
+        assert_eq!(summaries[4].backend, ServerBackend::Unknown);
+
+        assert!(summaries[0].age_ms.is_some(), "sampled server has an age");
+        assert!(
+            summaries[3].age_ms.is_none(),
+            "a not-answering server has no fresh age"
+        );
+        assert!(
+            summaries[4].age_ms.is_none(),
+            "a server that never answered has no age, never a fake 0"
+        );
     }
 
     #[test]
@@ -2876,5 +3095,91 @@ mod tests {
         b_stop.store(true, Ordering::Relaxed);
         let _ = a_handle.join();
         let _ = b_handle.join();
+    }
+
+    #[test]
+    fn idle_repaint_is_skipped_until_the_tick() {
+        let start = Instant::now();
+        let mut scheduler = RedrawScheduler::new(start, IDLE_REDRAW_INTERVAL);
+
+        // The first frame always paints; with no state change the view is then
+        // left untouched until the idle tick elapses.
+        assert!(scheduler.should_paint(start));
+        assert!(!scheduler.should_paint(start + Duration::from_millis(50)));
+        assert!(!scheduler.should_paint(start + Duration::from_millis(249)));
+
+        // A real change paints immediately instead of waiting for the tick.
+        scheduler.mark_dirty();
+        assert!(scheduler.should_paint(start + Duration::from_millis(100)));
+        assert!(!scheduler.should_paint(start + Duration::from_millis(101)));
+    }
+
+    #[test]
+    fn poll_timeout_never_delays_a_repaint_and_bounds_the_drain_latency() {
+        let start = Instant::now();
+        let mut scheduler = RedrawScheduler::new(start, IDLE_REDRAW_INTERVAL);
+
+        // Dirty view: `event::poll` must not block, so the frame is drawn now.
+        assert_eq!(scheduler.poll_timeout(start), Duration::ZERO);
+        assert!(scheduler.should_paint(start));
+        // Clean view: the poll is capped, so newly arrived samples are drained
+        // promptly even when the next idle tick is still far away.
+        assert_eq!(scheduler.poll_timeout(start), MAX_POLL_INTERVAL);
+        assert_eq!(
+            scheduler.poll_timeout(start + Duration::from_millis(240)),
+            Duration::from_millis(10)
+        );
+    }
+
+    /// Simulates the production loop for one second and returns how many times
+    /// it painted. The loop advances by `poll_timeout`, exactly as the real
+    /// `event::poll` bounds an iteration; `snapshot_interval` models the fast
+    /// worker pushing a (repaint-forcing) snapshot on that cadence, and `None`
+    /// models a loop that receives no new data at all.
+    fn simulated_idle_redraws(snapshot_interval: Option<Duration>) -> usize {
+        let one_second = Duration::from_secs(1);
+        let start = Instant::now();
+        let mut scheduler = RedrawScheduler::new(start, IDLE_REDRAW_INTERVAL);
+        let mut now = Duration::ZERO;
+        let mut next_snapshot = snapshot_interval;
+        let mut redraws = 0usize;
+        while now < one_second {
+            if let (Some(interval), Some(at)) = (snapshot_interval, next_snapshot) {
+                if now >= at {
+                    scheduler.mark_dirty();
+                    next_snapshot = Some(at + interval);
+                }
+            }
+            if scheduler.should_paint(start + now) {
+                redraws += 1;
+            }
+            now += scheduler.poll_timeout(start + now);
+        }
+        redraws
+    }
+
+    #[test]
+    fn idle_redraw_rate_is_cut_from_the_50ms_poll_to_the_tick() {
+        // Before: an idle iteration was bounded by `event::poll(50 ms)` and the
+        // loop painted every iteration => 20 full redraws per second.
+        let before =
+            Duration::from_secs(1).as_millis() as usize / MAX_POLL_INTERVAL.as_millis() as usize;
+        assert_eq!(before, 20, "documented pre-change idle redraw rate");
+
+        // After: with no state change and no input, only the idle tick paints.
+        let idle = simulated_idle_redraws(None);
+        assert!(idle < before, "idle redraws {idle} not below {before}");
+        assert!(idle <= 4, "idle redraws {idle}/s exceed the ~4/s budget");
+
+        // A fast snapshot on the default 1000 ms cadence lands on the idle tick,
+        // so it adds nothing; a 100 ms cadence roughly doubles the rate. These
+        // bound the real idle rate (not just the scheduler floor).
+        assert_eq!(
+            simulated_idle_redraws(Some(Duration::from_millis(1_000))),
+            idle
+        );
+        let fast = simulated_idle_redraws(Some(Duration::from_millis(100)));
+        assert_eq!(fast, 10, "100 ms snapshots should yield ~10 redraws/s");
+        assert!(fast < before);
     }
 }

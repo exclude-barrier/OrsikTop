@@ -788,6 +788,65 @@ pub struct FastSnapshot {
     pub mapping_generation: u64,
 }
 
+/// Coarse activity phase of a monitored server, derived from that server's own
+/// telemetry. Used only for presentation in the multi-server overview; a server
+/// with no reliable evidence has no phase (`None`), which renders `—` — it is
+/// never guessed into `IDLE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityPhase {
+    /// Connected and no request activity reported.
+    Idle,
+    /// Reading the prompt (prefill).
+    Prefill,
+    /// Producing tokens (decode).
+    Generating,
+    /// A request is in flight without a reported rate (aggregate activity).
+    Processing,
+    /// Requests are deferred waiting for a free slot.
+    Queued,
+    /// The connection is being re-established; held state, not live activity.
+    Reconnecting,
+}
+
+impl ActivityPhase {
+    /// Short uppercase label shown in the overview.
+    pub fn label(self) -> &'static str {
+        match self {
+            ActivityPhase::Idle => "IDLE",
+            ActivityPhase::Prefill => "PREFILL",
+            ActivityPhase::Generating => "GENERATING",
+            ActivityPhase::Processing => "PROCESSING",
+            ActivityPhase::Queued => "QUEUED",
+            ActivityPhase::Reconnecting => "RECONNECTING",
+        }
+    }
+}
+
+/// Which inference backend a monitored server appears to be, derived from
+/// already-collected per-server telemetry (no new probing). `Unknown` covers a
+/// server that has never answered and cannot be classified without guessing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerBackend {
+    /// No reliable evidence yet — rendered `—`, never an assumed backend.
+    #[default]
+    Unknown,
+    /// llama.cpp: a recognised Prometheus `/metrics` exposition.
+    LlamaCpp,
+    /// Strata: a recognised JSON telemetry object / reported live phase.
+    Strata,
+}
+
+impl ServerBackend {
+    /// Display label; an unknown backend is shown as `—` (never a guess).
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerBackend::Unknown => "—",
+            ServerBackend::LlamaCpp => "llama.cpp",
+            ServerBackend::Strata => "Strata",
+        }
+    }
+}
+
 /// Compact per-server status for the multi-server overview and selector.
 ///
 /// This carries only what the overview needs; the full [`LlmStats`] for the
@@ -803,6 +862,23 @@ pub struct ServerSummary {
     pub label: String,
     pub connected: bool,
     pub reconnecting: bool,
+    /// A server-reported activity phase, or `None` when there is no reliable
+    /// evidence (a server that has never answered, or is offline). Never a
+    /// guessed `IDLE`.
+    pub phase: Option<ActivityPhase>,
+    /// Milliseconds since this server's last successful measurement. `None`
+    /// when it has never answered, rendering `—` rather than a fabricated `0`.
+    /// The overview shows this only when the server is not answering, or its
+    /// sample interval is not yet known; a connected server with a known
+    /// interval shows that interval (`~N ms avg`) instead, mirroring the
+    /// selected-server panel.
+    pub age_ms: Option<u64>,
+    /// Smoothed sample interval (ms) while connected, from the same per-server
+    /// history as the selected-server panel. `None` until a second sample
+    /// arrives; the overview then shows the interval for a connected server.
+    pub sample_interval_ms: Option<f64>,
+    /// Backend inferred from already-collected per-server telemetry.
+    pub backend: ServerBackend,
     /// True when the server's `/slots` endpoint answered with a valid array in
     /// this sample. Only then are [`Self::slot_count`] and
     /// [`Self::busy_slots`] real; otherwise the slot count is unknown and must
