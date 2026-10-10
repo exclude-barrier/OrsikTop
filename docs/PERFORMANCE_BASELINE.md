@@ -396,6 +396,139 @@ keine Konfiguration, `src/strata.rs` unverändert. Die Messungen liefen
 ausschließlich über das freigegebene cf-desktop-Gate (`pc-project cargo test`),
 mit Host, Toolchain, Snapshot-Hash, Exitcode und Rohlog belegt.
 
+## CFA-36 — Prozesskollektor: DRM-fd-Scan optimiert (Vorher/Nachher)
+
+Dieser Abschnitt gehört zu **CFA-36** (EPIC 3.2 „Nur bestätigte Engpässe
+optimieren“). Er baut auf dem `#[ignore]`-Benchmark aus CFA-35 auf, der seit der
+operator-freigegebenen Runner-Verdrahtung im Gate ausführbar ist. **Alle Werte
+sind Debug-Testprofil-Werte** (`test`, unoptimized + debuginfo) auf `cf-desktop`,
+gemessen über das Gate
+`pc-project cargo test --all-targets --locked -- --ignored --test-threads=1 perf_baseline_soak_and_process_collection_benchmark`.
+
+### Engpass-Analyse (belegt)
+
+Der Benchmark wurde um eine **Komponenten-Aufteilung** des Kollektors erweitert
+(zwei zusätzliche `ORSKTOP_BENCH`-Größen, nur im `#[ignore]`-Test): der
+Prozesszyklus ist die Summe aus dem Thread-Zähler-Lesen (`/proc/<pid>/status`,
+eine Datei je Prozess) und dem DRM-fd-Scan (`/proc/<pid>/fd` + `fdinfo`, je
+Prozess). Über die Läufe hinweg dominiert der **DRM-fd-Scan** klar:
+
+| Größe | typischer Wert (Debug) | Anteil |
+| --- | --- | --- |
+| `process_threads_read_total_us` | ~15 000–22 000 µs (ganze Tabelle) | ~5–10 % |
+| `process_drm_scan_total_us` | ~260 000–295 000 µs (ganze Tabelle) | **~90–95 %** |
+| `process_collect_mean_us` | ~277 000–318 000 µs | (Summe + Aggregation) |
+
+Eine einmalige Detailmessung (Instrumentierung während der Analyse, 1806 bzw.
+1805 Prozesse, **einmalige Diagnose, nicht Teil des Dauer-Benchmarks**;
+Artifacts `1233195fe2cc44e1946ceb0f3ceaf3ba` und
+`e793e4fdd4cd43039a70572233adb6d6`) trennt den Scan weiter auf:
+
+| Phase | Wert | Anteil am Scan | Anzahl |
+| --- | --- | --- | --- |
+| fd-Verzeichnis listen (gesamte Listenphase je `fd`-Verzeichnis) | ~164 000–178 000 µs | ~32 % | 1 306–1 307 lesbare `fd`-Verzeichnisse, **~295 000–305 000 fds** |
+| je fd `readlink` (`symlink_target`) | ~351 000–393 000 µs | **~68 %** | ~295 000–305 000 readlink-Aufrufe |
+
+Die ~32 % sind die **gesamte Listenphase**; welcher Anteil davon auf
+`file_type()` entfällt, ist **nicht getrennt gemessen**. Ebenso ist **nicht
+getrennt gemessen**, wie viel `read_dir_names` allein (ohne
+`symlink_target_starts_with` und Puffer-Wiederverwendung) zum Gewinn beiträgt.
+
+Damit ist belegt: **Der bestätigte Engpass ist der DRM-fd-Scan**, und darin das
+**je fd anfallende `readlink`** (ein Syscall je offenem fd). Die Anzahl der
+Syscalls ist ohne Caching/Staleness-Kompromiss nicht reduzierbar; reduzierbar
+sind die **Allokationen** um diesen Syscall herum (Debug-Profil).
+
+### Optimierung (verlustfrei)
+
+Zwei kleine, generische Erweiterungen der `system::Sys`-Naht (beide mit
+Default-Impl, also für `FixtureSys`/weitere Implementierungen automatisch
+korrekt) plus eine Änderung des Scans in `src/drm.rs`:
+
+- `read_dir_names` — listet nur die **Namen** eines Verzeichnisses, ohne die
+  `file_type()`-Klassifikation je Eintrag; der fd-Scan braucht nur die fd-Nummern
+  (`/proc/<pid>/fd` enthält keine Unterverzeichnisse).
+- `symlink_target_starts_with` — prüft das Symlink-Ziel **byteweise** gegen ein
+  Präfix (`b"/dev/dri/"`), statt für **jeden** fd ein `String`-Ziel zu bauen
+  (`to_string_lossy().into_owned()`).
+- `sample_process_gpus` (`src/drm.rs`) baut den `/proc/<pid>/fd/<n>`- und
+  `/proc/<pid>/fdinfo/<n>`-Pfad in **wiederverwendeten Puffern** statt je fd neu
+  (`join`-Allokation).
+
+**Keine Semantikänderung:** Es wird weiterhin **jeder** offene fd genau einmal
+per `readlink` geprüft; der Vergleich `starts_with("/dev/dri/")` bleibt inhaltlich
+identisch (byteweise vs. `str`-Präfix). Die Telemetrie-Aktualität bleibt
+**unverändert** (gleiche Frequenz `process_refresh_ms`, gleiche Daten); es wird
+kein Wert zwischengespeichert.
+
+### Vorher/Nachher (gepaart, gleicher Host/Zustand)
+
+Um Host-Last als Störgröße auszuschließen, wurden Vorher- und Nachher-Zustand
+**unmittelbar hintereinander** gemessen (nahezu gleiche Prozesszahl, nur der Code
+`src/drm.rs`+`src/system.rs` getauscht). Der Vorher-Zustand ist der Stand
+`84da992`; der Nachher-Zustand ergänzt die o. g. Naht-Methoden. Nur Paar 3 hat
+eine **exakt identische** Prozesszahl; Paar 1 weicht um 3 und Paar 2 um 27
+Prozesse ab, daher ist die `Δ/prozess`-Spalte die belastbarere Größe. Drei Paare:
+
+| Paar | Prozesse (vor/nach) | `collect_mean` vor → nach (µs) | Δ | `drm_scan` vor → nach (µs) | Δ/prozess |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1755 / 1758 | 312 883 → 282 753 | **−9,6 %** | 288 010 → 265 316 | 164,1 → 150,9 µs (−8,0 %) |
+| 2 | 1782 / 1755 | 318 443 → 277 293 | **−12,9 %** | 296 191 → 256 696 | 166,2 → 146,3 µs (−12,0 %) |
+| 3 | 1752 / 1752 | 310 365 → 281 124 | **−9,4 %** | 289 496 → 261 397 | 165,2 → 149,2 µs (−9,7 %) |
+
+Ergebnis: ein **reproduzierbarer Gewinn von ~10 %** auf dem dominierenden
+Bauteil (`process_collect_mean_us` und `process_drm_scan_total_us`) bei
+**unveränderter Telemetrie** und ohne zusätzliche Syscalls.
+
+Rohbelege der sechs Läufe (cf-desktop-Gate, je `source_unchanged: true`,
+`exit 0`), Vorher → Nachher je Paar:
+`0066affd853547a1a92f35c368716149` → `6b43566779524dfc83a30795e3009d25`,
+`2244e523898d442985c4def8909ec28f` → `0910bec9e2514b22887f35b0d966e7ef`,
+`253590e0eecc4426b77f280505633ba5` → `f418628b3ddd4b55a252f6fad1956ba9`
+(unter `/home/chris/.local/share/paperclip-app/heavy-checks/…`).
+
+Ohne die Paarung wird der Gewinn **überschätzt**: ungepaarte Läufe auf
+wechselnd belastetem Host streuen stark (dieselbe unbeänderte Codebasis ergab
+`collect_mean` zwischen ~312 000 und ~697 000 µs), so dass der Vergleich nur
+**innerhalb** eines Paares belastbar ist. Das bestätigt die Streuungs-Warnung
+aus CFA-35 (F3).
+
+**Abgrenzung zum Operator-Baseline-Lauf.** Der Operator-Baseline-Lauf
+(`process_collect_mean_us=326054`, Snapshot `307184f3…`) lag in einem
+Niedriglast-Fenster und ist damit **kompatibel** mit dem hier gemessenen
+Nachher-Bereich (~277 000–282 000 µs). Der belastbare Vorher/Nachher-Vergleich
+ist deshalb der **gepaarte** oben, nicht der Vergleich gegen den einzelnen
+Operator-Lauf.
+
+### Gates (Nachher-Stand)
+
+| Gate | Ergebnis |
+| --- | --- |
+| `cargo fmt --all -- --check` | Exit 0 |
+| `cargo clippy --all-targets --locked -- -D warnings` | Exit 0 |
+| `cargo test --all-targets --locked` | Exit 0, `480 passed / 0 failed / 4 ignored` |
+
+Gemeinsamer Snapshot der drei Läufe: `f0efbba1736d06e23a8c18dad8af3e2996e2255566a5e07651b37d8a46a648f9`
+(Artifacts `548ebf087c1a4a869ca2fb5d1ace1ee5` / `27dd17ee939741629d6706af91fc6e6e` /
+`709bc6ae81cc46709aebec68e003c704`). **Hinweis:** Der Hash umfasst dieses
+Dokument; das Eintragen dieser Zeile erzeugt bereits einen neuen Snapshot, daher
+ist `f0efbba1…` der letzte gemessene Stand **vor** dieser Notiz. Die drei neuen
+Tests aus der Review-Nacharbeit (`real_read_dir_names_…`,
+`real_symlink_target_starts_with_…`, `default_and_real_naht_methods_…`) laufen im
+regulären (nicht-`#[ignore]`) Gate; die Testzahl steigt dadurch 477 → 480.
+
+### Offene Punkte / Restrisiko
+
+- Das verbleibende `readlink` je fd (der Syscall selbst) ist **nicht** ohne
+  Caching reduzierbar. Caching (fd→DRM-Menge je Prozess, seltener neu scannen)
+  würde die Telemetrie-Aktualität verschlechtern und verstößt gegen das
+  Abnahmekriterium „keine Verschlechterung der Telemetrie-Aktualität“; daher
+  **nicht** umgesetzt.
+- Die Sub-Aufteilung (readlink vs. klassifiziertes `read_dir`) stammt aus einer
+  **einmaligen** Analyse-Instrumentierung; der Dauer-Benchmark berichtet nur die
+  Komponenten-Aufteilung Thread-Read vs. DRM-Scan.
+- Kein Release-Profil; alle Werte gelten für das Debug-Testprofil (s. o.).
+
 ## Querverweise
 
 - `src/app.rs` — `RedrawScheduler`, `simulated_idle_redraws`, die zwei
