@@ -26,8 +26,8 @@ use crate::{
     discovery_llm::LocalServerIdentity,
     domain::{
         DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessIdentity, ProcessStats,
-        ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
-        MIN_REFRESH_MS, REFRESH_STEP_MS,
+        ServerBackend, ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS,
+        MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
     drm::{sample_process_gpus, DrmSamplerState},
     gpu::new_gpu_provider,
@@ -243,7 +243,8 @@ pub fn run(
             // An accepted sample changes the overview and/or the active view.
             scheduler.mark_dirty();
         }
-        snapshot.servers = build_server_summaries(&order, &endpoints, &registry);
+        snapshot.servers =
+            build_server_summaries(&order, &endpoints, &registry, &ui_state, Instant::now());
         snapshot.selected_server = selected.clone();
 
         // S16: an auto-discovered server is dynamic — it can restart on the
@@ -618,10 +619,17 @@ fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
 }
 
 /// Build the compact per-server summaries for the overview, in `order`.
+///
+/// All new per-server fields are pure derivations from already-collected data:
+/// the activity phase and backend come from that server's `LlmStats`, and the
+/// measurement age / sample interval from its own per-server UI history — no
+/// extra polling and no telemetry-semantics change.
 fn build_server_summaries(
     order: &[String],
     endpoints: &BTreeMap<String, String>,
     registry: &BTreeMap<String, LlmStats>,
+    ui_state: &UiState,
+    now: Instant,
 ) -> Vec<ServerSummary> {
     order
         .iter()
@@ -638,6 +646,12 @@ fn build_server_summaries(
                 label,
                 connected: stats.is_some_and(|stats| stats.connected && !stats.reconnecting),
                 reconnecting: stats.is_some_and(|stats| stats.reconnecting),
+                // Absent telemetry leaves the phase unknown (`—`), never a
+                // guessed `IDLE`; a server with evidence carries its phase.
+                phase: stats.and_then(crate::llama::activity_phase),
+                age_ms: ui_state.server_sample_age_ms(key, now),
+                sample_interval_ms: ui_state.server_sample_interval_ms(key),
+                backend: stats.map_or(ServerBackend::Unknown, |stats| stats.backend),
                 // Slot availability is propagated explicitly so an absent or
                 // failed `/slots` never collapses to a fabricated `0/0`.
                 slots_available: stats.is_some_and(|stats| stats.slots_available),
@@ -2649,7 +2663,13 @@ mod tests {
             },
         );
 
-        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].label, "model-A");
         assert!(summaries[0].connected);
@@ -2724,7 +2744,13 @@ mod tests {
             },
         );
 
-        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
         assert!(!summaries[0].slots_available, "metrics-only slots unknown");
         assert!(summaries[0].connected, "metrics-only server is connected");
         assert_eq!(
@@ -2742,6 +2768,105 @@ mod tests {
         assert!(!summaries[3].slots_available);
         // No cross-server contamination: each summary reflects only its own key.
         assert_ne!(summaries[2].slot_count, summaries[1].slot_count);
+    }
+
+    #[test]
+    fn build_server_summaries_derives_phase_age_and_backend() {
+        use crate::domain::ActivityPhase;
+        use crate::strata::StrataPhase;
+
+        let order = vec![
+            "gen".to_string(),
+            "quiet".to_string(),
+            "strata".to_string(),
+            "offline_reg".to_string(),
+            "off".to_string(),
+        ];
+        let mut endpoints = BTreeMap::new();
+        for key in &order {
+            endpoints.insert(key.clone(), format!("http://{key}:8080"));
+        }
+        let mut registry = BTreeMap::new();
+        registry.insert(
+            "gen".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                generation_tps: Some(20.0),
+                backend: ServerBackend::LlamaCpp,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "quiet".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                backend: ServerBackend::LlamaCpp,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "strata".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                strata_phase: Some(StrataPhase::Reading),
+                backend: ServerBackend::Strata,
+                ..Default::default()
+            },
+        );
+        // A registry entry that is currently not answering: its phase must be
+        // unknown (`None`), never a guessed `IDLE`.
+        registry.insert(
+            "offline_reg".to_string(),
+            LlmStats {
+                connected: false,
+                ..Default::default()
+            },
+        );
+        // "off" has no registry entry at all: never sampled.
+
+        let mut ui_state = UiState::default();
+        for key in ["gen", "quiet", "strata"] {
+            ui_state.record_llm_sample(
+                key,
+                "gen",
+                &LlmStats {
+                    connected: true,
+                    metrics_available: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let now = Instant::now();
+        let summaries = build_server_summaries(&order, &endpoints, &registry, &ui_state, now);
+
+        assert_eq!(summaries[0].phase, Some(ActivityPhase::Generating));
+        assert_eq!(summaries[1].phase, Some(ActivityPhase::Idle));
+        assert_eq!(summaries[2].phase, Some(ActivityPhase::Prefill));
+        assert_eq!(
+            summaries[3].phase, None,
+            "a not-answering registry entry stays unknown, not IDLE"
+        );
+        assert_eq!(
+            summaries[4].phase, None,
+            "never sampled stays unknown, not IDLE"
+        );
+
+        assert_eq!(summaries[0].backend, ServerBackend::LlamaCpp);
+        assert_eq!(summaries[2].backend, ServerBackend::Strata);
+        assert_eq!(summaries[4].backend, ServerBackend::Unknown);
+
+        assert!(summaries[0].age_ms.is_some(), "sampled server has an age");
+        assert!(
+            summaries[3].age_ms.is_none(),
+            "a not-answering server has no fresh age"
+        );
+        assert!(
+            summaries[4].age_ms.is_none(),
+            "a server that never answered has no age, never a fake 0"
+        );
     }
 
     #[test]

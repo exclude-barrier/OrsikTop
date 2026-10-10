@@ -168,11 +168,25 @@ fn selector_scroll(highlight: usize, total: usize, visible: usize) -> usize {
         .min(max_scroll)
 }
 
+/// Color for a per-server activity phase in the selector. Unknown/absent
+/// phases are muted; generating, prefill and active phases get the same colors
+/// as the selected-server panel.
+fn selector_phase_color(phase: Option<ActivityPhase>) -> Color {
+    match phase {
+        Some(ActivityPhase::Generating) => ORK_GREEN,
+        Some(ActivityPhase::Prefill) => CYAN,
+        Some(ActivityPhase::Processing | ActivityPhase::Queued | ActivityPhase::Reconnecting) => {
+            YELLOW
+        }
+        _ => MUTED,
+    }
+}
+
 /// Multi-server selector/overview popup. Lists every known server with its
-/// state, slot counts, context and throughput; the selected server is marked
-/// `*` and the highlighted row `>`. The list scrolls so the highlighted row
-/// stays visible and the title carries an `N/M` position indicator. Endpoints
-/// are redacted before display.
+/// state, activity phase, measurement age, backend, slot counts, context and
+/// throughput; the selected server is marked `*` and the highlighted row `>`.
+/// The list scrolls so the highlighted row stays visible and the title carries
+/// an `N/M` position indicator. Endpoints are redacted before display.
 pub(super) fn draw_server_selector(
     frame: &mut Frame,
     area: Rect,
@@ -183,7 +197,9 @@ pub(super) fn draw_server_selector(
 ) {
     let overflow_rows = overflow_line_count(overflow) as u16;
     let width = area.width.saturating_sub(6).min(78);
-    let height = (servers.len() as u16 + overflow_rows + 4)
+    // Two lines per server (a header line and a detail line), so the popup can
+    // show every required field without truncating a value.
+    let height = (servers.len() as u16 * 2 + overflow_rows + 4)
         .min(area.height.saturating_sub(4))
         .max(5);
     if width < 48 || height < 5 {
@@ -222,7 +238,8 @@ pub(super) fn draw_server_selector(
         return;
     }
 
-    let mut lines: Vec<Line> = Vec::with_capacity(servers.len());
+    let inner_width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(servers.len() * 2);
     for (index, server) in servers.iter().enumerate() {
         let is_selected = server.key == selected_server;
         let marker = if index == highlight { ">" } else { " " };
@@ -254,22 +271,93 @@ pub(super) fn draw_server_selector(
         } else {
             "—/—".to_string()
         };
-        let label = fit_cell(&server.label, 20);
-        lines.push(Line::from(vec![
+        // Per-server activity phase. Missing evidence stays `—`; it is never
+        // rendered as a guessed `IDLE`.
+        let phase = server.phase.map_or("—", ActivityPhase::label);
+        // Per-server measurement freshness, mirroring the selected-server
+        // panel: a connected server shows its (smoothed) sample interval, a
+        // server that is not answering shows how old its last successful
+        // measurement is, and a server that never answered shows `—`.
+        let sample = if server.connected {
+            match (server.sample_interval_ms, server.age_ms) {
+                (Some(avg_ms), _) => format!("~{avg_ms:.0} ms avg"),
+                (None, Some(age_ms)) => {
+                    format!("{} ago", format_sample_age(Duration::from_millis(age_ms)))
+                }
+                (None, None) => "—".to_string(),
+            }
+        } else if let Some(age_ms) = server.age_ms {
+            format!("{} ago", format_sample_age(Duration::from_millis(age_ms)))
+        } else {
+            "—".to_string()
+        };
+        let label = fit_cell(&server.label, 16);
+
+        // Line 1: identity, state, activity phase, and — when it fits — the
+        // backend and endpoint. Whole cells that do not fit are dropped, so a
+        // value is never sliced in half; only the trailing endpoint, which is
+        // not a measured value, is trimmed with an explicit `…`.
+        let mut header = vec![
             Span::styled(
                 format!("{marker}{star} "),
                 Style::default().fg(if index == highlight { CYAN } else { MUTED }),
             ),
-            Span::styled(format!("{label:<20} "), Style::default().fg(WHITE)),
+            Span::styled(format!("{label:<16} "), Style::default().fg(WHITE)),
             Span::styled(format!("{state:<12} "), Style::default().fg(state_color)),
-            Span::styled(format!("S {slots}  "), Style::default().fg(MUTED)),
-            Span::styled(format!("CTX {ctx:<13} "), Style::default().fg(MUTED)),
-            Span::styled(format!("{tps:<12} "), Style::default().fg(MUTED)),
             Span::styled(
-                compact_endpoint(&server.endpoint),
-                Style::default().fg(DIM_GREEN),
+                format!("{phase:<12} "),
+                Style::default().fg(selector_phase_color(server.phase)),
             ),
-        ]));
+        ];
+        let mut used = 3 + 17 + 13 + 13;
+        if used + 11 <= inner_width {
+            header.push(Span::styled(
+                format!("{:<10} ", server.backend.label()),
+                Style::default().fg(DIM_GREEN),
+            ));
+            used += 11;
+        }
+        if inner_width > used {
+            header.push(Span::styled(
+                fit_cell(&compact_endpoint(&server.endpoint), inner_width - used),
+                Style::default().fg(DIM_GREEN),
+            ));
+        }
+        lines.push(Line::from(header));
+
+        // Line 2: slot counts, CTX, tok/s and measurement freshness. Same rule:
+        // drop whole trailing cells rather than truncating a number. The slot
+        // and CTX cells are kept first, tok/s next, the measurement age last.
+        let mut detail = vec![Span::raw("   ")];
+        let mut used = 3;
+        if used + 7 <= inner_width {
+            detail.push(Span::styled(
+                format!("{:<6} ", format!("S {slots}")),
+                Style::default().fg(MUTED),
+            ));
+            used += 7;
+        }
+        if used + 18 <= inner_width {
+            detail.push(Span::styled(
+                format!("CTX {ctx:<13} "),
+                Style::default().fg(MUTED),
+            ));
+            used += 18;
+        }
+        if used + 13 <= inner_width {
+            detail.push(Span::styled(
+                format!("{tps:<12} "),
+                Style::default().fg(MUTED),
+            ));
+            used += 13;
+        }
+        if used + 1 + sample.chars().count() <= inner_width {
+            detail.push(Span::styled(
+                format!(" {sample}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        lines.push(Line::from(detail));
     }
     if servers.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -322,7 +410,23 @@ pub(super) fn draw_server_selector(
     let viewport = inner_h - overflow_shown;
 
     if viewport > 0 {
-        let scroll = selector_scroll(highlight, lines.len(), viewport) as u16;
+        // Each server occupies two lines, so scroll in line units and keep both
+        // lines of the highlighted entry inside the viewport. The scroll window
+        // must span an even number of lines: a two-line entry then always lands
+        // on an even pair boundary, so its header and detail stay together. An
+        // odd viewport therefore computes the offset against `viewport - 1`;
+        // the extra rendered row simply shows the next entry's header. Rounding
+        // the offset down to an even line then never moves the window past the
+        // highlighted entry's detail (which an odd window did, making the last
+        // server's detail unreachable).
+        let last_line = highlight * 2 + 1;
+        let window = if viewport >= 2 {
+            viewport - (viewport % 2)
+        } else {
+            viewport
+        };
+        let scroll = selector_scroll(last_line, lines.len(), window);
+        let scroll = (scroll - (scroll % 2)) as u16;
         frame.render_widget(
             Paragraph::new(lines).scroll((scroll, 0)),
             Rect::new(inner.x, inner.y, inner.width, viewport as u16),
