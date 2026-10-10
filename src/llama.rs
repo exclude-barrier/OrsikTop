@@ -116,6 +116,12 @@ pub struct LlmStats {
     /// normalized. `None` for llama.cpp and for an absent/unrecognised state,
     /// so the existing activity heuristics apply unchanged.
     pub strata_phase: Option<crate::strata::StrataPhase>,
+    /// Backend inferred from this sample's already-parsed `/metrics` wire body:
+    /// a recognised Strata JSON object, or a Prometheus exposition that
+    /// actually carries `llamacpp` metric names. Anything else stays
+    /// [`ServerBackend::Unknown`](crate::domain::ServerBackend::Unknown)
+    /// (rendered `—`) — an assumed backend is never reported.
+    pub backend: crate::domain::ServerBackend,
     pub spec_drafts_total: Option<f64>,
     pub spec_draft_tokens: Option<f64>,
     pub spec_accepted_tokens: Option<f64>,
@@ -124,6 +130,70 @@ pub struct LlmStats {
     pub spec_n_max: Option<u64>,
     pub spec_acceptance_pct: Option<f64>,
     pub error: String,
+}
+
+/// Classify a server's activity phase from its own telemetry using the shared
+/// heuristic: a server-reported Strata phase is authoritative, otherwise the
+/// live rates and slot activity decide. This never inspects connection state —
+/// callers that need to distinguish "offline" from "idle" use
+/// [`activity_phase`]; the selected-server panel uses it directly (an offline
+/// server keeps its last-known idle presentation there).
+pub(crate) fn classify_phase(llm: &LlmStats) -> crate::domain::ActivityPhase {
+    let strata_phase = llm.strata_phase;
+    let generating = strata_phase == Some(crate::strata::StrataPhase::Generating)
+        || llm.generation_tps.is_some_and(|value| value > 0.05);
+    let reading = strata_phase == Some(crate::strata::StrataPhase::Reading)
+        || llm.prompt_tps.is_some_and(|value| value > 0.05);
+    if generating {
+        crate::domain::ActivityPhase::Generating
+    } else if reading {
+        crate::domain::ActivityPhase::Prefill
+    } else if llm.busy_slots > 0 || llm.active_requests.is_some_and(|value| value > 0.0) {
+        crate::domain::ActivityPhase::Processing
+    } else if llm.deferred_requests.is_some_and(|value| value > 0.0) {
+        crate::domain::ActivityPhase::Queued
+    } else {
+        crate::domain::ActivityPhase::Idle
+    }
+}
+
+/// The activity phase shown per server in the overview. `None` means there is
+/// no reliable evidence — a server that has never answered, or is currently
+/// offline — and must render `—` rather than a guessed `IDLE`. A server being
+/// reconnected keeps an explicit `RECONNECTING` label (held state, not live
+/// activity).
+pub(crate) fn activity_phase(llm: &LlmStats) -> Option<crate::domain::ActivityPhase> {
+    if llm.reconnecting {
+        return Some(crate::domain::ActivityPhase::Reconnecting);
+    }
+    if !llm.connected {
+        return None;
+    }
+    Some(classify_phase(llm))
+}
+
+/// The backend a server appears to be, identified positively from the parsed
+/// `/metrics` wire body — never assumed. A recognised Strata JSON object is a
+/// positive Strata signal (even when it exposes no `live.state`). A Prometheus
+/// exposition counts as llama.cpp only when it actually carries `llamacpp`
+/// metric names; an unrelated Prometheus endpoint, or a JSON body that is not
+/// Strata, stays `Unknown` (rendered `—`).
+fn classify_backend(
+    format: Option<MetricsFormat>,
+    metrics: &[MetricSample],
+) -> crate::domain::ServerBackend {
+    use crate::domain::ServerBackend;
+    match format {
+        Some(MetricsFormat::Strata) => ServerBackend::Strata,
+        Some(MetricsFormat::Prometheus)
+            if metrics
+                .iter()
+                .any(|sample| sample.name.contains("llamacpp")) =>
+        {
+            ServerBackend::LlamaCpp
+        }
+        _ => ServerBackend::Unknown,
+    }
 }
 
 /// One visible slot in the per-slot context overview: the slot's own
@@ -368,6 +438,10 @@ impl LlamaMonitor {
                 "/metrics returned no metrics".to_string()
             };
         }
+        // Backend is identified from the parsed wire body, never assumed (a
+        // reachable `/metrics` alone does not imply a backend). Computed from
+        // the already-parsed sample; no extra request.
+        stats.backend = classify_backend(parsed.format, &metrics);
         // Capacity fallback: if /props did not supply n_ctx, a recognised Strata
         // engine reports its configured context; use it as the CTX denominator
         // (capacity only — never occupancy). /slots n_ctx still refines it below.
@@ -1272,6 +1346,43 @@ mod tests {
     }
 
     #[test]
+    fn classify_backend_requires_positive_evidence() {
+        use crate::domain::ServerBackend;
+
+        // A recognised Strata JSON body without any `live.state` is still
+        // positively Strata — it must never be reported as llama.cpp.
+        let strata = r#"{"engine":{"model":"m"},"totals":{"prompt_tokens":5,"output_tokens":2,"prompt_ms":2000.0,"decode_ms":500.0},"requests_kept":1}"#;
+        let parsed = parse_metrics_body(strata);
+        assert_eq!(parsed.format, Some(MetricsFormat::Strata));
+        assert_eq!(
+            classify_backend(parsed.format, &parsed.samples),
+            ServerBackend::Strata
+        );
+
+        // A Prometheus exposition counts as llama.cpp only when it actually
+        // carries llama.cpp metric names.
+        let llama = parse_metrics_body("# fixture\nllamacpp:prompt_tokens_total 5\n");
+        assert_eq!(
+            classify_backend(llama.format, &llama.samples),
+            ServerBackend::LlamaCpp
+        );
+        // Some other Prometheus endpoint is not claimed as llama.cpp.
+        let other = parse_metrics_body("# fixture\nmysql_up 1\n");
+        assert_eq!(other.format, Some(MetricsFormat::Prometheus));
+        assert_eq!(
+            classify_backend(other.format, &other.samples),
+            ServerBackend::Unknown
+        );
+
+        // Unrecognised JSON is neither Strata nor llama.cpp.
+        let json = parse_metrics_body("{\"foo\": 1}");
+        assert_eq!(
+            classify_backend(json.format, &json.samples),
+            ServerBackend::Unknown
+        );
+    }
+
+    #[test]
     fn pretty_printed_json_never_reaches_the_prometheus_parser() {
         // The line-oriented Prometheus parser would read `"prompt_tokens": 5`
         // as a bogus sample. Dispatch by shape prevents that.
@@ -1363,6 +1474,11 @@ mod tests {
         );
         assert_eq!(first.error, "", "no metrics-off error expected");
         assert_eq!(first.model, "strata-model");
+        assert_eq!(
+            first.backend,
+            crate::domain::ServerBackend::Strata,
+            "a recognised Strata body must be identified as Strata"
+        );
         assert_eq!(first.prompt_total, Some(1000.0));
         assert_eq!(first.generated_total, Some(250.0));
         // Lifetime averages from totals + ms-derived seconds.

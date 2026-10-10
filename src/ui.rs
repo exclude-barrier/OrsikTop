@@ -15,8 +15,8 @@ use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
     cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu, ProcessIdentity,
-        ProcessStats, ServerSummary, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+        ActivityPhase, GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu,
+        ProcessIdentity, ProcessStats, ServerSummary, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
     gpu,
 };
@@ -288,6 +288,27 @@ impl UiState {
                 now,
             );
         }
+    }
+
+    /// Milliseconds since this server's last successful measurement, from the
+    /// same per-server history the selected-server panel uses. `None` when the
+    /// server has never answered, so the overview shows `—` rather than `0` or
+    /// a generic connection age.
+    pub fn server_sample_age_ms(&self, key: &str, now: Instant) -> Option<u64> {
+        self.llm_histories
+            .get(key)
+            .and_then(|history| history.last_fresh_at)
+            .map(|at| now.saturating_duration_since(at).as_millis() as u64)
+    }
+
+    /// Smoothed sample interval (ms) for a server while it is connected, from
+    /// its own per-server history (the same value the selected-server panel
+    /// shows). `None` until a second sample has been seen or while offline, so
+    /// the overview falls back to the measurement age instead of a fake value.
+    pub fn server_sample_interval_ms(&self, key: &str) -> Option<f64> {
+        self.llm_histories
+            .get(key)
+            .and_then(|history| history.sample_interval_ema_ms)
     }
 
     /// Make `key`'s own history active (the selected server changed). Other
@@ -2511,6 +2532,264 @@ mod tests {
         assert!(
             text.contains("16/16"),
             "position indicator missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn server_selector_keeps_the_highlighted_detail_line_visible_at_odd_heights() {
+        // Regression (F5): each server now renders two lines, which made the
+        // effective viewport odd at many terminal heights. The scroll offset
+        // was rounded down to an even line, dropping the highlighted entry's
+        // *detail* line (slots, CTX, tok/s, age) out of the window — at the
+        // last entry it was not reachable at all. Each server carries a unique
+        // CTX marker, so `contains` proves the detail line itself is on screen,
+        // not merely its header. `render_selector` returns only the drawn
+        // buffer, so an off-screen detail is genuinely absent.
+        let servers: Vec<ServerSummary> = (0..5)
+            .map(|i| {
+                let mut server = summary(&format!("s{i:02}"), true, true, 1, 4);
+                server.context_used = Some(1000 + i);
+                server.context_size = 9999;
+                server
+            })
+            .collect();
+        // 80x15 gives an odd popup inner height (no overflow block).
+        let area = Rect::new(0, 0, 80, 15);
+        for index in 0..servers.len() {
+            let text = render_selector(&servers, "s00", index, &[], area);
+            let marker = format!("CTX {}/9999", 1000 + index);
+            assert!(
+                text.contains(&marker),
+                "highlight {index} detail line ({marker}) must be visible at 80x15:\n{text}"
+            );
+        }
+
+        // Same invariant with a pinned overflow block shrinking the viewport to
+        // an odd height, matching the existing scrolled-overflow configuration
+        // (80x16, 16 servers, 2 overflow endpoints).
+        let servers: Vec<ServerSummary> = (0..16)
+            .map(|i| {
+                let mut server = summary(&format!("s{i:02}"), true, true, 1, 4);
+                server.context_used = Some(1000 + i);
+                server.context_size = 9999;
+                server
+            })
+            .collect();
+        let overflow = vec![
+            crate::app::ServerSpec {
+                key: "o1".to_string(),
+                endpoint: "http://10.0.0.9:8080".to_string(),
+                identity: None,
+            },
+            crate::app::ServerSpec {
+                key: "o2".to_string(),
+                endpoint: "http://10.0.0.10:8080".to_string(),
+                identity: None,
+            },
+        ];
+        let area = Rect::new(0, 0, 80, 16);
+        for index in 0..servers.len() {
+            let text = render_selector(&servers, "s00", index, &overflow, area);
+            let marker = format!("CTX {}/9999", 1000 + index);
+            assert!(
+                text.contains(&marker),
+                "highlight {index} detail line ({marker}) must be visible at 80x16 with overflow:\n{text}"
+            );
+            assert!(
+                text.contains("NOT MONITORED"),
+                "the pinned overflow block must stay visible at highlight {index}:\n{text}"
+            );
+        }
+    }
+
+    /// Render the selector and return it row by row, so a test can assert what
+    /// appears on one server's line (per-server, not merely "somewhere").
+    fn render_selector_rows(servers: &[ServerSummary], selected: &str, area: Rect) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_server_selector(frame, area, servers, selected, 0, &[]))
+            .unwrap();
+        let width = area.width as usize;
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect()
+    }
+
+    /// The two rendered lines (`header`, `detail`) of the selector entry whose
+    /// header carries `label` at the marker/label column.
+    fn selector_entry<'a>(rows: &'a [String], label: &str) -> (&'a str, &'a str) {
+        let pos = rows
+            .iter()
+            .position(|row| {
+                row.find(label).is_some_and(|byte| {
+                    let start = row[..byte].chars().count();
+                    let chars: Vec<char> = row.chars().collect();
+                    start >= 3
+                        && matches!(chars[start - 3], '>' | ' ')
+                        && matches!(chars[start - 2], '*' | ' ')
+                        && chars[start - 1] == ' '
+                })
+            })
+            .unwrap_or_else(|| panic!("no selector entry for {label}: {rows:?}"));
+        (
+            rows[pos].as_str(),
+            rows.get(pos + 1).map(String::as_str).unwrap_or(""),
+        )
+    }
+
+    /// The `width` characters of `header` starting `offset` chars after `label`.
+    /// Used to assert a specific column rather than "somewhere on the row".
+    fn selector_cell_after_label(header: &str, label: &str, offset: usize, width: usize) -> String {
+        let byte = header
+            .find(label)
+            .unwrap_or_else(|| panic!("label {label} not in {header:?}"));
+        let start = header[..byte].chars().count() + offset;
+        header.chars().skip(start).take(width).collect()
+    }
+
+    /// Char offset from the label to the activity-phase column: the label cell
+    /// (16 + 1) plus the state cell (12 + 1).
+    const PHASE_OFFSET: usize = 17 + 13;
+    const PHASE_WIDTH: usize = 12;
+
+    #[test]
+    fn server_selector_shows_activity_phase_per_server() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut generating = summary("gen", true, true, 1, 1);
+        generating.phase = Some(ActivityPhase::Generating);
+        let mut prefilling = summary("prefill", true, true, 1, 1);
+        prefilling.phase = Some(ActivityPhase::Prefill);
+        let mut idle = summary("quiet", true, true, 0, 1);
+        idle.phase = Some(ActivityPhase::Idle);
+        // No telemetry at all: the phase must stay unknown, never `IDLE`.
+        let unknown = summary("unknown", false, false, 0, 0);
+        // A dropped connection keeps an explicit held-state label.
+        let mut reconnecting = summary("recon", false, false, 0, 0);
+        reconnecting.reconnecting = true;
+        reconnecting.phase = Some(ActivityPhase::Reconnecting);
+        let servers = vec![generating, prefilling, idle, unknown, reconnecting];
+        let rows = render_selector_rows(&servers, "gen", area);
+
+        // Check the phase column itself, not just "somewhere on the row".
+        for (label, expected) in [
+            ("gen", "GENERATING"),
+            ("prefill", "PREFILL"),
+            ("quiet", "IDLE"),
+            ("recon", "RECONNECTING"),
+        ] {
+            let (header, _) = selector_entry(&rows, label);
+            let cell = selector_cell_after_label(header, label, PHASE_OFFSET, PHASE_WIDTH);
+            assert_eq!(
+                cell.trim(),
+                expected,
+                "phase column of {label} must read {expected}: {rows:?}"
+            );
+        }
+
+        let (unknown_header, _) = selector_entry(&rows, "unknown");
+        let unknown_cell =
+            selector_cell_after_label(unknown_header, "unknown", PHASE_OFFSET, PHASE_WIDTH);
+        assert_eq!(
+            unknown_cell.trim(),
+            "—",
+            "a missing phase must render — in the phase column: {rows:?}"
+        );
+        assert_ne!(
+            unknown_cell.trim(),
+            "IDLE",
+            "a missing phase must not be guessed as IDLE: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn server_selector_shows_measurement_age_and_interval() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut fresh = summary("fresh", true, true, 1, 1);
+        fresh.sample_interval_ms = Some(100.0);
+        fresh.age_ms = Some(95);
+        // Connected but the interval EMA is not known yet: show the age, not a
+        // fabricated interval or `—`.
+        let mut warming = summary("warming", true, true, 0, 1);
+        warming.age_ms = Some(1_500);
+        let mut stale = summary("stale", false, false, 0, 0);
+        stale.age_ms = Some(2_400);
+        // Never measured: no age, must render `—` rather than `0`. Slot/CTX are
+        // known so the sample is the only `—` on the row.
+        let mut never = summary("never", false, true, 0, 2);
+        never.context_used = Some(1);
+        never.context_size = 2;
+        never.generation_tps = Some(1.0);
+        let rows = render_selector_rows(&[fresh, warming, stale, never], "fresh", area);
+
+        let (_, fresh_detail) = selector_entry(&rows, "fresh");
+        assert!(
+            fresh_detail.contains("~100 ms avg"),
+            "a connected server shows its sample interval: {rows:?}"
+        );
+        let (_, warming_detail) = selector_entry(&rows, "warming");
+        assert!(
+            warming_detail.contains("1.5 s ago"),
+            "a connected server without an interval yet shows its age: {rows:?}"
+        );
+        let (_, stale_detail) = selector_entry(&rows, "stale");
+        assert!(
+            stale_detail.contains("2.4 s ago"),
+            "a stale server shows its measurement age: {rows:?}"
+        );
+        let (_, never_detail) = selector_entry(&rows, "never");
+        assert!(
+            never_detail.contains("—"),
+            "a never-measured server shows —: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn server_selector_keeps_phase_age_ctx_tps_and_backend_visible_at_80_columns() {
+        // Required fields must all be readable on an 80-column terminal without
+        // any value being sliced in half (a truncated CTX would look like a
+        // different, real value).
+        let area = Rect::new(0, 0, 80, 20);
+        let mut server = summary("model", true, true, 1, 4);
+        server.phase = Some(ActivityPhase::Generating);
+        server.backend = crate::domain::ServerBackend::LlamaCpp;
+        server.context_used = Some(32768);
+        server.context_size = 131072;
+        server.generation_tps = Some(20.5);
+        server.sample_interval_ms = Some(100.0);
+        server.age_ms = Some(95);
+        let rows = render_selector_rows(&[server], "model", area);
+        let (header, detail) = selector_entry(&rows, "model");
+
+        assert!(
+            detail.contains("CTX 32768/131072"),
+            "the full CTX value must survive at 80 columns: {rows:?}"
+        );
+        assert!(
+            detail.contains("20.5 tok/s"),
+            "tok/s must be visible at 80 columns: {rows:?}"
+        );
+        assert!(
+            detail.contains("~100 ms avg"),
+            "the measurement age/interval must be visible: {rows:?}"
+        );
+        assert!(
+            detail.contains("S 1/4"),
+            "slot counts must stay visible: {rows:?}"
+        );
+        let phase = selector_cell_after_label(header, "model", PHASE_OFFSET, PHASE_WIDTH);
+        assert_eq!(
+            phase.trim(),
+            "GENERATING",
+            "phase missing at 80 columns: {rows:?}"
+        );
+        assert!(
+            header.contains("llama.cpp"),
+            "the backend label must be visible at 80 columns: {rows:?}"
         );
     }
 
