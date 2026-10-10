@@ -1,0 +1,15 @@
+# A llama.cpp exposition whose ordering differs from the current fixture and
+# that carries HELP/TYPE comments plus a labelled series and unknown future
+# metrics. The unknown series must be retained verbatim and must never disturb
+# the recognised llama.cpp metrics.
+# HELP llamacpp:requests_processing Requests currently being processed
+# TYPE llamacpp:requests_processing gauge
+llamacpp:requests_processing 2
+# TYPE llamacpp:a_future_metric_total counter
+llamacpp:a_future_metric_total 5
+llamacpp:a_future_metric_total{model="x"} 6
+llamacpp:prompt_tokens_total 777
+llamacpp:tokens_predicted_total 444
+llamacpp:tokens_predicted_seconds_total 4
+llamacpp:prompt_tokens_cached_total 123
+llamacpp:some_brand_new_gauge 1.5

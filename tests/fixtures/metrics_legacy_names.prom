@@ -1,0 +1,9 @@
+# An older llama.cpp exposition that uses legacy metric names. The legacy
+# counter names are accepted as compatibility fallbacks; the legacy gauges are
+# only a fallback source for the lifetime average. The unrelated vendor metric
+# must be ignored.
+llamacpp:tokens_evaluated_total 1000
+predicted_tokens_total 250
+llamacpp:prompt_tokens_seconds 0
+llamacpp:predicted_tokens_seconds 0
+unrelated_vendor_metric 1

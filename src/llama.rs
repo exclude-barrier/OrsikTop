@@ -2866,6 +2866,483 @@ mod tests {
             "Qwen3.8-27B-UD-Q4_K_M"
         );
     }
+
+    /// A deterministic mock `/props`/`/metrics`/`/slots` backend.
+    ///
+    /// `respond(path, n)` returns `(status, content_type, body)` for the `n`-th
+    /// request to that exact path. Counting per path (never globally) keeps a
+    /// sequenced endpoint deterministic even though `sample()` fetches the
+    /// three endpoints concurrently. The server thread stops when the handle is
+    /// dropped.
+    struct MockBackend {
+        base: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockBackend {
+        fn base(&self) -> &str {
+            &self.base
+        }
+    }
+
+    impl Drop for MockBackend {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn spawn_backend<F>(respond: F) -> MockBackend
+    where
+        F: Fn(&str, usize) -> (u16, &'static str, String) + Send + 'static,
+    {
+        use std::collections::HashMap;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock backend");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let calls: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop_flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line);
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let index = {
+                            let mut calls = calls.lock().expect("mock call counter");
+                            let entry = calls.entry(path.clone()).or_insert(0);
+                            let index = *entry;
+                            *entry += 1;
+                            index
+                        };
+                        let (status, content_type, body) = respond(&path, index);
+                        let reason = match status {
+                            200 => "OK",
+                            404 => "Not Found",
+                            501 => "Not Implemented",
+                            _ => "Error",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        MockBackend {
+            base: format!("http://{addr}"),
+            stop,
+        }
+    }
+
+    #[test]
+    fn a_missing_props_endpoint_leaves_the_model_unknown_but_keeps_telemetry() {
+        // /props 404 while /metrics and /slots answer: the server is still
+        // reachable, so metric and slot telemetry must stay available and the
+        // model stays unknown rather than guessed.
+        let backend = spawn_backend(|path, _n| {
+            if path.contains("/props") {
+                (
+                    404,
+                    "application/json",
+                    "{\"error\":\"not found\"}".to_string(),
+                )
+            } else if path.contains("/metrics") {
+                (
+                    200,
+                    "text/plain",
+                    include_str!("../tests/fixtures/metrics_current.prom").to_string(),
+                )
+            } else if path.contains("/slots") {
+                (
+                    200,
+                    "application/json",
+                    include_str!("../tests/fixtures/slots_idle.json").to_string(),
+                )
+            } else {
+                (404, "text/plain", String::new())
+            }
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let stats = monitor.sample();
+
+        assert!(stats.connected);
+        assert!(stats.metrics_available);
+        assert!(stats.slots_available);
+        assert_eq!(stats.prompt_total, Some(12000.0));
+        assert_eq!(stats.model, UNKNOWN_MODEL_LABEL, "no props -> no model");
+        // Capacity still comes from the /slots payload, not from a guess.
+        assert_eq!(stats.context_size, 196608);
+        assert_eq!(stats.slot_count, 1);
+    }
+
+    #[test]
+    fn a_missing_slots_endpoint_keeps_metrics_visible() {
+        // /slots 404 while /metrics answers: metric-derived values stay real,
+        // the slot-derived values stay unavailable (never a fabricated zero).
+        let backend = spawn_backend(|path, _n| {
+            if path.contains("/props") {
+                (
+                    200,
+                    "application/json",
+                    include_str!("../tests/fixtures/props.json").to_string(),
+                )
+            } else if path.contains("/metrics") {
+                (
+                    200,
+                    "text/plain",
+                    include_str!("../tests/fixtures/metrics_current.prom").to_string(),
+                )
+            } else {
+                (404, "application/json", "[]".to_string())
+            }
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let stats = monitor.sample();
+
+        assert!(stats.connected);
+        assert!(stats.metrics_available);
+        assert!(!stats.slots_available);
+        assert_eq!(stats.prompt_total, Some(12000.0));
+        assert!(
+            stats.slots_error.contains("404"),
+            "the /slots failure must be surfaced: {:?}",
+            stats.slots_error
+        );
+        assert_eq!(stats.model, "Qwen3.8-27B-UD-Q4_K_M");
+        // Context size is seeded by /props; occupancy stays unknown.
+        assert_eq!(stats.context_size, 196608);
+        assert_eq!(stats.context_used, None);
+        assert_eq!(stats.slot_count, 0);
+    }
+
+    #[test]
+    fn unrecognized_metrics_json_goes_unavailable_and_recovers_without_a_spike() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Sequence: valid llama.cpp -> unrecognised JSON -> valid llama.cpp
+        // with a larger counter. The invalid sample must clear availability and
+        // drop the counter baseline so recovery cannot report a delta averaged
+        // across the gap.
+        let metrics_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&metrics_calls);
+        let backend = spawn_backend(move |path, _n| {
+            if path.contains("/metrics") {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                if index == 1 {
+                    (
+                        200,
+                        "application/json",
+                        "{\"unexpected\": true}".to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        "text/plain",
+                        format!(
+                            "llamacpp:prompt_tokens_total {}\n",
+                            12000 + 50 * index as u64
+                        ),
+                    )
+                }
+            } else if path.contains("/slots") {
+                (
+                    200,
+                    "application/json",
+                    "[{\"id\":0,\"n_ctx\":4096,\"is_processing\":false}]".to_string(),
+                )
+            } else {
+                (
+                    200,
+                    "application/json",
+                    "{\"model_name\":\"m\",\"total_slots\":1}".to_string(),
+                )
+            }
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+
+        let first = monitor.sample();
+        assert!(first.metrics_available);
+        assert_eq!(first.prompt_total, Some(12000.0));
+        assert_eq!(
+            first.prompt_tps, None,
+            "first sample only sets the baseline"
+        );
+
+        thread::sleep(Duration::from_millis(2));
+
+        let invalid = monitor.sample();
+        assert!(!invalid.metrics_available);
+        assert_eq!(invalid.prompt_total, None, "no fabricated zero");
+        assert_eq!(invalid.prompt_tps, None);
+        assert_eq!(invalid.backend, crate::domain::ServerBackend::Unknown);
+        assert!(
+            invalid.error.contains("unrecognized JSON"),
+            "the reason must be format-specific: {:?}",
+            invalid.error
+        );
+
+        thread::sleep(Duration::from_millis(2));
+
+        let recovered = monitor.sample();
+        assert!(recovered.metrics_available);
+        assert_eq!(recovered.prompt_total, Some(12100.0));
+        assert_eq!(
+            recovered.prompt_tps, None,
+            "the baseline was dropped during the invalid sample; recovery re-baselines"
+        );
+    }
+
+    #[test]
+    fn a_prometheus_counter_reset_after_a_restart_is_unavailable_then_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A restarted llama.cpp restarts every cumulative counter at zero. That
+        // is a reset, not a negative rate: the live value must be unavailable,
+        // and the renewed climb establishes a fresh baseline.
+        let metrics_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&metrics_calls);
+        let backend = spawn_backend(move |path, _n| {
+            if path.contains("/metrics") {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                let body = match index {
+                    0 => "llamacpp:prompt_tokens_total 12000\nllamacpp:prompt_seconds_total 12\nllamacpp:tokens_predicted_total 800\nllamacpp:tokens_predicted_seconds_total 20\n".to_string(),
+                    1 => "llamacpp:prompt_tokens_total 0\nllamacpp:tokens_predicted_total 0\n".to_string(),
+                    _ => "llamacpp:prompt_tokens_total 200\nllamacpp:tokens_predicted_total 50\n".to_string(),
+                };
+                (200, "text/plain", body)
+            } else if path.contains("/slots") {
+                // Counter-less /slots: the aggregate /metrics delta is the only
+                // live-rate source under test.
+                (
+                    200,
+                    "application/json",
+                    "[{\"id\":0,\"n_ctx\":4096,\"is_processing\":false}]".to_string(),
+                )
+            } else {
+                (
+                    200,
+                    "application/json",
+                    "{\"model_name\":\"m\",\"total_slots\":1}".to_string(),
+                )
+            }
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+
+        let first = monitor.sample();
+        assert!(first.metrics_available);
+        assert_eq!(first.prompt_total, Some(12000.0));
+        // Lifetime averages are unaffected by the reset semantics.
+        assert_eq!(first.prompt_avg_tps, Some(1000.0));
+        assert_eq!(first.generation_avg_tps, Some(40.0));
+        assert_eq!(first.prompt_tps, None);
+
+        thread::sleep(Duration::from_millis(2));
+
+        let restarted = monitor.sample();
+        assert_eq!(restarted.prompt_total, Some(0.0));
+        assert_eq!(restarted.prompt_tps, None, "a counter reset is not a rate");
+        assert_eq!(restarted.generation_tps, None);
+
+        thread::sleep(Duration::from_millis(2));
+
+        let recovered = monitor.sample();
+        assert_eq!(recovered.prompt_total, Some(200.0));
+        assert!(
+            recovered.prompt_tps.is_some_and(|rate| rate > 0.0),
+            "a counter climbing from the new baseline is a real rate: {:?}",
+            recovered.prompt_tps
+        );
+    }
+
+    #[test]
+    fn legacy_llama_metric_names_are_accepted_as_fallbacks() {
+        let backend = spawn_backend(|path, _n| {
+            if path.contains("/metrics") {
+                (
+                    200,
+                    "text/plain",
+                    include_str!("../tests/fixtures/metrics_legacy_names.prom").to_string(),
+                )
+            } else if path.contains("/slots") {
+                (
+                    200,
+                    "application/json",
+                    "[{\"id\":0,\"n_ctx\":4096,\"is_processing\":false}]".to_string(),
+                )
+            } else {
+                (
+                    200,
+                    "application/json",
+                    "{\"model_name\":\"legacy\",\"total_slots\":1}".to_string(),
+                )
+            }
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let stats = monitor.sample();
+
+        assert!(stats.metrics_available);
+        assert_eq!(
+            stats.prompt_total,
+            Some(1000.0),
+            "llamacpp:tokens_evaluated_total is a legacy prompt name"
+        );
+        assert_eq!(
+            stats.generated_total,
+            Some(250.0),
+            "predicted_tokens_total is a legacy generation name"
+        );
+        // The legacy gauges are only a fallback average source when no seconds
+        // counter is present.
+        assert_eq!(stats.prompt_avg_tps, Some(0.0));
+        assert_eq!(stats.generation_avg_tps, Some(0.0));
+    }
+
+    #[test]
+    fn prometheus_payload_with_unknown_fields_keeps_known_metrics_and_labels() {
+        let metrics = parse_prometheus(include_str!(
+            "../tests/fixtures/metrics_schema_unknown.prom"
+        ));
+
+        // A reordered exposure with HELP/TYPE noise and unknown series still
+        // yields the recognised metrics.
+        assert_eq!(
+            pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_total"]),
+            Some(777.0)
+        );
+        assert_eq!(
+            pick_metric_opt(&metrics, &["llamacpp:tokens_predicted_total"]),
+            Some(444.0)
+        );
+        assert_eq!(
+            pick_metric_opt(&metrics, &["llamacpp:prompt_tokens_cached_total"]),
+            Some(123.0)
+        );
+        assert_eq!(
+            pick_metric_opt(&metrics, &["llamacpp:requests_processing"]),
+            Some(2.0)
+        );
+        // An unknown series is retained verbatim with its label intact and does
+        // not shadow a recognised metric.
+        assert_eq!(
+            metrics
+                .iter()
+                .filter(|sample| sample.name == "llamacpp:a_future_metric_total")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn strata_metrics_fixture_tolerates_unknown_and_reordered_fields() {
+        let parsed = parse_metrics_body(include_str!(
+            "../tests/fixtures/strata_metrics_unknown.json"
+        ));
+
+        assert_eq!(parsed.format, Some(MetricsFormat::Strata));
+        assert_eq!(
+            classify_backend(parsed.format, &parsed.samples),
+            crate::domain::ServerBackend::Strata
+        );
+        // Identity and capacity survive unknown sibling fields.
+        assert_eq!(parsed.strata_since, Some(1_800_000_000.5));
+        assert_eq!(parsed.strata_capacity, Some(131_072));
+        // Known counters are normalised (ms -> s); unknown fields never become
+        // canonical samples.
+        assert_eq!(
+            pick_metric_opt(&parsed.samples, &["llamacpp:prompt_tokens_total"]),
+            Some(42.0)
+        );
+        assert_eq!(
+            pick_metric_opt(&parsed.samples, &["llamacpp:tokens_predicted_total"]),
+            Some(7.0)
+        );
+        assert_eq!(
+            pick_metric_opt(&parsed.samples, &["llamacpp:prompt_seconds_total"]),
+            Some(2.1)
+        );
+        let decode_seconds = pick_metric_opt(
+            &parsed.samples,
+            &["llamacpp:tokens_predicted_seconds_total"],
+        )
+        .expect("decode seconds present");
+        assert!(
+            (decode_seconds - 0.7).abs() < 1e-9,
+            "700 ms must normalise to 0.7 s, got {decode_seconds}"
+        );
+        assert!(!parsed
+            .samples
+            .iter()
+            .any(|sample| sample.name.contains("future") || sample.name.contains("new_metric")));
+    }
+
+    #[test]
+    fn an_invalid_props_refresh_keeps_the_cached_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let props_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&props_calls);
+        let backend = spawn_backend(move |path, _n| {
+            if path.contains("/metrics") {
+                (
+                    200,
+                    "text/plain",
+                    "llamacpp:prompt_tokens_total 10\n".to_string(),
+                )
+            } else if path.contains("/slots") {
+                (200, "application/json", "[]".to_string())
+            } else {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    (
+                        200,
+                        "application/json",
+                        "{\"model_name\":\"model-A\",\"default_generation_settings\":{\"n_ctx\":4096}}"
+                            .to_string(),
+                    )
+                } else {
+                    (200, "application/json", "this is not json".to_string())
+                }
+            }
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+
+        let first = monitor.sample();
+        assert_eq!(first.model, "model-A");
+        assert_eq!(first.context_size, 4096);
+
+        // Force a /props refresh; the server now returns a malformed body.
+        monitor.props_dirty = true;
+        thread::sleep(Duration::from_millis(2));
+        let second = monitor.sample();
+
+        assert_eq!(
+            second.model, "model-A",
+            "a malformed refresh must not erase the cache"
+        );
+        assert_eq!(second.context_size, 4096);
+        // The refresh stays pending so the next sample retries.
+        assert!(monitor.props_dirty);
+    }
 }
 
 #[cfg(test)]
