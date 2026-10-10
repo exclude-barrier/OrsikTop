@@ -26,7 +26,7 @@
 //! richer engine-level UX is a later UX stage.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::domain::{parse_pci_bdf, ProcessIdentity};
@@ -113,24 +113,31 @@ pub fn sample_process_gpus<S: Sys>(
     let fd_dir = pid_dir.join("fd");
     let fdinfo_dir = pid_dir.join("fdinfo");
 
-    let Some(fd_entries) = sys.read_dir(&fd_dir) else {
+    let Some(fd_names) = sys.read_dir_names(&fd_dir) else {
         return Vec::new();
     };
 
     // Read the fdinfo of each open fd that points at a DRM device. Checking the
-    // symlink target first avoids reading fdinfo for every non-DRM fd.
+    // symlink target first avoids reading fdinfo for every non-DRM fd. The
+    // `/proc/<pid>/fd` entry names are only the fd numbers, so the directory is
+    // listed without per-entry metadata and the target is matched against the
+    // `/dev/dri/` prefix by raw bytes — no `String` is built for the ~all
+    // non-DRM fds. Both path buffers are reused across fds to avoid one
+    // allocation per fd.
+    let mut fd_path = PathBuf::with_capacity(64);
+    let mut fdinfo_path = PathBuf::with_capacity(64);
     let mut parsed: Vec<ParsedFd> = Vec::new();
-    for entry in &fd_entries {
-        if entry.is_dir {
+    for name in &fd_names {
+        fd_path.clear();
+        fd_path.push(&fd_dir);
+        fd_path.push(name);
+        if !sys.symlink_target_starts_with(&fd_path, b"/dev/dri/") {
             continue;
         }
-        let Some(target) = sys.symlink_target(&fd_dir.join(&entry.name)) else {
-            continue;
-        };
-        if !target.starts_with("/dev/dri/") {
-            continue;
-        }
-        let Some(info) = sys.read_to_string(&fdinfo_dir.join(&entry.name)) else {
+        fdinfo_path.clear();
+        fdinfo_path.push(&fdinfo_dir);
+        fdinfo_path.push(name);
+        let Some(info) = sys.read_to_string(&fdinfo_path) else {
             continue;
         };
         if let Some(fd) = parse_fdinfo(&info) {

@@ -1,0 +1,14 @@
+{
+  "engine": { "model": "future-engine", "context": 131072, "unknown_engine_field": 5 },
+  "live": { "state": "idle", "unknown_live_field": 3 },
+  "totals": {
+    "since": 1800000000.5,
+    "prompt_tokens": 42,
+    "output_tokens": 7,
+    "prompt_ms": 2100.0,
+    "decode_ms": 700.0,
+    "unknown_totals_field": 9
+  },
+  "requests_kept": 3,
+  "a_future_field": { "new_metric": 999 }
+}
