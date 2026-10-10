@@ -467,6 +467,30 @@ mod tests {
     }
 
     #[test]
+    fn temperature_reads_an_amd_k10temp_tctl_sensor() {
+        // AMD's k10temp exposes the package temperature as `Tctl`, not Intel's
+        // `Package id 0`. Both the CPU thermal-driver filter (k10temp) and the
+        // package-label preference (Tctl) must accept the AMD shape, and the
+        // preferred Tctl reading must win over a per-CCD one.
+        let mut fixture = FixtureSys::default();
+        fixture
+            .dir_entry("/sys/class/hwmon", "hwmon0", true, false)
+            .file("/sys/class/hwmon/hwmon0/name", "k10temp\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_input", "47000\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_label", "Tctl\n")
+            .file("/sys/class/hwmon/hwmon0/temp2_input", "52000\n")
+            .file("/sys/class/hwmon/hwmon0/temp2_label", "Tccd1\n")
+            .dir_entry("/sys/class/hwmon/hwmon0", "name", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_input", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_label", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp2_input", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp2_label", false, false);
+        let mut sensors = CpuSensors::default();
+        sensors.discover(&fixture);
+        assert_eq!(sensors.sample_temperature_c(&fixture), Some(47.0));
+    }
+
+    #[test]
     fn rapl_watts_delta_math_and_unmeasurable_windows() {
         // 250_000 µJ over 50_000 µs (50 ms) = 5 W.
         let watts = rapl_watts(1_000_000, 1_250_000, 50_000).expect("measurable window");
