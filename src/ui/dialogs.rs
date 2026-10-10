@@ -5,6 +5,10 @@ pub(super) fn draw_help_popup(frame: &mut Frame, area: Rect) {
     let width = area.width.saturating_sub(6).min(72);
     let height = area.height.saturating_sub(4).min(22);
     if width < 48 || height < 16 {
+        // The full popup does not fit. Still draw a reduced help notice when
+        // the compact layout advertises `[h]`; otherwise opening help would
+        // leave the UI in an invisible, key-swallowing mode.
+        draw_help_compact(frame, area);
         return;
     }
 
@@ -65,6 +69,51 @@ pub(super) fn draw_help_popup(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Reduced help shown when the full popup does not fit — e.g. the compact
+/// dashboard range, where `[h]` is still advertised. It lists the essential
+/// keys so help is never an invisible mode. Nothing is drawn when the area is
+/// too small even for this notice.
+fn draw_help_compact(frame: &mut Frame, area: Rect) {
+    if area.width < 24 || area.height < 3 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).min(56);
+    let height = area.height.saturating_sub(2).clamp(3, 8);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" HELP · OrsikTop ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " Esc / h  close help",
+            Style::default().fg(WHITE),
+        )),
+        Line::from(Span::styled(
+            " s  servers    q  settings",
+            Style::default().fg(WHITE),
+        )),
+        Line::from(Span::styled(
+            " - / +  refresh interval",
+            Style::default().fg(WHITE),
+        )),
+        Line::from(Span::styled(
+            " /  search    ↑ / ↓  select",
+            Style::default().fg(WHITE),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Compact notice shown when the terminal is too small for the settings
 /// popup; nothing is rendered when the area cannot fit the notice itself.
 pub(super) fn draw_settings_too_small(frame: &mut Frame, area: Rect) {
@@ -88,16 +137,42 @@ pub(super) fn draw_settings_too_small(frame: &mut Frame, area: Rect) {
     frame.render_widget(block, popup);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Terminal too small for settings (need 54x15)",
+            " Terminal too small for settings (need 60x19)",
             Style::default().fg(MUTED),
         ))),
         inner,
     );
 }
 
+/// Rows the overflow block needs: one header plus one row per configured
+/// endpoint beyond the monitoring cap. Zero when there is no overflow.
+fn overflow_line_count(overflow: &[crate::app::ServerSpec]) -> usize {
+    if overflow.is_empty() {
+        0
+    } else {
+        overflow.len() + 1
+    }
+}
+
+/// Scroll offset (in rows) that keeps `highlight` inside a window of `visible`
+/// rows out of `total`, without ever scrolling past the end. The last row is
+/// therefore reachable by moving the highlight, and the highlighted row is
+/// always inside the window.
+fn selector_scroll(highlight: usize, total: usize, visible: usize) -> usize {
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    let max_scroll = total - visible;
+    highlight
+        .saturating_sub(visible.saturating_sub(1))
+        .min(max_scroll)
+}
+
 /// Multi-server selector/overview popup. Lists every known server with its
 /// state, slot counts, context and throughput; the selected server is marked
-/// `*` and the highlighted row `>`. Endpoints are redacted before display.
+/// `*` and the highlighted row `>`. The list scrolls so the highlighted row
+/// stays visible and the title carries an `N/M` position indicator. Endpoints
+/// are redacted before display.
 pub(super) fn draw_server_selector(
     frame: &mut Frame,
     area: Rect,
@@ -106,11 +181,7 @@ pub(super) fn draw_server_selector(
     highlight: usize,
     overflow: &[crate::app::ServerSpec],
 ) {
-    let overflow_rows = if overflow.is_empty() {
-        0
-    } else {
-        overflow.len() as u16 + 1
-    };
+    let overflow_rows = overflow_line_count(overflow) as u16;
     let width = area.width.saturating_sub(6).min(78);
     let height = (servers.len() as u16 + overflow_rows + 4)
         .min(area.height.saturating_sub(4))
@@ -125,18 +196,32 @@ pub(super) fn draw_server_selector(
         height,
     );
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" LLM SERVERS · Up/Down · Enter select · Esc close ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ORK_GREEN));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
 
     let highlight = if servers.is_empty() {
         0
     } else {
         highlight.min(servers.len() - 1)
     };
+    // Position indicator so a scrolled list still tells the user how many
+    // servers exist and which one is highlighted.
+    let position = if servers.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", highlight + 1, servers.len())
+    };
+    let block = Block::default()
+        .title(format!(
+            " LLM SERVERS {position} · Up/Down · Enter select · Esc close "
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORK_GREEN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     let mut lines: Vec<Line> = Vec::with_capacity(servers.len());
     for (index, server) in servers.iter().enumerate() {
         let is_selected = server.key == selected_server;
@@ -194,9 +279,13 @@ pub(super) fn draw_server_selector(
     }
     // Configured endpoints beyond the monitoring cap are shown explicitly so
     // they are never silently dropped. They are not polled; endpoints are
-    // redacted (no credentials/query tokens).
+    // redacted (no credentials/query tokens). The block is pinned to the
+    // bottom of the popup: it never scrolls out of view with the server list,
+    // and when it is too tall to fit, at least its header (which names the
+    // count) survives, so the unmonitored extras are always signalled.
+    let mut overflow_lines: Vec<Line> = Vec::with_capacity(overflow_line_count(overflow));
     if !overflow.is_empty() {
-        lines.push(Line::from(Span::styled(
+        overflow_lines.push(Line::from(Span::styled(
             format!(
                 "── NOT MONITORED · server limit reached ({}) ──",
                 overflow.len()
@@ -204,7 +293,7 @@ pub(super) fn draw_server_selector(
             Style::default().fg(YELLOW),
         )));
         for spec in overflow {
-            lines.push(Line::from(vec![
+            overflow_lines.push(Line::from(vec![
                 Span::styled("  ✗ ", Style::default().fg(YELLOW)),
                 Span::styled(
                     fit_cell(&compact_endpoint(&spec.endpoint), 40),
@@ -217,7 +306,58 @@ pub(super) fn draw_server_selector(
             ]));
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    let inner_h = inner.height as usize;
+    let overflow_total = overflow_lines.len();
+    // Give the server list at least one row when servers exist, and cap the
+    // pinned block at half the popup so a long overflow list cannot starve the
+    // interactive server list it sits under. Only an overflow-only popup may
+    // spend its whole height on the block.
+    let reserve_cap = if servers.is_empty() {
+        inner_h
+    } else {
+        inner_h.saturating_sub(1).min((inner_h / 2).max(1))
+    };
+    let overflow_shown = overflow_total.min(reserve_cap);
+    let viewport = inner_h - overflow_shown;
+
+    if viewport > 0 {
+        let scroll = selector_scroll(highlight, lines.len(), viewport) as u16;
+        frame.render_widget(
+            Paragraph::new(lines).scroll((scroll, 0)),
+            Rect::new(inner.x, inner.y, inner.width, viewport as u16),
+        );
+    }
+
+    if overflow_shown > 0 {
+        let hidden = overflow_total - overflow_shown;
+        if hidden > 0 && overflow_shown >= 2 {
+            // Replace the last visible row with an explicit continuation so a
+            // clipped overflow block is never silently cut. The marker occupies
+            // one of the `overflow_shown` rows, so one more entry is hidden
+            // than the raw difference: hidden endpoints = hidden + 1.
+            overflow_lines.truncate(overflow_shown);
+            if let Some(last) = overflow_lines.last_mut() {
+                *last = Line::from(Span::styled(
+                    format!("  … {} more not monitored", hidden + 1),
+                    Style::default().fg(YELLOW),
+                ));
+            }
+        } else {
+            // `overflow_shown == 1` keeps the header, which already names the
+            // total count of unmonitored endpoints.
+            overflow_lines.truncate(overflow_shown);
+        }
+        frame.render_widget(
+            Paragraph::new(overflow_lines),
+            Rect::new(
+                inner.x,
+                inner.y + viewport as u16,
+                inner.width,
+                overflow_shown as u16,
+            ),
+        );
+    }
 }
 
 pub(super) fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState) {
