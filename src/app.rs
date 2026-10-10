@@ -3715,6 +3715,41 @@ mod tests {
             cycle_times.last().map_or(0, |d| d.as_micros()),
         );
 
+        // Component split of the collector (CFA-36): the collector cycle is the
+        // sum of the per-process thread-count read and the per-process DRM fd
+        // scan. Both phases are re-timed here (over the same process table) so
+        // an optimization targets the dominant one. Reported, never asserted.
+        let mut thread_read_total = Duration::ZERO;
+        let mut thread_read_failures = 0usize;
+        for pid in system.processes().keys() {
+            let start = Instant::now();
+            if read_process_thread_count(pid.as_u32()).is_none() {
+                thread_read_failures += 1;
+            }
+            thread_read_total += start.elapsed();
+        }
+        bench_emit(
+            "process_threads_read_total_us",
+            thread_read_total.as_micros(),
+        );
+        bench_emit("process_threads_read_failures", thread_read_failures);
+
+        let mut drm_scan_total = Duration::ZERO;
+        let mut drm_procs_with_gpu = 0usize;
+        let mut drm_scan_state = DrmSamplerState::default();
+        let drm_now = Instant::now();
+        for (pid, process) in system.processes().iter() {
+            let identity = ProcessIdentity::new(pid.as_u32(), process.start_time());
+            let start = Instant::now();
+            let gpus = sample_process_gpus(&RealSys, drm_now, identity, &mut drm_scan_state);
+            drm_scan_total += start.elapsed();
+            if !gpus.is_empty() {
+                drm_procs_with_gpu += 1;
+            }
+        }
+        bench_emit("process_drm_scan_total_us", drm_scan_total.as_micros());
+        bench_emit("process_drm_procs_with_gpu", drm_procs_with_gpu);
+
         // Longer-operation window: render the full dashboard continuously and
         // sample RSS / threads once per second to expose growth over time. This
         // is the closest a unit harness gets to "longer monitoring operation"; a
