@@ -54,11 +54,11 @@ pub(super) fn draw_llm(
         return;
     }
 
-    let context_used = if llm.slots_available {
-        llm.context_used
-    } else {
-        llm.context_high_watermark
-    };
+    // The CTX row shows current occupancy only. Without `/slots` the occupancy
+    // is unknown (`— / capacity`); the `/metrics` high-water mark is a
+    // historical lifetime peak and must never stand in as the current value.
+    // It stays available, explicitly labelled, in `orsiktop diag`.
+    let context_used = llm.context_used;
     let context_pct = match (context_used, llm.context_size) {
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
         _ => 0.0,
@@ -389,11 +389,9 @@ pub(super) fn draw_llm_metrics_unavailable(
     llm: &LlmStats,
     state: &UiState,
 ) {
-    let context_used = if llm.slots_available {
-        llm.context_used
-    } else {
-        llm.context_high_watermark
-    };
+    // Current occupancy only: the high-water mark is historical and is not the
+    // current context value (see `draw_llm`).
+    let context_used = llm.context_used;
     let context_pct = match (context_used, llm.context_size) {
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
         _ => 0.0,
@@ -576,25 +574,23 @@ pub(super) fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     // A server-reported phase (Strata) is authoritative for the request phase:
     // PREFILL while reading the prompt, and GENERATING even when the windowed
     // rate momentarily reads zero. An absent/unknown phase falls through to the
-    // existing activity heuristics, so llama.cpp is unchanged.
-    let strata_phase = llm.strata_phase;
-    let generating = strata_phase == Some(crate::strata::StrataPhase::Generating)
-        || llm.generation_tps.is_some_and(|value| value > 0.05);
-    let reading = strata_phase == Some(crate::strata::StrataPhase::Reading)
-        || llm.prompt_tps.is_some_and(|value| value > 0.05);
-    if llm.reconnecting {
-        ("RECONNECTING", YELLOW)
-    } else if generating {
-        ("GENERATING", ORK_GREEN)
-    } else if reading {
-        ("PREFILL", CYAN)
-    } else if llm.busy_slots > 0 || llm.active_requests.is_some_and(|value| value > 0.0) {
-        ("PROCESSING", YELLOW)
-    } else if llm.deferred_requests.is_some_and(|value| value > 0.0) {
-        ("QUEUED", YELLOW)
+    // existing activity heuristics, so llama.cpp is unchanged. Connection
+    // state is handled here (a lost connection is its own phase), while the
+    // per-server overview additionally suppresses a phase entirely when there
+    // is no reliable evidence.
+    use crate::domain::ActivityPhase;
+    let phase = if llm.reconnecting {
+        ActivityPhase::Reconnecting
     } else {
-        ("IDLE", MUTED)
-    }
+        crate::llama::classify_phase(llm)
+    };
+    let color = match phase {
+        ActivityPhase::Idle => MUTED,
+        ActivityPhase::Prefill => CYAN,
+        ActivityPhase::Generating => ORK_GREEN,
+        ActivityPhase::Processing | ActivityPhase::Queued | ActivityPhase::Reconnecting => YELLOW,
+    };
+    (phase.label(), color)
 }
 
 /// One entry per slot for the per-slot context overview. The slot's own
