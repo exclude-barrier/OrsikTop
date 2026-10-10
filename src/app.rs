@@ -485,19 +485,28 @@ pub fn run(
                             // Any left-click away from a process row releases the pinned process.
                             ui_state.clear_process_selection();
 
-                            let (width, _) = crossterm::terminal::size()?;
-                            let header = Rect::new(0, 0, width, 3);
+                            let (width, height) = crossterm::terminal::size()?;
                             let mut handled = false;
-                            if let Some(controls) = ui::refresh_controls(header) {
-                                if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
-                                    change_refresh(&mut refresh_ms, false, &refresh_shared);
-                                    settings.refresh_ms = refresh_ms;
-                                    handled = true;
-                                } else if ui::rect_contains(controls.plus, mouse.column, mouse.row)
-                                {
-                                    change_refresh(&mut refresh_ms, true, &refresh_shared);
-                                    settings.refresh_ms = refresh_ms;
-                                    handled = true;
+                            // The refresh buttons only exist in the full
+                            // layout; in the compact range those cells show the
+                            // status line, so a click there must not change the
+                            // interval behind an invisible control.
+                            if ui::uses_full_layout(width, height) {
+                                let header = Rect::new(0, 0, width, 3);
+                                if let Some(controls) = ui::refresh_controls(header) {
+                                    if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
+                                        change_refresh(&mut refresh_ms, false, &refresh_shared);
+                                        settings.refresh_ms = refresh_ms;
+                                        handled = true;
+                                    } else if ui::rect_contains(
+                                        controls.plus,
+                                        mouse.column,
+                                        mouse.row,
+                                    ) {
+                                        change_refresh(&mut refresh_ms, true, &refresh_shared);
+                                        settings.refresh_ms = refresh_ms;
+                                        handled = true;
+                                    }
                                 }
                             }
                             if !handled {
