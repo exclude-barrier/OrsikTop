@@ -57,7 +57,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 | Multi-server | — (only a **single** server was ever auto-discovered; parallel polling/isolation/selector never observed live) | Concurrency, per-server isolation, selector rendering, diagnostics inventory | — | `src/app.rs`, `src/discovery_llm.rs`, `src/ui.rs`, `src/diagnostics.rs` tests |
 | TUI | Observed on both boxes (rendered against live data) | 116 `TestBackend` render/interaction tests | — | `src/ui.rs::tests` |
 | Discovery / DRM / GPU mapping / domain | DRM/sysfs discovery + per-process fdinfo on the dev box; BDF identity on both boxes; NVML compute-app mapping on cf-desktop | Parser/shape branches; multi-render-node attribution; render-fd mapping branch; `Multi` mapping state | — | `discovery_real_system_smoke`, `drm_real_system_smoke`; `src/discovery.rs`, `src/drm.rs`, `src/gpu_map.rs`, `src/domain.rs` tests |
-| Config / diagnostics / redaction | `orsiktop diag` on cf-desktop (`docs/HARDWARE_SUPPORT.md:48`, `:59`) and the dev box (`docs/S18_STAGE_SUMMARY.md:72`) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
+| Config / diagnostics / redaction | `orsiktop diag` on cf-desktop (`docs/HARDWARE_SUPPORT.md:55`, `:66`) and the dev box (`docs/S18_STAGE_SUMMARY.md:72`) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
 
 ## Area detail
 
@@ -69,7 +69,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
   Tailscale and against the local cf-desktop server (S24): SLOTS 1/2, per-slot
   CTX `98,307/115,200`, MTP3, speculative counters (310,316 draft / 187,897
   accepted, 60.6%), aggregate live TPS, spec/MTP acceptance hold. The
-  cf-desktop server is `--parallel 2` (`docs/HARDWARE_SUPPORT.md:24`), so it is
+  cf-desktop server is `--parallel 2` (`docs/HARDWARE_SUPPORT.md:31`), so it is
   **not** single-slot evidence. Recorded in `docs/HARDWARE_SUPPORT.md`
   (multi-slot row).
 - **Fixture.** Parsing and aggregation are pinned to checked-in bodies:
@@ -195,7 +195,13 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
   `real_worker_polls_multiple_servers_independently` (`src/app.rs:2873`),
   `an_unreachable_server_does_not_block_a_healthy_one` (`src/app.rs:2921`),
   `a_slow_server_does_not_delay_a_healthy_servers_delivery` (`src/app.rs:3044`),
-  `changed_identity_keys_detects_only_restarted_servers`. Per-server summaries:
+  `rebuild_resets_monitor_on_a_same_endpoint_restart` (`src/app.rs:2967`,
+  the direct test of `rebuild_server_monitors`),
+  `changed_identity_keys_detects_only_restarted_servers` (`src/app.rs:3007`,
+  the app-side history reset). The worker is bounded by the
+  `MAX_MONITORED_SERVERS = 16` cap (`src/domain.rs:25`); servers past the cap
+  are split into `overflow` (`src/main.rs:438`) and reported as not polled
+  (`src/diagnostics.rs:569`). Per-server summaries:
   `build_server_summaries_distinguishes_unavailable_slots_from_real_zero`
   (`src/app.rs:2688`), `build_server_summaries_derives_phase_age_and_backend`
   (`src/app.rs:2774`). Discovery/ordering: `src/discovery_llm.rs::tests`
@@ -209,13 +215,15 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
   `probe_servers_reports_a_healthy_server_while_an_offline_one_is_isolated`
   (`src/diagnostics.rs:1200`).
 - **Unknown.** None.
-- **Known contradiction (needs a separate fix).** `docs/HARDWARE_SUPPORT.md:61`
-  still says the multi-slot row has "one active `LlamaMonitor` … no
-  simultaneous polling", which is stale and contradicts the implemented and
-  tested behaviour (`real_worker_polls_multiple_servers_independently`,
-  `src/app.rs:2873`). This new file follows the code and tests;
-  `docs/HARDWARE_SUPPORT.md` should be corrected to match (follow-up outside
-  this doc-only ticket).
+- **Consistency with `docs/HARDWARE_SUPPORT.md`.** Its multi-slot row previously
+  carried a stale "one active `LlamaMonitor` … no simultaneous polling" claim,
+  which contradicted the implemented and fixture-tested behaviour. That wording
+  is corrected (CFA-40) and now matches this file and the code: `spawn_llm_worker`
+  polls every monitored server concurrently (up to `MAX_MONITORED_SERVERS` = 16,
+  `src/domain.rs:25`; servers past the cap are not polled)
+  (`real_worker_polls_multiple_servers_independently`,
+  `src/app.rs:2873`), and the concurrent path remains fixture-only (see the
+  Multi-server row above).
 
 ### TUI
 
@@ -246,7 +254,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
   Multi-render-node attribution, the render-fd mapping branch, and the `Multi`
   mapping state are fixture-only.
 - **Config / diagnostics / redaction.** `orsiktop diag` is live on cf-desktop
-  (`docs/HARDWARE_SUPPORT.md:48`, `:59`) and the dev box
+  (`docs/HARDWARE_SUPPORT.md:55`, `:66`) and the dev box
   (`docs/S18_STAGE_SUMMARY.md:72`). Rendering redaction and parsing are
   fixture-tested (`src/diagnostics.rs::tests` at `:666`,
   `render_maps_local_server_process_to_render_gpu` at `:733`,
@@ -305,7 +313,8 @@ from *fixture* to *live* with the box named.
 ## Cross-references
 
 - `docs/HARDWARE_SUPPORT.md` — per-capability hardware matrix and evidence
-  levels (detail; note the stale "no simultaneous polling" wording at `:61`).
+  levels (detail; its Multi-server polling and Strata backend rows mirror this
+  file's Live/Fixture/Unknown split).
 - `docs/V0_2_6_NOTES.md` — validation record and pending live items.
 - `docs/S10_STAGE_SUMMARY.md`, `docs/S11_STAGE_SUMMARY.md` — CPU topology,
   cpufreq, RAPL and sensor live validation.
