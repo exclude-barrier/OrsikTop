@@ -63,32 +63,26 @@ pub(super) fn draw_llm(
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
         _ => 0.0,
     };
-    let context_bar = inner.width.saturating_sub(46).max(8) as usize;
     // Multi-slot servers show which slot supplies the displayed CTX pair,
     // using the slot's own /slots `id`. Hidden for a single slot
     // (unambiguous) and when the selected slot reports no id (never a fake
-    // number). Below the width where the CTX bar stops being pinned (54 =
-    // 46 + 8) the tag is dropped before the context values so the row
-    // cannot overflow further.
+    // number). Below the width where the CTX bar stops being pinned the tag
+    // is dropped before the context values so the row cannot overflow.
     let context_slot_tag = (llm.slot_count > 1)
         .then_some(llm.context_slot_id)
         .flatten()
         .filter(|_| inner.width >= 54)
         .map(|id| format!("S{id}"));
-    let mut context_suffix = Vec::new();
-    if let Some(tag) = &context_slot_tag {
-        context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
-    }
-    context_suffix.push(Span::styled(
-        match (context_used, llm.context_size) {
-            (Some(used), size) if size > 0 => {
-                format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
-            }
-            (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
-            _ => " waiting for context".to_string(),
-        },
-        Style::default().fg(MUTED),
-    ));
+    // `ctx_row_metrics` picks a bar width (shrinking it, never below the
+    // floor) and a suffix form so the whole row — label, bar, percentage and
+    // the used/capacity pair — fits `inner.width`. The pair's digits are
+    // never cut.
+    let (context_bar, context_suffix) = ctx_row_metrics(
+        inner.width,
+        context_slot_tag.as_deref(),
+        context_used,
+        llm.context_size,
+    );
     // An unknown occupancy or capacity renders the meter as unavailable (`—`),
     // never as a fabricated `0.0%`; a known zero stays a real `0.0%`.
     let context_line = if context_used.is_some() && llm.context_size > 0 {
@@ -378,6 +372,87 @@ pub(super) fn draw_llm(
     }
 }
 
+/// Fixed prefix widths of a CTX meter row, shared by `meter_line` and
+/// `unavailable_meter_line`: the `" CTX  "` label and the `" {value:<8}"`
+/// percentage (or unavailable placeholder) field.
+const CTX_LABEL_CELLS: usize = 6;
+const CTX_VALUE_CELLS: usize = 9;
+/// Smallest bar still drawn. The bar shrinks to keep the metric values
+/// visible, but never below this, and never so far that a number is cut.
+const CTX_BAR_FLOOR: usize = 4;
+
+/// Choose the CTX bar width and the trailing suffix so the whole row fits
+/// `inner_width` cells. The pair of numbers is never truncated: the bar
+/// shrinks down to [`CTX_BAR_FLOOR`] first, then the slot tag is dropped,
+/// then the `" tok"` unit, and only a panel too narrow for any number falls
+/// back to the bare meter. The nominal (widest) bar mirrors the historical
+/// fixed sizing (`inner_width - 46`, at least 8) and is kept whenever the
+/// suffix fits, so a row that already fit stays unchanged.
+fn ctx_row_metrics(
+    inner_width: u16,
+    tag: Option<&str>,
+    used: Option<u64>,
+    size: u64,
+) -> (usize, Vec<Span<'static>>) {
+    let avail = inner_width as usize;
+    let pair_full = match (used, size) {
+        (Some(used), size) if size > 0 => {
+            format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
+        }
+        (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
+        _ => " waiting for context".to_string(),
+    };
+    // First degradation step: drop only the `" tok"` unit, the `used / capacity`
+    // pair with its ` / ` separator stays whole (never a cut digit).
+    let pair_no_unit = match (used, size) {
+        (Some(used), size) if size > 0 => {
+            format!(" {} / {}", grouped_u64(used), grouped_u64(size))
+        }
+        (None, size) if size > 0 => format!(" — / {}", grouped_u64(size)),
+        _ => " waiting for context".to_string(),
+    };
+    let pair_compact = match (used, size) {
+        (Some(used), size) if size > 0 => format!(" {}/{}", grouped_u64(used), grouped_u64(size)),
+        (None, size) if size > 0 => format!(" —/{}", grouped_u64(size)),
+        _ => " waiting for context".to_string(),
+    };
+    let nominal = avail.saturating_sub(46).max(8);
+
+    // Richest suffix first: with the slot tag, then without it, then with only
+    // the `" tok"` unit dropped (`used / capacity`), then the compact form and
+    // finally the bare meter. The bar shrinks (down to the floor) before a
+    // richer suffix is abandoned, and the numeric pair is only given up when
+    // even the compact form cannot reach the bar floor.
+    let candidates = [
+        (tag, pair_full.as_str()),
+        (None, pair_full.as_str()),
+        (None, pair_no_unit.as_str()),
+        (None, pair_compact.as_str()),
+        (None, ""),
+    ];
+    for (candidate_tag, text) in candidates {
+        let mut width = text.chars().count();
+        let mut spans = Vec::new();
+        if let Some(tag) = candidate_tag {
+            spans.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
+            width += 1 + tag.chars().count();
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text.to_string(), Style::default().fg(MUTED)));
+        }
+        let max_bar = avail.saturating_sub(CTX_LABEL_CELLS + CTX_VALUE_CELLS + width);
+        if max_bar >= CTX_BAR_FLOOR {
+            return (nominal.min(max_bar), spans);
+        }
+    }
+    // Narrower than the floor for every suffix (below the supported panel
+    // widths): keep the row inside `avail` with the bare meter, no suffix.
+    (
+        nominal.min(avail.saturating_sub(CTX_LABEL_CELLS + CTX_VALUE_CELLS)),
+        Vec::new(),
+    )
+}
+
 /// Panel rendered when the server is reachable (`connected`) but `/metrics`
 /// is unavailable or disabled. The `/slots`-derived state — slot counts, the
 /// selected CTX pair and the per-slot overview — stays visible; every
@@ -396,26 +471,17 @@ pub(super) fn draw_llm_metrics_unavailable(
         (Some(used), size) if size > 0 => (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
         _ => 0.0,
     };
-    let context_bar = inner.width.saturating_sub(46).max(8) as usize;
     let context_slot_tag = (llm.slot_count > 1)
         .then_some(llm.context_slot_id)
         .flatten()
         .filter(|_| inner.width >= 54)
         .map(|id| format!("S{id}"));
-    let mut context_suffix = Vec::new();
-    if let Some(tag) = &context_slot_tag {
-        context_suffix.push(Span::styled(format!(" {tag}"), Style::default().fg(CYAN)));
-    }
-    context_suffix.push(Span::styled(
-        match (context_used, llm.context_size) {
-            (Some(used), size) if size > 0 => {
-                format!(" {} / {} tok", grouped_u64(used), grouped_u64(size))
-            }
-            (None, size) if size > 0 => format!(" — / {} tok", grouped_u64(size)),
-            _ => " waiting for context".to_string(),
-        },
-        Style::default().fg(MUTED),
-    ));
+    let (context_bar, context_suffix) = ctx_row_metrics(
+        inner.width,
+        context_slot_tag.as_deref(),
+        context_used,
+        llm.context_size,
+    );
     // An unknown occupancy or capacity renders the meter as unavailable (`—`),
     // never as a fabricated `0.0%`; a known zero stays a real `0.0%`.
     let context_line = if context_used.is_some() && llm.context_size > 0 {
