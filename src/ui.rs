@@ -46,6 +46,8 @@ use widgets::*;
 
 #[cfg(test)]
 mod layout_regression_tests;
+#[cfg(test)]
+mod ux_baseline_tests;
 
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_MAX_SAMPLES: usize = 720;
