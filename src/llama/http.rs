@@ -1,5 +1,8 @@
 //! Extracted from the former monolithic `llama.rs`. Behavior-preserving split.
-use super::*;
+use reqwest::blocking::Client;
+use serde_json::Value;
+
+use super::{JsonOutcome, MetricsOutcome, MAX_RESPONSE_BYTES};
 
 /// Join a scoped fetch handle, converting a thread panic into the caller's
 /// error outcome instead of propagating it. A panic in one endpoint's fetch
@@ -83,6 +86,7 @@ pub(super) fn fetch_json(client: &Client, url: String) -> JsonOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::thread;

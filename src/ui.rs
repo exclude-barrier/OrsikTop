@@ -7,18 +7,22 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
+#[cfg(test)]
+use crate::cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology};
+#[cfg(test)]
+use crate::domain::{ActivityPhase, LlmSlotInfo};
+#[cfg(test)]
+use crate::gpu;
 use crate::{
     config::{AppConfig, MAX_OFFLINE_GRACE_MS, MAX_PROCESS_REFRESH_MS, MIN_PROCESS_REFRESH_MS},
-    cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology, CpuVendor},
     domain::{
-        ActivityPhase, GpuMapping, GpuSelector, GpuStats, LlmSlotInfo, LlmStats, MappedGpu,
-        ProcessIdentity, ProcessStats, ServerSummary, SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
+        GpuMapping, GpuSelector, GpuStats, LlmStats, ProcessIdentity, ProcessStats, ServerSummary,
+        SystemStats, MAX_REFRESH_MS, MIN_REFRESH_MS,
     },
-    gpu,
 };
 
 // Extracted submodules (behavior-preserving refactor).
@@ -29,20 +33,41 @@ mod llm;
 mod processes;
 mod system;
 mod widgets;
-#[allow(unused_imports)]
-use dialogs::*;
-#[allow(unused_imports)]
-use gpu_panel::*;
-#[allow(unused_imports)]
-use history::*;
-#[allow(unused_imports)]
-use llm::*;
-#[allow(unused_imports)]
-use processes::*;
-#[allow(unused_imports)]
-use system::*;
-#[allow(unused_imports)]
-use widgets::*;
+use dialogs::{
+    build_endpoint, default_port_for_scheme, draw_help_popup, draw_server_selector,
+    draw_settings_popup, endpoint_parts, parse_setting_u64,
+};
+use gpu_panel::{draw_gpu, enc_dec_idle};
+#[cfg(test)]
+use gpu_panel::{gpu_attribution_label, gpu_in_mapping};
+#[cfg(test)]
+use history::{
+    braille_char, llm_rate_history_has_activity, resample_history, smooth_llm_sample_interval,
+    trend_lines,
+};
+use history::{draw_history, observe_llm_into, push_history_at};
+use llm::{draw_llm, friendly_llm_error, llm_link_status, metrics_unavailable_reason};
+#[cfg(test)]
+use llm::{
+    llm_last_sample_text, llm_phase, llm_slot_overview_line, llm_spec_row, slot_overview_entries,
+};
+use processes::{
+    draw_processes, grouped_process_rows_filtered, process_row_target, take_pinned_group_rows,
+};
+#[cfg(test)]
+use processes::{grouped_process_rows, process_matches_search, sorted_processes_with_pin};
+#[cfg(test)]
+use system::{
+    core_heatmap_rows, core_usage_color, core_usage_glyph, physical_core_average,
+    physical_core_color, system_full_view,
+};
+use system::{draw_system, load_average_text, system_panel_height};
+#[cfg(test)]
+use widgets::{
+    bar_gradient_color, clamp_percent, fine_bar, fine_bar_spans, fixed_data_pair, grouped_f64,
+    grouped_u64, label_span, meter_line, optional_number, thread_cell,
+};
+use widgets::{button_span, compact_endpoint, fit_cell, percent};
 
 #[cfg(test)]
 mod layout_regression_tests;

@@ -1,5 +1,22 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use std::time::Instant;
+
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
+};
+
+use super::gpu_panel::gpu_attribution_label;
+use super::history::draw_llm_rate_history;
+use super::widgets::{
+    compact_tokens, format_sample_age, format_uptime, grouped_f64, grouped_u64, label_span,
+    llm_metric_cell, llm_sep, meter_line, unavailable_meter_line, value_span,
+};
+use super::{UiState, BRIGHT_GREEN, CYAN, DIM_GREEN, MUTED, ORANGE, ORK_GREEN, RED, WHITE, YELLOW};
+use crate::domain::{GpuMapping, LlmSlotInfo, LlmStats};
 
 pub(super) fn draw_llm(
     frame: &mut Frame,
