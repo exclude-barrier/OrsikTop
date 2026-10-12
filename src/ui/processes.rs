@@ -1,5 +1,21 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use std::collections::{HashMap, HashSet};
+
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
+};
+
+use super::widgets::{compact_memory, fit_cell, gpu_cell, thread_cell};
+use super::{
+    ProcessDisplayRow, ProcessGroup, ProcessHeaderHit, ProcessRowTarget, ProcessRowsHit,
+    ProcessSortKey, UiState, BRIGHT_GREEN, CYAN, DIM_GREEN, INNER_GREEN, MUTED, ORANGE, ORK_GREEN,
+    PROCESS_SELECTED_BG, YELLOW,
+};
+use crate::domain::{ProcessIdentity, ProcessStats};
 
 pub(super) fn process_row_target(row: &ProcessDisplayRow<'_>) -> ProcessRowTarget {
     match row {
