@@ -1,5 +1,13 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use std::time::Duration;
+
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+
+use super::{BAR_EMPTY, CYAN, INNER_GREEN, MUTED, ORANGE, ORK_GREEN, RED, WHITE, YELLOW};
+use crate::cpu::{CpuTopology, CpuVendor};
 
 pub(super) fn format_sample_age(age: Duration) -> String {
     let millis = age.as_millis();

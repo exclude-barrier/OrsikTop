@@ -26,8 +26,8 @@ use crate::{
     discovery_llm::LocalServerIdentity,
     domain::{
         DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessIdentity, ProcessStats,
-        ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
-        MIN_REFRESH_MS, REFRESH_STEP_MS,
+        ServerBackend, ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS,
+        MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
     drm::{sample_process_gpus, DrmSamplerState},
     gpu::new_gpu_provider,
@@ -49,6 +49,77 @@ const SLOW_SENSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 /// a single `/proc` scan, never per UI frame. Manual endpoints are static, so
 /// no scan happens for them.
 const SERVER_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum time the render loop may go without repainting when nothing changed.
+///
+/// The loop used to repaint in every iteration, and an idle iteration was
+/// bounded by `event::poll(50 ms)` — about 20 full redraws per second with no
+/// new data. A repaint now happens only when the visible state changed or when
+/// this tick elapses. The tick is kept because parts of the view are
+/// wall-clock-relative ("{age} ago", uptime) and the transient CONNECTED flash
+/// must be able to expire; 250 ms bounds that staleness while an idle dashboard
+/// drops to ~4 repaints/s.
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Upper bound on how long `event::poll` may block before the loop re-checks
+/// its channels. This preserves the original ~50 ms data-drain latency, so a
+/// configured 100 ms refresh still reaches the screen promptly; only the
+/// repaint itself is paced, not the collection cadence.
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Paces repaints for the render loop.
+///
+/// A repaint is requested (`mark_dirty`) whenever an applied snapshot/sample or
+/// an input event can change what is on screen; `should_paint` also fires once
+/// per `interval` so time-relative text keeps advancing while idle. Keeping the
+/// decision in one place is what makes the idle redraw rate measurable without
+/// a terminal.
+struct RedrawScheduler {
+    dirty: bool,
+    next_tick: Instant,
+    interval: Duration,
+}
+
+impl RedrawScheduler {
+    fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            dirty: true,
+            next_tick: now,
+            interval,
+        }
+    }
+
+    /// Request a repaint at the next opportunity (state or input changed).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Whether the view must be painted at `now`. Advances the idle tick on
+    /// every paint so a stationary dashboard repaints at a bounded rate.
+    fn should_paint(&mut self, now: Instant) -> bool {
+        if self.dirty || now >= self.next_tick {
+            self.dirty = false;
+            self.next_tick = now + self.interval;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// How long `event::poll` may block. A dirty view returns zero so the
+    /// repaint is not delayed; a clean view waits for the next idle tick but
+    /// never longer than `MAX_POLL_INTERVAL`, so newly arrived samples are
+    /// still drained promptly. Input wakes the poll immediately either way.
+    fn poll_timeout(&self, now: Instant) -> Duration {
+        if self.dirty {
+            Duration::ZERO
+        } else {
+            self.next_tick
+                .saturating_duration_since(now)
+                .min(MAX_POLL_INTERVAL)
+        }
+    }
+}
 
 pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -141,10 +212,15 @@ pub fn run(
     let mut snapshot = DashboardSnapshot::default();
     let mut ui_state = UiState::default();
     let mut last_server_resync = Instant::now();
+    let mut scheduler = RedrawScheduler::new(Instant::now(), IDLE_REDRAW_INTERVAL);
 
     loop {
+        // Each applied fast snapshot can change the overview; repaint on the
+        // next iteration rather than waiting for the idle tick. Fast snapshots
+        // have no rejection path — only LLM samples are filtered (below).
         while let Ok(next) = fast_rx.try_recv() {
             apply_fast_snapshot(&mut snapshot, &mut ui_state, mapping_generation, next);
+            scheduler.mark_dirty();
         }
         while let Ok(next) = llm_rx.try_recv() {
             // Drop results produced for a server set we already replaced, or
@@ -164,8 +240,11 @@ pub fn run(
             if is_selected {
                 snapshot.llm = next.stats;
             }
+            // An accepted sample changes the overview and/or the active view.
+            scheduler.mark_dirty();
         }
-        snapshot.servers = build_server_summaries(&order, &endpoints, &registry);
+        snapshot.servers =
+            build_server_summaries(&order, &endpoints, &registry, &ui_state, Instant::now());
         snapshot.selected_server = selected.clone();
 
         // S16: an auto-discovered server is dynamic — it can restart on the
@@ -193,26 +272,33 @@ pub fn run(
                 &mut ui_state,
             );
             last_server_resync = Instant::now();
+            // A resync can add/remove/replace a monitored server.
+            scheduler.mark_dirty();
         }
 
-        terminal.draw(|frame| {
-            ui::draw(
-                frame,
-                &snapshot.system,
-                &snapshot.llm,
-                &snapshot.gpu,
-                &snapshot.gpu_map,
-                &snapshot.servers,
-                &snapshot.selected_server,
-                &overflow,
-                &mut ui_state,
-                &resolved.endpoint,
-                refresh_ms,
-                resolved.auto,
-            )
-        })?;
+        if scheduler.should_paint(Instant::now()) {
+            terminal.draw(|frame| {
+                ui::draw(
+                    frame,
+                    &snapshot.system,
+                    &snapshot.llm,
+                    &snapshot.gpu,
+                    &snapshot.gpu_map,
+                    &snapshot.servers,
+                    &snapshot.selected_server,
+                    &overflow,
+                    &mut ui_state,
+                    &resolved.endpoint,
+                    refresh_ms,
+                    resolved.auto,
+                )
+            })?;
+        }
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(scheduler.poll_timeout(Instant::now()))? {
+            // Any input/resize can change the rendered view; let the next
+            // iteration repaint promptly instead of waiting for the idle tick.
+            scheduler.mark_dirty();
             match event::read()? {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Repeat
@@ -400,19 +486,28 @@ pub fn run(
                             // Any left-click away from a process row releases the pinned process.
                             ui_state.clear_process_selection();
 
-                            let (width, _) = crossterm::terminal::size()?;
-                            let header = Rect::new(0, 0, width, 3);
+                            let (width, height) = crossterm::terminal::size()?;
                             let mut handled = false;
-                            if let Some(controls) = ui::refresh_controls(header) {
-                                if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
-                                    change_refresh(&mut refresh_ms, false, &refresh_shared);
-                                    settings.refresh_ms = refresh_ms;
-                                    handled = true;
-                                } else if ui::rect_contains(controls.plus, mouse.column, mouse.row)
-                                {
-                                    change_refresh(&mut refresh_ms, true, &refresh_shared);
-                                    settings.refresh_ms = refresh_ms;
-                                    handled = true;
+                            // The refresh buttons only exist in the full
+                            // layout; in the compact range those cells show the
+                            // status line, so a click there must not change the
+                            // interval behind an invisible control.
+                            if ui::uses_full_layout(width, height) {
+                                let header = Rect::new(0, 0, width, 3);
+                                if let Some(controls) = ui::refresh_controls(header) {
+                                    if ui::rect_contains(controls.minus, mouse.column, mouse.row) {
+                                        change_refresh(&mut refresh_ms, false, &refresh_shared);
+                                        settings.refresh_ms = refresh_ms;
+                                        handled = true;
+                                    } else if ui::rect_contains(
+                                        controls.plus,
+                                        mouse.column,
+                                        mouse.row,
+                                    ) {
+                                        change_refresh(&mut refresh_ms, true, &refresh_shared);
+                                        settings.refresh_ms = refresh_ms;
+                                        handled = true;
+                                    }
                                 }
                             }
                             if !handled {
@@ -524,10 +619,17 @@ fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
 }
 
 /// Build the compact per-server summaries for the overview, in `order`.
+///
+/// All new per-server fields are pure derivations from already-collected data:
+/// the activity phase and backend come from that server's `LlmStats`, and the
+/// measurement age / sample interval from its own per-server UI history — no
+/// extra polling and no telemetry-semantics change.
 fn build_server_summaries(
     order: &[String],
     endpoints: &BTreeMap<String, String>,
     registry: &BTreeMap<String, LlmStats>,
+    ui_state: &UiState,
+    now: Instant,
 ) -> Vec<ServerSummary> {
     order
         .iter()
@@ -544,6 +646,12 @@ fn build_server_summaries(
                 label,
                 connected: stats.is_some_and(|stats| stats.connected && !stats.reconnecting),
                 reconnecting: stats.is_some_and(|stats| stats.reconnecting),
+                // Absent telemetry leaves the phase unknown (`—`), never a
+                // guessed `IDLE`; a server with evidence carries its phase.
+                phase: stats.and_then(crate::llama::activity_phase),
+                age_ms: ui_state.server_sample_age_ms(key, now),
+                sample_interval_ms: ui_state.server_sample_interval_ms(key),
+                backend: stats.map_or(ServerBackend::Unknown, |stats| stats.backend),
                 // Slot availability is propagated explicitly so an absent or
                 // failed `/slots` never collapses to a fabricated `0/0`.
                 slots_available: stats.is_some_and(|stats| stats.slots_available),
@@ -2555,7 +2663,13 @@ mod tests {
             },
         );
 
-        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].label, "model-A");
         assert!(summaries[0].connected);
@@ -2630,7 +2744,13 @@ mod tests {
             },
         );
 
-        let summaries = build_server_summaries(&order, &endpoints, &registry);
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
         assert!(!summaries[0].slots_available, "metrics-only slots unknown");
         assert!(summaries[0].connected, "metrics-only server is connected");
         assert_eq!(
@@ -2648,6 +2768,105 @@ mod tests {
         assert!(!summaries[3].slots_available);
         // No cross-server contamination: each summary reflects only its own key.
         assert_ne!(summaries[2].slot_count, summaries[1].slot_count);
+    }
+
+    #[test]
+    fn build_server_summaries_derives_phase_age_and_backend() {
+        use crate::domain::ActivityPhase;
+        use crate::strata::StrataPhase;
+
+        let order = vec![
+            "gen".to_string(),
+            "quiet".to_string(),
+            "strata".to_string(),
+            "offline_reg".to_string(),
+            "off".to_string(),
+        ];
+        let mut endpoints = BTreeMap::new();
+        for key in &order {
+            endpoints.insert(key.clone(), format!("http://{key}:8080"));
+        }
+        let mut registry = BTreeMap::new();
+        registry.insert(
+            "gen".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                generation_tps: Some(20.0),
+                backend: ServerBackend::LlamaCpp,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "quiet".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                backend: ServerBackend::LlamaCpp,
+                ..Default::default()
+            },
+        );
+        registry.insert(
+            "strata".to_string(),
+            LlmStats {
+                connected: true,
+                metrics_available: true,
+                strata_phase: Some(StrataPhase::Reading),
+                backend: ServerBackend::Strata,
+                ..Default::default()
+            },
+        );
+        // A registry entry that is currently not answering: its phase must be
+        // unknown (`None`), never a guessed `IDLE`.
+        registry.insert(
+            "offline_reg".to_string(),
+            LlmStats {
+                connected: false,
+                ..Default::default()
+            },
+        );
+        // "off" has no registry entry at all: never sampled.
+
+        let mut ui_state = UiState::default();
+        for key in ["gen", "quiet", "strata"] {
+            ui_state.record_llm_sample(
+                key,
+                "gen",
+                &LlmStats {
+                    connected: true,
+                    metrics_available: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let now = Instant::now();
+        let summaries = build_server_summaries(&order, &endpoints, &registry, &ui_state, now);
+
+        assert_eq!(summaries[0].phase, Some(ActivityPhase::Generating));
+        assert_eq!(summaries[1].phase, Some(ActivityPhase::Idle));
+        assert_eq!(summaries[2].phase, Some(ActivityPhase::Prefill));
+        assert_eq!(
+            summaries[3].phase, None,
+            "a not-answering registry entry stays unknown, not IDLE"
+        );
+        assert_eq!(
+            summaries[4].phase, None,
+            "never sampled stays unknown, not IDLE"
+        );
+
+        assert_eq!(summaries[0].backend, ServerBackend::LlamaCpp);
+        assert_eq!(summaries[2].backend, ServerBackend::Strata);
+        assert_eq!(summaries[4].backend, ServerBackend::Unknown);
+
+        assert!(summaries[0].age_ms.is_some(), "sampled server has an age");
+        assert!(
+            summaries[3].age_ms.is_none(),
+            "a not-answering server has no fresh age"
+        );
+        assert!(
+            summaries[4].age_ms.is_none(),
+            "a server that never answered has no age, never a fake 0"
+        );
     }
 
     #[test]
@@ -2876,5 +3095,1699 @@ mod tests {
         b_stop.store(true, Ordering::Relaxed);
         let _ = a_handle.join();
         let _ = b_handle.join();
+    }
+
+    #[test]
+    fn idle_repaint_is_skipped_until_the_tick() {
+        let start = Instant::now();
+        let mut scheduler = RedrawScheduler::new(start, IDLE_REDRAW_INTERVAL);
+
+        // The first frame always paints; with no state change the view is then
+        // left untouched until the idle tick elapses.
+        assert!(scheduler.should_paint(start));
+        assert!(!scheduler.should_paint(start + Duration::from_millis(50)));
+        assert!(!scheduler.should_paint(start + Duration::from_millis(249)));
+
+        // A real change paints immediately instead of waiting for the tick.
+        scheduler.mark_dirty();
+        assert!(scheduler.should_paint(start + Duration::from_millis(100)));
+        assert!(!scheduler.should_paint(start + Duration::from_millis(101)));
+    }
+
+    #[test]
+    fn poll_timeout_never_delays_a_repaint_and_bounds_the_drain_latency() {
+        let start = Instant::now();
+        let mut scheduler = RedrawScheduler::new(start, IDLE_REDRAW_INTERVAL);
+
+        // Dirty view: `event::poll` must not block, so the frame is drawn now.
+        assert_eq!(scheduler.poll_timeout(start), Duration::ZERO);
+        assert!(scheduler.should_paint(start));
+        // Clean view: the poll is capped, so newly arrived samples are drained
+        // promptly even when the next idle tick is still far away.
+        assert_eq!(scheduler.poll_timeout(start), MAX_POLL_INTERVAL);
+        assert_eq!(
+            scheduler.poll_timeout(start + Duration::from_millis(240)),
+            Duration::from_millis(10)
+        );
+    }
+
+    /// Simulates the production loop for one second and returns how many times
+    /// it painted. The loop advances by `poll_timeout`, exactly as the real
+    /// `event::poll` bounds an iteration; `snapshot_interval` models the fast
+    /// worker pushing a (repaint-forcing) snapshot on that cadence, and `None`
+    /// models a loop that receives no new data at all.
+    fn simulated_idle_redraws(snapshot_interval: Option<Duration>) -> usize {
+        let one_second = Duration::from_secs(1);
+        let start = Instant::now();
+        let mut scheduler = RedrawScheduler::new(start, IDLE_REDRAW_INTERVAL);
+        let mut now = Duration::ZERO;
+        let mut next_snapshot = snapshot_interval;
+        let mut redraws = 0usize;
+        while now < one_second {
+            if let (Some(interval), Some(at)) = (snapshot_interval, next_snapshot) {
+                if now >= at {
+                    scheduler.mark_dirty();
+                    next_snapshot = Some(at + interval);
+                }
+            }
+            if scheduler.should_paint(start + now) {
+                redraws += 1;
+            }
+            now += scheduler.poll_timeout(start + now);
+        }
+        redraws
+    }
+
+    #[test]
+    fn idle_redraw_rate_is_cut_from_the_50ms_poll_to_the_tick() {
+        // Before: an idle iteration was bounded by `event::poll(50 ms)` and the
+        // loop painted every iteration => 20 full redraws per second.
+        let before =
+            Duration::from_secs(1).as_millis() as usize / MAX_POLL_INTERVAL.as_millis() as usize;
+        assert_eq!(before, 20, "documented pre-change idle redraw rate");
+
+        // After: with no state change and no input, only the idle tick paints.
+        let idle = simulated_idle_redraws(None);
+        assert!(idle < before, "idle redraws {idle} not below {before}");
+        assert!(idle <= 4, "idle redraws {idle}/s exceed the ~4/s budget");
+
+        // A fast snapshot on the default 1000 ms cadence lands on the idle tick,
+        // so it adds nothing; a 100 ms cadence roughly doubles the rate. These
+        // bound the real idle rate (not just the scheduler floor).
+        assert_eq!(
+            simulated_idle_redraws(Some(Duration::from_millis(1_000))),
+            idle
+        );
+        let fast = simulated_idle_redraws(Some(Duration::from_millis(100)));
+        assert_eq!(fast, 10, "100 ms snapshots should yield ~10 redraws/s");
+        assert!(fast < before);
+    }
+
+    // ------------------------------------------------------------------
+    // CFA-35 — reproducible runtime performance baseline
+    // ------------------------------------------------------------------
+    //
+    // Two benchmarks drive the *real* runtime paths (the synchronous
+    // `LlamaMonitor` HTTP poll, the ratatui render closure over a full
+    // 16-server dashboard, the production `RedrawScheduler` model and the
+    // `/proc` process collector) and emit machine-readable
+    // `ORSKTOP_BENCH|<key>=<value>` lines on the raw process stdout: libtest
+    // captures `println!`, but a direct `stdout().write_all` still reaches the
+    // `cargo test` log.
+    //
+    //  * `perf_baseline_benchmark_for_dirty_only_redraw_and_polling` — the cheap
+    //    in-gate part. It exercises the poll path against blocking-accept mock
+    //    servers, the render closure and TUI input latency, reports thread-local
+    //    CPU, and reads *no* `/proc` process tables. It is small enough (~0.5 s)
+    //    to run in every sanctioned gate, which is exactly what lets an
+    //    independent `pc-project cargo test --all-targets --locked` run
+    //    reproduce its numbers.
+    //
+    //  * `perf_baseline_soak_and_process_collection_benchmark` — `#[ignore]`d. It
+    //    holds the expensive parts (the full host `/proc`+DRM process-table
+    //    collection and a longer-operation window) that must not run in every
+    //    gate. It needs a targeted, single-threaded invocation:
+    //      cargo test --all-targets --locked -- --ignored --test-threads=1 \
+    //        perf_baseline_soak_and_process_collection_benchmark
+    //    The sanctioned `pc-project cargo test` gate only accepts the fixed
+    //    argument list and cannot forward those flags, so running it needs an
+    //    operator-approved benchmark runner; the limitation is recorded in
+    //    `docs/PERFORMANCE_BASELINE.md`.
+    //
+    // Every timing is *reported*, never asserted: the tests assert only
+    // structural invariants, so they cannot flake and they do not turn the
+    // shared suite into a brittle wall-clock gate. The wall-clock figures are a
+    // per-machine baseline (see `docs/PERFORMANCE_BASELINE.md`), not a CI
+    // threshold.
+
+    /// Assumed Linux `USER_HZ` for converting `/proc/.../stat` jiffies to
+    /// microseconds. 100 Hz is the near-universal default; it is documented
+    /// rather than probed so the benchmark has no extra dependency.
+    const BENCH_CLK_TCK: f64 = 100.0;
+
+    fn bench_emit(key: &str, value: impl std::fmt::Display) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "ORSKTOP_BENCH|{key}={value}");
+        let _ = out.flush();
+    }
+
+    /// `utime + stime` of the *calling thread* in clock ticks
+    /// (`/proc/thread-self/stat`, fields 14+15). Reading `/proc/self/stat`
+    /// instead would sum every thread of the parallel libtest process and report
+    /// CPU this test did not spend; thread-self isolates it. Parsing resumes
+    /// after the final `)` so a `comm` with spaces or parentheses cannot shift
+    /// the fields.
+    fn thread_cpu_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+        let rest = stat.rsplit_once(')')?.1;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let utime: u64 = fields.get(11)?.parse().ok()?;
+        let stime: u64 = fields.get(12)?.parse().ok()?;
+        Some(utime + stime)
+    }
+
+    fn bench_ticks_to_us(ticks: u64) -> u128 {
+        (u128::from(ticks) * 1_000_000) / BENCH_CLK_TCK as u128
+    }
+
+    /// First numeric field of a `/proc/self/status` line (e.g. `VmRSS:`,
+    /// `Threads:`).
+    fn self_status_field(name: &str) -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status.lines().find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+    }
+
+    /// Nearest-rank percentile of an ascending-sorted slice.
+    fn bench_percentile(sorted: &[Duration], q: f64) -> Duration {
+        if sorted.is_empty() {
+            return Duration::ZERO;
+        }
+        let idx = (((sorted.len() - 1) as f64) * q).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    fn bench_mean(durations: &[Duration]) -> Duration {
+        if durations.is_empty() {
+            return Duration::ZERO;
+        }
+        let total: Duration = durations.iter().sum();
+        total / durations.len() as u32
+    }
+
+    /// A mock server with a **blocking** `accept`. Unlike `spawn_plain_server`
+    /// (non-blocking listener + 2 ms `WouldBlock` sleep), it answers as soon as a
+    /// request arrives, so a measured poll cycle reflects OrsikTop's HTTP client
+    /// work instead of the mock's sleep quantum. Stop it with
+    /// `stop_blocking_mock`, which wakes the blocked `accept` with one
+    /// connection.
+    fn spawn_blocking_mock(
+        model: &'static str,
+        n_ctx: u64,
+        prompt_tokens: u64,
+        predicted: u64,
+    ) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The stop wake-up connects without sending a request;
+                        // break before the 2 s read timeout would stall the join.
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Some(path) = read_request_path(&mut stream) {
+                            let (body, content_type) =
+                                mock_body(&path, model, n_ctx, prompt_tokens, predicted);
+                            write_http(&mut stream, &body, content_type);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop, handle)
+    }
+
+    fn stop_blocking_mock(
+        stop: &Arc<AtomicBool>,
+        addr: SocketAddr,
+        handle: thread::JoinHandle<()>,
+    ) {
+        stop.store(true, Ordering::Relaxed);
+        // Wake the blocked `accept`; the loop then observes the stop flag.
+        let _ = TcpStream::connect(addr);
+        let _ = handle.join();
+    }
+
+    /// A representative full dashboard: `server_count` servers and a
+    /// `process_count`-row process table (the "large process list" scenario).
+    fn bench_dashboard(server_count: usize, process_count: u32) -> DashboardSnapshot {
+        let processes: Vec<ProcessStats> = (0..process_count)
+            .map(|i| ProcessStats {
+                pid: 1000 + i,
+                program: format!("worker-{i}"),
+                command: format!("/usr/bin/worker-{i} --slot {i}"),
+                cpu_pct: f64::from(i % 100),
+                memory_bytes: u64::from(i + 1) * 1_048_576,
+                threads: Some(((i % 16) + 1) as usize),
+                start_time: 1_700_000_000 + u64::from(i),
+                gpu: Vec::new(),
+            })
+            .collect();
+
+        let order: Vec<String> = (0..server_count)
+            .map(|i| format!("http://10.0.0.{i}:8080/"))
+            .collect();
+        let mut endpoints = BTreeMap::new();
+        let mut registry = BTreeMap::new();
+        for (i, key) in order.iter().enumerate() {
+            endpoints.insert(key.clone(), key.trim_end_matches('/').to_string());
+            registry.insert(
+                key.clone(),
+                LlmStats {
+                    connected: true,
+                    metrics_available: true,
+                    slots_available: true,
+                    slot_count: 4,
+                    busy_slots: (i % 5) as u64,
+                    context_used: Some(1000 + i as u64),
+                    context_size: 8192,
+                    model: format!("model-{i}"),
+                    generation_tps: Some(20.0),
+                    backend: ServerBackend::LlamaCpp,
+                    ..Default::default()
+                },
+            );
+        }
+        let servers = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
+        DashboardSnapshot {
+            system: SystemStats {
+                memory_used_bytes: 32 * 1024 * 1024 * 1024,
+                memory_total_bytes: 64 * 1024 * 1024 * 1024,
+                load_one: Some(1.0),
+                load_five: Some(0.8),
+                load_fifteen: Some(0.5),
+                processes,
+                ..Default::default()
+            },
+            servers,
+            selected_server: order[0].clone(),
+            llm: registry[&order[0]].clone(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn perf_baseline_benchmark_for_dirty_only_redraw_and_polling() {
+        let wall_start = Instant::now();
+        let cpu_start = thread_cpu_ticks();
+
+        // Redraw frequency is a deterministic *model* of the production
+        // `RedrawScheduler`, not a wall-clock measurement. Keys carry a `model_`
+        // prefix so the document cannot present them as measured data; the real
+        // assertion lives in
+        // `idle_redraw_rate_is_cut_from_the_50ms_poll_to_the_tick`.
+        bench_emit("model_redraw_pre_optimization_per_s", 20);
+        bench_emit("model_redraw_idle_per_s", simulated_idle_redraws(None));
+        for interval_ms in [100u64, 250, 1000] {
+            bench_emit(
+                &format!("model_redraw_per_s_interval_{interval_ms}ms"),
+                simulated_idle_redraws(Some(Duration::from_millis(interval_ms))),
+            );
+        }
+
+        let snapshot = bench_dashboard(16, 400);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
+        let mut ui_state = UiState::default();
+        let render_frame = |terminal: &mut Terminal<ratatui::backend::TestBackend>,
+                            ui_state: &mut UiState| {
+            terminal
+                .draw(|frame| {
+                    ui::draw(
+                        frame,
+                        &snapshot.system,
+                        &snapshot.llm,
+                        &snapshot.gpu,
+                        &snapshot.gpu_map,
+                        &snapshot.servers,
+                        &snapshot.selected_server,
+                        &[],
+                        ui_state,
+                        "http://10.0.0.0:8080",
+                        1000,
+                        false,
+                    )
+                })
+                .unwrap();
+        };
+
+        // First frame *in this test process* — not full program start: GPU
+        // discovery, NVML init and sensor discovery run in `spawn_fast_worker`
+        // before any frame is drawn and are not part of this measurement.
+        let cold_start = Instant::now();
+        render_frame(&mut terminal, &mut ui_state);
+        bench_emit(
+            "render_first_frame_in_process_us",
+            cold_start.elapsed().as_micros(),
+        );
+
+        // Warm steady state. CPU comes from *this thread*, not the process: a
+        // single ≤6 ms frame is below the 10 ms jiffy resolution, so the
+        // per-frame CPU is derived from the sum over the whole loop.
+        let warm_iterations = 60usize;
+        let mut warm_render = Vec::with_capacity(warm_iterations);
+        let render_cpu_before = thread_cpu_ticks();
+        for _ in 0..warm_iterations {
+            let frame_start = Instant::now();
+            render_frame(&mut terminal, &mut ui_state);
+            warm_render.push(frame_start.elapsed());
+        }
+        let render_cpu = render_cpu_before
+            .zip(thread_cpu_ticks())
+            .map(|(before, after)| after.saturating_sub(before));
+        warm_render.sort();
+        let warm_mean = bench_mean(&warm_render);
+        bench_emit("render_warm_mean_us", warm_mean.as_micros());
+        bench_emit(
+            "render_warm_p95_us",
+            bench_percentile(&warm_render, 0.95).as_micros(),
+        );
+        bench_emit(
+            "render_warm_max_us",
+            warm_render.last().map_or(0, |d| d.as_micros()),
+        );
+        bench_emit(
+            "render_warm_max_fps",
+            1_000_000u128 / warm_mean.as_micros().max(1),
+        );
+        if let Some(ticks) = render_cpu {
+            // Thread CPU of this thread only, over the whole 60-frame loop: a
+            // single ≤6 ms frame is below the 10 ms jiffy resolution, so the
+            // per-frame CPU is *derived* from the sum (no per-frame jiffy
+            // percentage is reported — at this window it would only show
+            // quantisation).
+            let cpu_us_per_frame = bench_ticks_to_us(ticks) as f64 / warm_iterations as f64;
+            bench_emit("render_thread_cpu_ticks_total", ticks);
+            bench_emit(
+                "render_cpu_us_per_frame_derived",
+                format!("{cpu_us_per_frame:.0}"),
+            );
+            // Derived idle-TUI CPU: redraws/s × CPU/frame. The pre-optimization
+            // loop painted every ~50 ms poll iteration (20/s); the scheduler now
+            // paints ~4/s idle. Labelled `derived_` because it multiplies a
+            // *modelled* rate by the measured per-frame CPU.
+            let idle_per_s = simulated_idle_redraws(None) as f64;
+            bench_emit(
+                "derived_idle_cpu_pct",
+                format!("{:.3}", idle_per_s * cpu_us_per_frame / 1_000_000.0 * 100.0),
+            );
+            bench_emit(
+                "derived_pre_optimization_cpu_pct",
+                format!("{:.3}", 20.0 * cpu_us_per_frame / 1_000_000.0 * 100.0),
+            );
+        }
+        if let Some(rss_kb) = self_status_field("VmRSS:") {
+            bench_emit("rss_kb_after_render", rss_kb);
+        }
+        if let Some(threads) = self_status_field("Threads:") {
+            bench_emit("threads_after_render", threads);
+        }
+
+        // TUI input latency: a selection change plus the immediate repaint it
+        // triggers, repeated so a single scheduling hiccup cannot define the
+        // figure. The loop's own terminal event poll (`event::poll`) is not
+        // reproducible in a `TestBackend` harness, so this is the repaint share
+        // only — documented in `docs/PERFORMANCE_BASELINE.md`.
+        let input_reps = 30usize;
+        let mut input_latencies = Vec::with_capacity(input_reps);
+        for _ in 0..input_reps {
+            let input_start = Instant::now();
+            ui_state.move_process_selection(1, &snapshot.system.processes);
+            render_frame(&mut terminal, &mut ui_state);
+            input_latencies.push(input_start.elapsed());
+        }
+        input_latencies.sort();
+        bench_emit(
+            "input_to_frame_mean_us",
+            bench_mean(&input_latencies).as_micros(),
+        );
+        bench_emit(
+            "input_to_frame_p95_us",
+            bench_percentile(&input_latencies, 0.95).as_micros(),
+        );
+        bench_emit(
+            "input_to_frame_max_us",
+            input_latencies.last().map_or(0, |d| d.as_micros()),
+        );
+
+        // HTTP poll latency for 1, 4 and 16 blocking-accept mock servers. One
+        // cycle polls every server sequentially through `LlamaMonitor::sample`;
+        // the mock answers on arrival, so the value is OrsikTop's client cost,
+        // not a sleep quantum.
+        for server_count in [1usize, 4, 16] {
+            let mut addrs = Vec::new();
+            let mut stops = Vec::new();
+            let mut handles = Vec::new();
+            for _ in 0..server_count {
+                let (addr, stop, handle) = spawn_blocking_mock("model-A", 4096, 1000, 500);
+                addrs.push(addr);
+                stops.push(stop);
+                handles.push(handle);
+            }
+            let mut monitors: Vec<LlamaMonitor> = addrs
+                .iter()
+                .map(|addr| LlamaMonitor::new(&format!("http://{addr}")).unwrap())
+                .collect();
+            // Discard one warm-up cycle (connection setup, first parse).
+            for monitor in &mut monitors {
+                let _ = monitor.sample();
+            }
+            let cycles = 8usize;
+            let mut cycle_times = Vec::with_capacity(cycles);
+            for _ in 0..cycles {
+                let cycle_start = Instant::now();
+                for monitor in &mut monitors {
+                    let _ = monitor.sample();
+                }
+                cycle_times.push(cycle_start.elapsed());
+            }
+            cycle_times.sort();
+            let cycle_mean = bench_mean(&cycle_times);
+            bench_emit(
+                &format!("poll_{server_count}_servers_cycle_mean_us"),
+                cycle_mean.as_micros(),
+            );
+            bench_emit(
+                &format!("poll_{server_count}_servers_cycle_max_us"),
+                cycle_times.last().map_or(0, |d| d.as_micros()),
+            );
+            bench_emit(
+                &format!("poll_{server_count}_servers_per_server_us"),
+                cycle_mean.as_micros() / server_count as u128,
+            );
+
+            for ((stop, addr), handle) in stops.into_iter().zip(addrs).zip(handles) {
+                stop_blocking_mock(&stop, addr, handle);
+            }
+        }
+
+        // Whole-process footprint for this measurement window. RSS and thread
+        // count are inherently process properties; they describe this test
+        // process, not the production TUI (see the document's limitations).
+        let wall = wall_start.elapsed();
+        bench_emit("measurement_wall_ms", wall.as_millis());
+        if let Some(rss_kb) = self_status_field("VmRSS:") {
+            bench_emit("process_rss_kb", rss_kb);
+        }
+        if let Some(threads) = self_status_field("Threads:") {
+            bench_emit("process_threads", threads);
+        }
+        if let (Some(cpu0), Some(cpu1)) = (cpu_start, thread_cpu_ticks()) {
+            let ticks = cpu1.saturating_sub(cpu0);
+            bench_emit("thread_cpu_ticks_total", ticks);
+            if !wall.is_zero() {
+                bench_emit(
+                    "thread_cpu_pct_avg",
+                    format!(
+                        "{:.2}",
+                        ticks as f64 / (wall.as_secs_f64() * BENCH_CLK_TCK) * 100.0
+                    ),
+                );
+            }
+        }
+
+        // Host / test conditions, read from inside the run: the sanctioned
+        // cf-desktop helper only reports host name, toolchain and GPU state, so
+        // the CPU model, memory, kernel and CPU count are captured here.
+        if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+            if let Some(model) = cpuinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("model name"))
+                .map(|rest| rest.trim_start_matches([':', ' ', '\t']).trim())
+            {
+                bench_emit("host_cpu_model", model);
+            }
+        }
+        bench_emit(
+            "host_logical_cpus",
+            std::thread::available_parallelism().map_or(0, |n| n.get()),
+        );
+        if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+            bench_emit("host_kernel", release.trim());
+        }
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            if let Some(kb) = meminfo
+                .lines()
+                .find(|line| line.starts_with("MemTotal:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+            {
+                bench_emit("host_mem_total_kb", kb);
+            }
+        }
+
+        // Structural invariants only: the scenarios produced real data and the
+        // dashboard is the intended size. No wall-clock threshold here.
+        assert_eq!(snapshot.servers.len(), 16, "16-server scenario is built");
+        assert_eq!(snapshot.system.processes.len(), 400);
+        assert!(!warm_render.is_empty());
+    }
+
+    /// The heavy half of the CFA-35 baseline: the real `/proc`+DRM
+    /// process-collector cycle and a longer-operation window that samples RSS
+    /// and thread count over time. `#[ignore]`d on purpose — reading the whole
+    /// host process table on every gate is too costly for the shared suite.
+    /// Run it through an approved single-threaded benchmark runner:
+    ///   cargo test --all-targets --locked -- --ignored --test-threads=1 \
+    ///     perf_baseline_soak_and_process_collection_benchmark
+    #[test]
+    #[ignore = "heavy: reads the whole host /proc table + DRM fdinfo; run via an approved single-threaded runner, not in the shared gate"]
+    fn perf_baseline_soak_and_process_collection_benchmark() {
+        // Production fast-worker cycle: `refresh_processes_specifics` followed
+        // by `collect_process_stats`. Both are timed, together and apart, so the
+        // report does not understate the cycle by measuring only the collector.
+        let mut system = System::new();
+        let mut process_cache = ProcessCache::default();
+        let mut drm_state = DrmSamplerState::default();
+        let refresh_system = |system: &mut System| -> Duration {
+            let start = Instant::now();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_memory()
+                    .with_cpu()
+                    .with_exe(UpdateKind::Always),
+            );
+            start.elapsed()
+        };
+
+        let mut refresh_times = Vec::new();
+        let mut collect_times = Vec::new();
+        let mut cycle_times = Vec::new();
+        let mut process_count = 0usize;
+        for _ in 0..3 {
+            let refresh = refresh_system(&mut system);
+            let collect_start = Instant::now();
+            let processes = collect_process_stats(&system, &mut process_cache, &mut drm_state);
+            let collect = collect_start.elapsed();
+            process_count = processes.len();
+            refresh_times.push(refresh);
+            collect_times.push(collect);
+            cycle_times.push(refresh + collect);
+        }
+        refresh_times.sort();
+        collect_times.sort();
+        cycle_times.sort();
+        bench_emit("process_count", process_count);
+        bench_emit(
+            "process_refresh_mean_us",
+            bench_mean(&refresh_times).as_micros(),
+        );
+        bench_emit(
+            "process_collect_mean_us",
+            bench_mean(&collect_times).as_micros(),
+        );
+        bench_emit(
+            "process_collect_max_us",
+            collect_times.last().map_or(0, |d| d.as_micros()),
+        );
+        bench_emit(
+            "process_cycle_mean_us",
+            bench_mean(&cycle_times).as_micros(),
+        );
+        bench_emit(
+            "process_cycle_max_us",
+            cycle_times.last().map_or(0, |d| d.as_micros()),
+        );
+
+        // Component split of the collector (CFA-36): the collector cycle is the
+        // sum of the per-process thread-count read and the per-process DRM fd
+        // scan. Both phases are re-timed here (over the same process table) so
+        // an optimization targets the dominant one. Reported, never asserted.
+        let mut thread_read_total = Duration::ZERO;
+        let mut thread_read_failures = 0usize;
+        for pid in system.processes().keys() {
+            let start = Instant::now();
+            if read_process_thread_count(pid.as_u32()).is_none() {
+                thread_read_failures += 1;
+            }
+            thread_read_total += start.elapsed();
+        }
+        bench_emit(
+            "process_threads_read_total_us",
+            thread_read_total.as_micros(),
+        );
+        bench_emit("process_threads_read_failures", thread_read_failures);
+
+        let mut drm_scan_total = Duration::ZERO;
+        let mut drm_procs_with_gpu = 0usize;
+        let mut drm_scan_state = DrmSamplerState::default();
+        let drm_now = Instant::now();
+        for (pid, process) in system.processes().iter() {
+            let identity = ProcessIdentity::new(pid.as_u32(), process.start_time());
+            let start = Instant::now();
+            let gpus = sample_process_gpus(&RealSys, drm_now, identity, &mut drm_scan_state);
+            drm_scan_total += start.elapsed();
+            if !gpus.is_empty() {
+                drm_procs_with_gpu += 1;
+            }
+        }
+        bench_emit("process_drm_scan_total_us", drm_scan_total.as_micros());
+        bench_emit("process_drm_procs_with_gpu", drm_procs_with_gpu);
+
+        // Longer-operation window: render the full dashboard continuously and
+        // sample RSS / threads once per second to expose growth over time. This
+        // is the closest a unit harness gets to "longer monitoring operation"; a
+        // full soak belongs to EPIC 4.1.
+        let snapshot = bench_dashboard(16, 400);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
+        let mut ui_state = UiState::default();
+        let soak_window = Duration::from_secs(10);
+        let soak_start = Instant::now();
+        let mut soak_frames = 0u64;
+        let mut next_sample_s = 1u64;
+        while soak_start.elapsed() < soak_window {
+            terminal
+                .draw(|frame| {
+                    ui::draw(
+                        frame,
+                        &snapshot.system,
+                        &snapshot.llm,
+                        &snapshot.gpu,
+                        &snapshot.gpu_map,
+                        &snapshot.servers,
+                        &snapshot.selected_server,
+                        &[],
+                        &mut ui_state,
+                        "http://10.0.0.0:8080",
+                        1000,
+                        false,
+                    )
+                })
+                .unwrap();
+            soak_frames += 1;
+            let elapsed_s = soak_start.elapsed().as_secs();
+            if elapsed_s >= next_sample_s {
+                if let Some(rss_kb) = self_status_field("VmRSS:") {
+                    bench_emit(&format!("soak_rss_kb_at_{elapsed_s}s"), rss_kb);
+                }
+                if let Some(threads) = self_status_field("Threads:") {
+                    bench_emit(&format!("soak_threads_at_{elapsed_s}s"), threads);
+                }
+                next_sample_s = elapsed_s + 1;
+            }
+        }
+        bench_emit("soak_frames_total", soak_frames);
+        bench_emit("soak_window_s", soak_window.as_secs());
+
+        assert!(process_count > 0, "host process table is non-empty");
+        assert!(soak_frames > 0, "soak rendered at least one frame");
+    }
+
+    // -----------------------------------------------------------------
+    // EPIC 4.1 (CFA-37): mock-based soak / failure-mode harness
+    // -----------------------------------------------------------------
+    //
+    // A bounded endurance harness that drives the *real* `spawn_llm_worker`
+    // against programmable loopback mocks. Success is signalled by observed
+    // samples, never by a wall-clock threshold; the deadlines only bound
+    // failure. Each mock carries a distinct model, so a sample that reports a
+    // foreign model is caught as cross-server mixing. No real inference server
+    // is contacted.
+
+    /// Failure modes a `ProgrammableMock` can be switched into at runtime. The
+    /// mode is stored as the enum (behind a `Mutex`), never as its raw
+    /// discriminant, so reordering this enum cannot silently mis-decode a mode.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum MockMode {
+        Healthy,
+        /// Accept the request, then close without answering (connection drop).
+        Disconnect,
+        /// Answer correctly, but only after `SLOW_RESPONSE` — a slow server
+        /// still inside the client's request timeout.
+        Slow,
+        /// Accept and read the request, then hold the connection open until the
+        /// mode changes or `stop` is set, so the client aborts with a
+        /// **timeout** error rather than a connection drop (the real "reconnect
+        /// after timeout" path). `LLM_REQUEST_TIMEOUT_MS` (1200 ms,
+        /// `src/llama.rs`) is the only thing that ends the request in practice;
+        /// `HANG_SAFETY_LIMIT` is a last-resort cap.
+        Hang,
+        /// 200 with a malformed JSON body (or unrecognised metrics text).
+        BadJson,
+        /// 200 with an empty body.
+        Empty,
+        /// 501 on `/metrics` (metrics disabled), healthy elsewhere.
+        MetricsOff,
+    }
+
+    /// Delayed-but-successful response, kept well below the client's request
+    /// timeout: a slow server, not a hung one.
+    const SLOW_RESPONSE: Duration = Duration::from_millis(150);
+    /// Safety cap on how long `MockMode::Hang` holds a connection. The hold is
+    /// released as soon as the mode changes or `stop` is set, so in practice
+    /// only the *client's* request timeout (`LLM_REQUEST_TIMEOUT_MS` = 1200 ms
+    /// in `src/llama.rs`) ends a request — a fixed self-close would let a client
+    /// with a longer timeout pass by seeing a connection drop instead of a real
+    /// timeout. This cap only keeps a mis-wired test from hanging forever.
+    const HANG_SAFETY_LIMIT: Duration = Duration::from_secs(30);
+
+    /// A loopback mock whose behaviour can be changed while it runs.
+    struct ProgrammableMock {
+        addr: SocketAddr,
+        mode: Arc<Mutex<MockMode>>,
+        /// Monotonic request counter driving the fake `/metrics` counters.
+        /// `restart_counters()` resets it to zero to model a server restart
+        /// whose cumulative counters begin again at zero.
+        requests: Arc<AtomicU64>,
+        /// Number of requests currently held open by `MockMode::Hang`. Lets a
+        /// test wait until a request is genuinely in flight before it stops the
+        /// worker, instead of racing the next poll cycle.
+        hang_active: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ProgrammableMock {
+        fn base(&self) -> String {
+            let addr = self.addr;
+            format!("http://{addr}")
+        }
+
+        fn set_mode(&self, mode: MockMode) {
+            *self.mode.lock().expect("mock mode lock") = mode;
+        }
+
+        /// Number of requests the mock is currently holding open in
+        /// `MockMode::Hang` (0 once the mode changes or `stop` is set).
+        fn hang_active(&self) -> u64 {
+            self.hang_active.load(Ordering::SeqCst)
+        }
+
+        /// Reset the fake cumulative counters to zero **without** changing the
+        /// endpoint, modelling a server whose counters restart while the model
+        /// stays the same. A monitor that keeps polling this endpoint must then
+        /// see a reset (rate unavailable), never a negative or absurd rate.
+        fn restart_counters(&self) {
+            self.requests.store(0, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ProgrammableMock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake a blocked `accept`; the loop then observes `stop` and exits.
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn serve_healthy(
+        stream: &mut TcpStream,
+        path: &str,
+        model: &str,
+        n_ctx: u64,
+        counter_base: u64,
+        index: u64,
+    ) {
+        if path.contains("/props") {
+            let body = format!(
+                "{{\"model_path\":\"{model}\",\"total_slots\":1,\"default_generation_settings\":{{\"n_ctx\":{n_ctx}}}}}"
+            );
+            write_http(stream, &body, "application/json");
+        } else if path.contains("/slots") {
+            let body = format!("[{{\"id\":0,\"n_ctx\":{n_ctx},\"is_processing\":false}}]");
+            write_http(stream, &body, "application/json");
+        } else {
+            let prompt = counter_base + index * 100;
+            let predicted = counter_base + index * 50;
+            let body =
+                format!("llamacpp:prompt_tokens_total {prompt}\nllamacpp:tokens_predicted_total {predicted}\n");
+            write_http(stream, &body, "text/plain");
+        }
+    }
+
+    fn serve_bad_json(stream: &mut TcpStream, path: &str) {
+        if path.contains("/metrics") {
+            // Not a recognised metrics sample -> metrics unavailable.
+            write_http(stream, "this is not a metrics body", "text/plain");
+        } else {
+            // Malformed JSON for /props and /slots.
+            write_http(stream, "{ this is not json", "application/json");
+        }
+    }
+
+    fn programmable_mock(model: String, n_ctx: u64, counter_base: u64) -> ProgrammableMock {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind programmable mock");
+        let addr = listener.local_addr().expect("addr");
+        let mode = Arc::new(Mutex::new(MockMode::Healthy));
+        let requests = Arc::new(AtomicU64::new(0));
+        let hang_active = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let mode_flag = Arc::clone(&mode);
+        let requests_flag = Arc::clone(&requests);
+        let hang_flag = Arc::clone(&hang_active);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                // The stop wake-up connects without a request; break before the
+                // read timeout would stall the join.
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some(path) = read_request_path(&mut stream) else {
+                    continue;
+                };
+                let current = *mode_flag.lock().expect("mock mode lock");
+                match current {
+                    MockMode::Disconnect => drop(stream),
+                    MockMode::Hang => {
+                        // Hold the connection open for as long as the mode stays
+                        // `Hang` and `stop` is unset, so only the *client's*
+                        // request timeout can end the request. Waking on `stop`
+                        // and re-checking the mode keep teardown and recovery
+                        // bounded; `HANG_SAFETY_LIMIT` is a last-resort cap for a
+                        // mis-wired test, never the normal exit. No response is
+                        // ever written.
+                        hang_flag.fetch_add(1, Ordering::SeqCst);
+                        let safety = Instant::now() + HANG_SAFETY_LIMIT;
+                        while !stop_flag.load(Ordering::SeqCst)
+                            && Instant::now() < safety
+                            && *mode_flag.lock().expect("mock mode lock") == MockMode::Hang
+                        {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        hang_flag.fetch_sub(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    mode => {
+                        let index = requests_flag.fetch_add(1, Ordering::SeqCst) + 1;
+                        match mode {
+                            MockMode::Slow => {
+                                thread::sleep(SLOW_RESPONSE);
+                                serve_healthy(
+                                    &mut stream,
+                                    &path,
+                                    &model,
+                                    n_ctx,
+                                    counter_base,
+                                    index,
+                                );
+                            }
+                            MockMode::BadJson => serve_bad_json(&mut stream, &path),
+                            MockMode::Empty => {
+                                write_http(&mut stream, "", "application/json");
+                            }
+                            MockMode::MetricsOff => {
+                                if path.contains("/metrics") {
+                                    write_http_status(
+                                        &mut stream,
+                                        "501 Not Implemented",
+                                        "disabled",
+                                    );
+                                } else {
+                                    serve_healthy(
+                                        &mut stream,
+                                        &path,
+                                        &model,
+                                        n_ctx,
+                                        counter_base,
+                                        index,
+                                    );
+                                }
+                            }
+                            MockMode::Healthy => {
+                                serve_healthy(
+                                    &mut stream,
+                                    &path,
+                                    &model,
+                                    n_ctx,
+                                    counter_base,
+                                    index,
+                                );
+                            }
+                            // Handled above.
+                            MockMode::Disconnect | MockMode::Hang => unreachable!(),
+                        }
+                    }
+                }
+            }
+        });
+        ProgrammableMock {
+            addr,
+            mode,
+            requests,
+            hang_active,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// A sample for `key` must never carry another server's model or context
+    /// size. `model` is empty or the explicit unknown label until `/props`
+    /// succeeds, so only a *known* model is checked; a known model implies
+    /// `/props` answered, so its `context_size` is checked alongside it (`n_ctx`
+    /// is a monotonic identity of the mock, unlike the model name alone).
+    fn assert_no_cross_mixing(
+        sample: &LlmSample,
+        key: &str,
+        expected_model: &str,
+        expected_ctx: u64,
+    ) {
+        if sample.server != key {
+            return;
+        }
+        let model = sample.stats.model.as_str();
+        if model.is_empty() || model == crate::llama::UNKNOWN_MODEL_LABEL {
+            return;
+        }
+        assert_eq!(
+            model, expected_model,
+            "server {key} reported the foreign model {model:?} (cross-server mixing)"
+        );
+        assert_eq!(
+            sample.stats.context_size, expected_ctx,
+            "server {key} reported the foreign context size {} (cross-server mixing)",
+            sample.stats.context_size
+        );
+    }
+
+    /// Start the real worker against `specs` with the given offline grace and a
+    /// 250 ms poll floor; returns the handles a soak test drives.
+    #[allow(clippy::type_complexity)]
+    fn start_soak_worker(
+        specs: Vec<ServerSpec>,
+        offline_ms: u64,
+    ) -> (
+        Arc<AtomicBool>,
+        mpsc::Receiver<LlmSample>,
+        mpsc::Sender<LlmCommand>,
+        thread::JoinHandle<()>,
+    ) {
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(offline_ms));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(MAX_MONITORED_SERVERS);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            specs,
+            refresh,
+            offline,
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+        (stop, sample_rx, cmd_tx, worker)
+    }
+
+    /// Join `worker` off-thread so a hang cannot wedge the test, returning
+    /// whether it finished within `bound`.
+    fn join_within(worker: thread::JoinHandle<()>, bound: Duration) -> bool {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let joiner = thread::spawn(move || {
+            let _ = worker.join();
+            let _ = done_tx.send(());
+        });
+        let joined = done_rx.recv_timeout(bound).is_ok();
+        let _ = joiner.join();
+        joined
+    }
+
+    /// Drain samples until `key` reports connected with its own `model`, or
+    /// panic at the deadline (a timeout bounds failure, never success).
+    fn wait_for_connected(
+        samples: &mpsc::Receiver<LlmSample>,
+        key: &str,
+        model: &str,
+        deadline: Duration,
+    ) {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(200)) {
+                if sample.server == key && sample.stats.connected && sample.stats.model == model {
+                    return;
+                }
+            }
+        }
+        panic!("server {key} never reported connected with model {model}");
+    }
+
+    #[test]
+    fn soak_worker_survives_malformed_json_and_recovers_without_mixing() {
+        // A answers malformed JSON, B is healthy. B's telemetry must stay its
+        // own while A is broken, and A must recover to its own model once the
+        // endpoint is healthy again — never borrowing B's.
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        let b = programmable_mock("model-B".to_string(), 8192, 7_000);
+        a.set_mode(MockMode::BadJson);
+
+        let key_a = crate::domain::server_key(&a.base());
+        let key_b = crate::domain::server_key(&b.base());
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(300));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(MAX_MONITORED_SERVERS);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            vec![test_spec(&key_a, &a.base()), test_spec(&key_b, &b.base())],
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        // Phase 1: B reports its own model while A is malformed.
+        let mut b_ok = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !b_ok {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                let server = sample.server.clone();
+                assert!(
+                    sample.server == key_a || sample.server == key_b,
+                    "unknown server key published: {server}"
+                );
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                assert_no_cross_mixing(&sample, &key_b, "model-B", 8192);
+                if sample.server == key_b
+                    && sample.stats.connected
+                    && sample.stats.model == "model-B"
+                {
+                    b_ok = true;
+                }
+            }
+        }
+        assert!(
+            b_ok,
+            "the healthy server must report its own model while A is malformed"
+        );
+
+        // Phase 2: A recovers to its own model.
+        a.set_mode(MockMode::Healthy);
+        let mut a_ok = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !a_ok {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                assert_no_cross_mixing(&sample, &key_b, "model-B", 8192);
+                if sample.server == key_a
+                    && sample.stats.connected
+                    && sample.stats.model == "model-A"
+                {
+                    a_ok = true;
+                }
+            }
+        }
+        assert!(
+            a_ok,
+            "A must recover to its own model after the malformed period"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn soak_polls_the_maximum_monitored_server_count_independently() {
+        // Every one of MAX_MONITORED_SERVERS servers must be polled, each with
+        // its own model — the cap must not silently drop or cross-wire a server.
+        let mocks: Vec<ProgrammableMock> = (0..MAX_MONITORED_SERVERS)
+            .map(|i| programmable_mock(format!("model-{i}"), 4096, 1_000 * (i as u64 + 1)))
+            .collect();
+        let specs: Vec<ServerSpec> = mocks
+            .iter()
+            .map(|mock| {
+                let key = crate::domain::server_key(&mock.base());
+                test_spec(&key, &mock.base())
+            })
+            .collect();
+        let keys: Vec<String> = specs.iter().map(|spec| spec.key.clone()).collect();
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(300));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<LlmSample>(MAX_MONITORED_SERVERS);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            specs,
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        // Only a sample that is actually *connected* and carries this server's
+        // own model counts as "polled", so a worker that published nothing but
+        // error samples for every server cannot pass; each mock has a unique
+        // model, and all share the same n_ctx.
+        let mut seen: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && seen.len() < keys.len() {
+            if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
+                let server = sample.server.clone();
+                let idx = keys
+                    .iter()
+                    .position(|key| *key == sample.server)
+                    .unwrap_or_else(|| panic!("unknown server key published: {server}"));
+                assert_no_cross_mixing(&sample, &keys[idx], &format!("model-{idx}"), 4096);
+                if sample.stats.connected && sample.stats.model == format!("model-{idx}") {
+                    seen.insert(sample.server);
+                }
+            }
+        }
+        let seen_len = seen.len();
+        let key_count = keys.len();
+        assert_eq!(
+            seen_len, key_count,
+            "all {MAX_MONITORED_SERVERS} servers must be polled, saw {seen_len} of {key_count}"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn soak_clean_shutdown_is_bounded_while_a_server_hangs() {
+        // The critical blocking-shutdown case is a *hung* server whose request
+        // is in flight for the whole client timeout, not a merely slow one:
+        // joining the worker after `stop` must still complete within a bound,
+        // because the in-flight request is cut off by `LLM_REQUEST_TIMEOUT_MS`.
+        // The mock is held open until `stop`, so `hang_active()` proves a
+        // request is genuinely in flight when shutdown begins — no race against
+        // the next poll cycle.
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        a.set_mode(MockMode::Hang);
+        let key_a = crate::domain::server_key(&a.base());
+
+        let refresh = Arc::new(AtomicU64::new(MIN_LLM_POLL_MS));
+        let offline = Arc::new(AtomicU64::new(300));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, _sample_rx) = mpsc::sync_channel::<LlmSample>(MAX_MONITORED_SERVERS);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<LlmCommand>();
+        let worker = spawn_llm_worker(
+            vec![test_spec(&key_a, &a.base())],
+            Arc::clone(&refresh),
+            Arc::clone(&offline),
+            Arc::clone(&stop),
+            sample_tx,
+            cmd_rx,
+        );
+
+        // Wait until the mock actually holds a request open.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.hang_active() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            a.hang_active() > 0,
+            "the mock never held a request open before shutdown"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            join_within(worker, Duration::from_secs(5)),
+            "the worker did not shut down within 5 s (blocking shutdown)"
+        );
+    }
+
+    #[test]
+    fn soak_reconnects_after_request_timeout() {
+        // A server that holds the connection open past the client's request
+        // timeout must fail (not merely answer late), and must recover to
+        // connected with its own model once it answers again — the real
+        // "reconnect after timeout" path. `MockMode::Slow` is below the timeout,
+        // so only `Hang` actually triggers a client timeout. `Hang` holds the
+        // connection until the mode changes, so the disconnect seen in phase 1
+        // can only be the client's own `LLM_REQUEST_TIMEOUT_MS` firing — a client
+        // with no or a longer timeout would stay blocked here, not observe a
+        // connection drop.
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        a.set_mode(MockMode::Hang);
+        let key_a = crate::domain::server_key(&a.base());
+
+        let (stop, samples, _cmds, worker) =
+            start_soak_worker(vec![test_spec(&key_a, &a.base())], 300);
+
+        // Phase 1: the hung server must not report a (stale) connected sample.
+        let mut saw_timeout = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !saw_timeout {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                if sample.server == key_a && !sample.stats.connected {
+                    saw_timeout = true;
+                }
+            }
+        }
+        assert!(
+            saw_timeout,
+            "a request held past the timeout must be reported as disconnected"
+        );
+
+        // Phase 2: once the server answers, it must recover to its own model.
+        a.set_mode(MockMode::Healthy);
+        wait_for_connected(&samples, &key_a, "model-A", Duration::from_secs(10));
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(join_within(worker, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn soak_counter_reset_is_reported_as_unavailable_not_a_fantasy_rate() {
+        // A restarted llama.cpp restarts its cumulative counters at zero. The
+        // monitor must treat that as a reset (live rate unavailable), never as a
+        // negative or absurd delta, and re-establish a fresh baseline. The
+        // endpoint (and identity) stays the same, so the monitor observes the
+        // backwards counters directly.
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        let key_a = crate::domain::server_key(&a.base());
+
+        let (stop, samples, _cmds, worker) =
+            start_soak_worker(vec![test_spec(&key_a, &a.base())], 300);
+
+        // Establish a live generation rate first.
+        let mut saw_rate = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !saw_rate {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                if sample.stats.connected && sample.stats.generation_tps.is_some() {
+                    saw_rate = true;
+                }
+            }
+        }
+        assert!(saw_rate, "a live generation rate must be established first");
+
+        // Restart the counters at zero without changing the endpoint.
+        a.restart_counters();
+        let mut saw_reset = false;
+        let mut saw_fresh = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !(saw_reset && saw_fresh) {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                for (label, value) in [
+                    ("prompt_tps", sample.stats.prompt_tps),
+                    ("generation_tps", sample.stats.generation_tps),
+                ] {
+                    if let Some(value) = value {
+                        assert!(
+                            value.is_finite() && (0.0..1e9).contains(&value),
+                            "a counter reset produced a fantasy {label}={value}"
+                        );
+                    }
+                }
+                if sample.stats.connected && sample.stats.generation_tps.is_none() {
+                    saw_reset = true;
+                }
+                // Only a *post-reset* live rate proves a fresh baseline was
+                // re-established. A rate fetched before the reset (still in
+                // flight when `restart_counters()` ran) must not count, or the
+                // test could pass without ever observing the reset recovery.
+                if saw_reset && sample.stats.connected && sample.stats.generation_tps.is_some() {
+                    saw_fresh = true;
+                }
+            }
+        }
+        assert!(
+            saw_reset,
+            "the counter reset must report an unavailable rate"
+        );
+        assert!(saw_fresh, "a fresh baseline must re-establish a live rate");
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(join_within(worker, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn soak_set_servers_churn_keeps_generations_and_polling_bounded() {
+        // Repeated `SetServers` rounds: the generation must never go backwards
+        // (a stale sample from a replaced set must not surface after a newer
+        // one), the added server must be polled under the new generation, a
+        // removed server must stop, and a same-key restart (new identity + a
+        // counter reset) must resume with the server's own values.
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        let b = programmable_mock("model-B".to_string(), 8192, 2_000);
+        let c = programmable_mock("model-C".to_string(), 16384, 3_000);
+        let key_a = crate::domain::server_key(&a.base());
+        let key_b = crate::domain::server_key(&b.base());
+        let key_c = crate::domain::server_key(&c.base());
+
+        let (stop, samples, cmds, worker) = start_soak_worker(
+            vec![test_spec(&key_a, &a.base()), test_spec(&key_b, &b.base())],
+            300,
+        );
+
+        let mut last_generation = 0u64;
+        // Phase 1: settle the initial A+B set at generation 0.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut established = false;
+        while Instant::now() < deadline && !established {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                assert!(
+                    sample.generation >= last_generation,
+                    "generation went backwards ({} after {})",
+                    sample.generation,
+                    last_generation
+                );
+                last_generation = sample.generation;
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                assert_no_cross_mixing(&sample, &key_b, "model-B", 8192);
+                if sample.server == key_b
+                    && sample.stats.connected
+                    && sample.stats.model == "model-B"
+                {
+                    established = true;
+                }
+            }
+        }
+        assert!(established, "the initial A+B set must be polled");
+
+        // Phase 2: switch to a new set {A (new identity), C} at generation 1.
+        // A keeps its key but its identity changed, so its monitor is rebuilt;
+        // its counters restart at zero. B is removed, C is added.
+        a.restart_counters();
+        cmds.send(LlmCommand::SetServers {
+            generation: 1,
+            servers: vec![
+                ServerSpec {
+                    identity: Some(LocalServerIdentity {
+                        pid: 999,
+                        start_time: 7,
+                    }),
+                    ..test_spec(&key_a, &a.base())
+                },
+                test_spec(&key_c, &c.base()),
+            ],
+        })
+        .unwrap();
+
+        let mut a_gen1 = false;
+        let mut c_gen1 = false;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline && !(a_gen1 && c_gen1) {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                assert!(
+                    sample.generation >= last_generation,
+                    "generation went backwards ({} after {})",
+                    sample.generation,
+                    last_generation
+                );
+                last_generation = last_generation.max(sample.generation);
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                assert_no_cross_mixing(&sample, &key_c, "model-C", 16384);
+                if sample.generation == 1
+                    && sample.server == key_a
+                    && sample.stats.connected
+                    && sample.stats.model == "model-A"
+                {
+                    a_gen1 = true;
+                }
+                if sample.generation == 1
+                    && sample.server == key_c
+                    && sample.stats.connected
+                    && sample.stats.model == "model-C"
+                {
+                    c_gen1 = true;
+                }
+            }
+        }
+        assert!(
+            a_gen1,
+            "the restarted server A must resume with its own values under generation 1"
+        );
+        assert!(
+            c_gen1,
+            "the newly added server C must be polled under generation 1"
+        );
+
+        // Once the switch has settled, the removed server B must not be polled
+        // under the new generation.
+        thread::sleep(Duration::from_millis(600));
+        let mut b_gen1 = 0usize;
+        while let Ok(sample) = samples.try_recv() {
+            assert!(sample.generation >= last_generation);
+            if sample.server == key_b && sample.generation == 1 {
+                b_gen1 += 1;
+            }
+        }
+        assert_eq!(
+            b_gen1, 0,
+            "a server removed from the set must not be polled under the new generation"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(join_within(worker, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn soak_selection_switch_keeps_each_servers_own_history() {
+        // Partial integration coverage: drive the real worker and feed its
+        // samples through the production selection seam
+        // (`UiState::record_llm_sample` + `select_llm_history`) while the
+        // selected server switches A -> B, and check that both servers keep an
+        // independently measured sample interval (via the public accessor) after
+        // the switch. It does **not** assert the *active* history's content, nor
+        // prove no cross-mixing: the interval accessor cannot tell whose samples
+        // built a history, and background servers accumulate their interval
+        // regardless of selection. Those properties are covered at the unit
+        // level by `ui::tests::per_server_histories_are_independent_and_survive_selection`
+        // and the `assert_no_cross_mixing` checks in the failure-mode tests here.
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        let b = programmable_mock("model-B".to_string(), 8192, 9_000);
+        let key_a = crate::domain::server_key(&a.base());
+        let key_b = crate::domain::server_key(&b.base());
+
+        let (stop, samples, _cmds, worker) = start_soak_worker(
+            vec![test_spec(&key_a, &a.base()), test_spec(&key_b, &b.base())],
+            300,
+        );
+
+        let mut ui = UiState::default();
+        let mut selected = key_a.clone();
+        ui.select_llm_history(&selected);
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline
+            && !(ui.server_sample_interval_ms(&key_a).is_some()
+                && ui.server_sample_interval_ms(&key_b).is_some())
+        {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                ui.record_llm_sample(&sample.server, &selected, &sample.stats);
+                // Once A has its own measured interval, switch the selection.
+                if selected == key_a && ui.server_sample_interval_ms(&key_a).is_some() {
+                    selected = key_b.clone();
+                    ui.select_llm_history(&key_b);
+                }
+            }
+        }
+        assert!(
+            ui.server_sample_interval_ms(&key_a).is_some(),
+            "A must keep its own history across the selection switch"
+        );
+        assert!(
+            ui.server_sample_interval_ms(&key_b).is_some(),
+            "B must accumulate its own history after the switch"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(join_within(worker, Duration::from_secs(5)));
+    }
+
+    /// The longer half of EPIC 4.1: drives every failure mode across two servers
+    /// over a sustained window, then asserts resilience (samples keep flowing,
+    /// no cross-mixing), a real stale-state transition (a failure phase outlasts
+    /// the grace hold, so the server is published as disconnected rather than
+    /// holding a last-good forever), and recovery to each server's own values.
+    /// Resource footprint is deliberately **not measured** here: `/proc/self` is
+    /// process-global and the shared gate runs tests in parallel, so such a bound
+    /// is meaningless, and this test asserts no resource values at all; the
+    /// strict probe lives in the `#[ignore]`d single-threaded test below.
+    #[test]
+    fn soak_endurance_all_failure_modes_without_mixing_and_recovers() {
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        let b = programmable_mock("model-B".to_string(), 8192, 2_000);
+
+        let key_a = crate::domain::server_key(&a.base());
+        let key_b = crate::domain::server_key(&b.base());
+        let known = [key_a.clone(), key_b.clone()];
+
+        // A short grace so a failure phase visibly outlasts the held last-good;
+        // B flips between modes so the two servers run under mismatched
+        // conditions (a mismatch cannot cross-wire them).
+        let (stop, samples, _cmds, worker) = start_soak_worker(
+            vec![test_spec(&key_a, &a.base()), test_spec(&key_b, &b.base())],
+            200,
+        );
+
+        let script = [
+            (MockMode::Healthy, MockMode::Healthy, 500u64),
+            (MockMode::Disconnect, MockMode::BadJson, 1_200),
+            (MockMode::Empty, MockMode::MetricsOff, 500),
+            (MockMode::Slow, MockMode::Disconnect, 500),
+            (MockMode::Healthy, MockMode::Healthy, 1_200),
+        ];
+
+        let mut observed = 0usize;
+        let mut saw_a_disconnected = false;
+        for (a_mode, b_mode, hold_ms) in script {
+            a.set_mode(a_mode);
+            b.set_mode(b_mode);
+            let phase_end = Instant::now() + Duration::from_millis(hold_ms);
+            while Instant::now() < phase_end {
+                if let Ok(sample) = samples.recv_timeout(Duration::from_millis(50)) {
+                    let server = sample.server.clone();
+                    assert!(
+                        known.contains(&sample.server),
+                        "unknown server key published: {server}"
+                    );
+                    assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                    assert_no_cross_mixing(&sample, &key_b, "model-B", 8192);
+                    if sample.server == key_a && !sample.stats.connected {
+                        saw_a_disconnected = true;
+                    }
+                    observed += 1;
+                }
+            }
+        }
+        assert!(
+            observed > 0,
+            "the soak must observe samples (no endless/spinning cycle)"
+        );
+        assert!(
+            saw_a_disconnected,
+            "a failure phase longer than the grace must publish A as disconnected, not hold last-good forever"
+        );
+
+        // Recovery: both servers healthy again report their own values.
+        a.set_mode(MockMode::Healthy);
+        b.set_mode(MockMode::Healthy);
+        let mut a_ok = false;
+        let mut b_ok = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !(a_ok && b_ok) {
+            if let Ok(sample) = samples.recv_timeout(Duration::from_millis(300)) {
+                assert_no_cross_mixing(&sample, &key_a, "model-A", 4096);
+                assert_no_cross_mixing(&sample, &key_b, "model-B", 8192);
+                if sample.server == key_a
+                    && sample.stats.connected
+                    && sample.stats.model == "model-A"
+                {
+                    a_ok = true;
+                }
+                if sample.server == key_b
+                    && sample.stats.connected
+                    && sample.stats.model == "model-B"
+                {
+                    b_ok = true;
+                }
+            }
+        }
+        assert!(
+            a_ok && b_ok,
+            "both servers must recover to their own values (a={a_ok}, b={b_ok})"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(join_within(worker, Duration::from_secs(5)));
+    }
+
+    /// Strict, deterministic leak probe for EPIC 4.1's "keine unkontrollierte
+    /// Ressourcenentwicklung". `#[ignore]`d on purpose: `/proc/self/status`
+    /// (`Threads:`, `VmRSS:`) is **process-global**, so in the shared parallel
+    /// gate the values are dominated by the other concurrently running tests and
+    /// no bound on them can detect a worker leak (this is why the in-gate
+    /// endurance test measures no resources at all). Run it single-threaded via
+    /// an approved runner so `/proc/self` is this test alone and the bounds are
+    /// meaningful:
+    ///   cargo test --all-targets --locked -- --ignored --test-threads=1 \
+    ///     soak_many_set_servers_rounds_bound_resources_single_threaded
+    ///
+    /// It churns the worker's monitor set through `MANY` `SetServers` rounds,
+    /// each a fresh process identity (i.e. a fresh `LlamaMonitor`/HTTP client)
+    /// plus an add/remove of a second server, then asserts the footprint does not
+    /// grow with the round count. A per-round leak of a client's threads or
+    /// buffers blows the bound, so the probe is red if one is introduced.
+    #[test]
+    #[ignore = "heavy/leak probe: run single-threaded via an approved runner (see doc comment); process-global /proc is meaningless in the parallel gate"]
+    fn soak_many_set_servers_rounds_bound_resources_single_threaded() {
+        const MANY: u64 = 60;
+        let a = programmable_mock("model-A".to_string(), 4096, 1_000);
+        let b = programmable_mock("model-B".to_string(), 8192, 2_000);
+        let key_a = crate::domain::server_key(&a.base());
+        let key_b = crate::domain::server_key(&b.base());
+
+        let (stop, samples, cmds, worker) =
+            start_soak_worker(vec![test_spec(&key_a, &a.base())], 200);
+
+        // Settle with one monitor so the baseline includes the worker's steady
+        // thread set; every mock thread is already running.
+        wait_for_connected(&samples, &key_a, "model-A", Duration::from_secs(10));
+        let threads_baseline = self_status_field("Threads:").unwrap_or(0);
+        let rss_baseline = self_status_field("VmRSS:").unwrap_or(0);
+
+        // High churn: a new identity every round forces a fresh monitor (HTTP
+        // client) each round; B is added/removed, so monitors are also dropped.
+        for round in 1..=MANY {
+            let mut servers = vec![ServerSpec {
+                identity: Some(LocalServerIdentity {
+                    pid: 2_000 + round as u32,
+                    start_time: round,
+                }),
+                ..test_spec(&key_a, &a.base())
+            }];
+            if round % 2 == 0 {
+                servers.push(test_spec(&key_b, &b.base()));
+            }
+            cmds.send(LlmCommand::SetServers {
+                generation: round,
+                servers,
+            })
+            .unwrap();
+            // Pace one poll cycle per round so the command is actually applied
+            // and a monitor rebuilds; drain the bounded channel meanwhile.
+            let cycle_end = Instant::now() + Duration::from_millis(MIN_LLM_POLL_MS + 20);
+            while Instant::now() < cycle_end {
+                let _ = samples.recv_timeout(Duration::from_millis(20));
+            }
+        }
+
+        // The worker must still be polling after the churn (no wedge).
+        wait_for_connected(&samples, &key_a, "model-A", Duration::from_secs(10));
+
+        stop.store(true, Ordering::SeqCst);
+        assert!(join_within(worker, Duration::from_secs(5)));
+        // The worker (and its monitors/clients) is joined, but a just-finished
+        // reqwest blocking runtime can take a moment to tear down its worker
+        // threads; this sleep lets that settle before counting. The two mock
+        // threads are still running — they are joined only when `a`/`b` drop at
+        // the end of this function — and were already running when
+        // `threads_baseline` was taken, so they cancel out of the comparison.
+        thread::sleep(Duration::from_millis(200));
+
+        let threads_after = self_status_field("Threads:").unwrap_or(0);
+        let rss_after = self_status_field("VmRSS:").unwrap_or(0);
+        bench_emit("soak_churn_rounds", MANY);
+        bench_emit("soak_churn_threads_baseline", threads_baseline);
+        bench_emit("soak_churn_threads_after", threads_after);
+        bench_emit(
+            "soak_churn_rss_growth_kb",
+            rss_after.saturating_sub(rss_baseline),
+        );
+
+        // Single-threaded: after the worker is joined the footprint must return
+        // to (roughly) the baseline taken with the worker running; a per-round
+        // leak over 60 rounds would be far above this slack.
+        assert!(
+            threads_after <= threads_baseline + 8,
+            "threads grew over {MANY} SetServers rounds ({threads_baseline} -> {threads_after}); a monitor/client leak?"
+        );
+        let rss_growth = rss_after.saturating_sub(rss_baseline);
+        assert!(
+            rss_growth < 64 * 1024,
+            "RSS grew by {rss_growth} KiB over {MANY} SetServers rounds (uncontrolled growth?)"
+        );
     }
 }
