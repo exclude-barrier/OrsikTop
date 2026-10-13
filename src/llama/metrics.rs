@@ -1,5 +1,7 @@
 //! Extracted from the former monolithic `llama.rs`. Behavior-preserving split.
-use super::*;
+use serde_json::Value;
+
+use super::{parse_prometheus, MetricSample, MetricsFormat, ParsedMetrics};
 
 /// Dispatch a `/metrics` body by its actual shape instead of assuming
 /// Prometheus. A body that starts with `{`/`[` is JSON: it is parsed once and
