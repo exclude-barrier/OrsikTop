@@ -1,5 +1,19 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
+};
+
+use super::widgets::{
+    fit_cell, fixed_data_pair, gpu_bar_width, label_span, meter_line, optional_number, percent,
+    unavailable_meter_line,
+};
+use super::{CYAN, DIM_GREEN, MUTED, ORANGE, ORK_GREEN, RED, WHITE, YELLOW};
+use crate::domain::{GpuMapping, GpuStats, MappedGpu};
+use crate::gpu;
 
 /// Encoder/decoder utilization is idle when both are missing or below 1%.
 /// On a pure LLM card this is always the case, so the ENC/DEC row is

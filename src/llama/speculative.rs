@@ -1,5 +1,9 @@
 //! Extracted from the former monolithic `llama.rs`. Behavior-preserving split.
-use super::*;
+use std::{fs, path::Path};
+
+use serde_json::Value;
+
+use super::{CachedProps, LlmStats, LocalSpeculativeConfig, SpeculativeConfig};
 
 pub(super) fn speculative_config(value: &Value) -> SpeculativeConfig {
     let params = value.get("params");
