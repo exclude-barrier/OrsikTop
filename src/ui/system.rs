@@ -1,5 +1,22 @@
 //! Extracted from the former monolithic `ui.rs`. Behavior-preserving split.
-use super::*;
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
+};
+
+use super::gpu_panel::temperature_color;
+use super::widgets::{
+    bytes_to_gib, clamp_percent, compact_cpu_model, interpolate_stops, label_span, meter_line,
+    percent, truncate_title, unavailable_meter_line, value_span,
+};
+use super::{
+    BAR_EMPTY, BRIGHT_GREEN, CYAN, DIM_GREEN, MUTED, ORANGE, ORK_GREEN, RED, WHITE, YELLOW,
+};
+use crate::cpu::{CpuCoreKind, CpuPhysicalCore, CpuTopology};
+use crate::domain::SystemStats;
 
 /// The `1 / 5 / 15` load-average row. All three come from one `/proc/loadavg`
 /// read, so they are either all known or all unknown; an unknown read renders

@@ -31,6 +31,24 @@ pub trait Sys {
     fn read_dir(&self, path: &Path) -> Option<Vec<SysEntry>>;
     /// Direct symlink target (not resolved). `None` if not a symlink or
     fn symlink_target(&self, path: &Path) -> Option<String>;
+    /// List only the entry **names** of a directory, without reading per-entry
+    /// metadata. The DRM fd scan only needs the fd numbers and reads each
+    /// symlink target itself, so it can skip the per-entry classification.
+    /// `None` if the directory is missing or unreadable. Defaults to
+    /// [`Sys::read_dir`].
+    fn read_dir_names(&self, path: &Path) -> Option<Vec<String>> {
+        self.read_dir(path)
+            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+    }
+    /// Whether the symlink at `path` points at a target that starts with the
+    /// raw byte `prefix`, without materializing the target as an owned
+    /// `String`. The DRM fd scan uses this to test the `/dev/dri/` prefix on
+    /// every open fd without one allocation per fd. Defaults to
+    /// [`Sys::symlink_target`].
+    fn symlink_target_starts_with(&self, path: &Path, prefix: &[u8]) -> bool {
+        self.symlink_target(path)
+            .is_some_and(|target| target.as_bytes().starts_with(prefix))
+    }
 }
 
 /// Production implementation backed by the local filesystem.
@@ -56,6 +74,23 @@ impl Sys for RealSys {
         std::fs::read_link(path)
             .ok()
             .map(|target| target.to_string_lossy().into_owned())
+    }
+
+    fn read_dir_names(&self, path: &Path) -> Option<Vec<String>> {
+        let entries = std::fs::read_dir(path).ok()?;
+        Some(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    fn symlink_target_starts_with(&self, path: &Path, prefix: &[u8]) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::read_link(path)
+            .map(|target| target.as_os_str().as_bytes().starts_with(prefix))
+            .unwrap_or(false)
     }
 }
 
@@ -218,6 +253,117 @@ mod tests {
         let file = dir.join("a-file");
         std::fs::write(&file, "x").unwrap();
         assert_eq!(sys.read_dir(&file), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn real_read_dir_names_lists_entry_names_without_metadata() {
+        let sys = RealSys;
+        // A missing path is unreadable: `None`, not an empty listing.
+        assert_eq!(
+            sys.read_dir_names(Path::new("/orsiktop-definitely-missing-directory")),
+            None
+        );
+
+        let dir = std::env::temp_dir().join(format!("orsiktop-readnames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A successfully read, empty directory is `Some([])`.
+        assert_eq!(sys.read_dir_names(&dir), Some(Vec::new()));
+
+        // A populated directory returns exactly the entry names, no metadata.
+        std::fs::write(dir.join("42"), "").unwrap();
+        std::fs::write(dir.join("43"), "").unwrap();
+        let mut names = sys.read_dir_names(&dir).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["42".to_string(), "43".to_string()]);
+
+        // A regular file is not a readable directory.
+        assert_eq!(sys.read_dir_names(&dir.join("42")), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn real_symlink_target_starts_with_compares_raw_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let sys = RealSys;
+        let dir = std::env::temp_dir().join(format!("orsiktop-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A (possibly dangling) symlink to a DRM node matches the prefix.
+        let dri = dir.join("renderD128");
+        symlink("/dev/dri/renderD128", &dri).unwrap();
+        assert!(sys.symlink_target_starts_with(&dri, b"/dev/dri/"));
+
+        // A symlink to a different target does not match `/dev/dri/`, but its
+        // own prefix does — the comparison is on the raw target bytes.
+        let other = dir.join("other");
+        symlink("/tmp/orsiktop-somewhere", &other).unwrap();
+        assert!(!sys.symlink_target_starts_with(&other, b"/dev/dri/"));
+        assert!(sys.symlink_target_starts_with(&other, b"/tmp/"));
+
+        // A regular file is not a symlink: never a match, even for an empty
+        // prefix that every string would start with.
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        assert!(!sys.symlink_target_starts_with(&plain, b"/dev/dri/"));
+        assert!(!sys.symlink_target_starts_with(&plain, b""));
+
+        // A missing path is never a matching symlink.
+        assert!(!sys.symlink_target_starts_with(&dir.join("missing"), b"/dev/dri/"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_and_real_naht_methods_agree_on_equivalent_data() {
+        use std::os::unix::fs::symlink;
+
+        // The override over a temp directory ...
+        let real = RealSys;
+        let dir = std::env::temp_dir().join(format!("orsiktop-naht-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("42"), "").unwrap();
+        std::fs::write(dir.join("43"), "").unwrap();
+        symlink("/dev/dri/renderD128", dir.join("render")).unwrap();
+        symlink("/tmp/other", dir.join("other")).unwrap();
+
+        // ... and the `Sys` default impl (via `FixtureSys`) describing the same
+        // logical directory must agree, so default and override cannot diverge.
+        let mut fixture = FixtureSys::default();
+        fixture
+            .dir_entry("/proc/123/fd", "42", false, true)
+            .dir_entry("/proc/123/fd", "43", false, true)
+            .dir_entry("/proc/123/fd", "render", false, true)
+            .dir_entry("/proc/123/fd", "other", false, true)
+            .symlink("/proc/123/fd/render", "/dev/dri/renderD128")
+            .symlink("/proc/123/fd/other", "/tmp/other");
+
+        let mut real_names = real.read_dir_names(&dir).unwrap();
+        let mut default_names = fixture.read_dir_names(Path::new("/proc/123/fd")).unwrap();
+        real_names.sort();
+        default_names.sort();
+        assert_eq!(real_names, default_names);
+
+        for (fd, real_path) in [("render", dir.join("render")), ("other", dir.join("other"))] {
+            let fixture_path = format!("/proc/123/fd/{fd}");
+            for prefix in [
+                b"/dev/dri/".as_slice(),
+                b"/tmp/".as_slice(),
+                b"/none/".as_slice(),
+            ] {
+                assert_eq!(
+                    real.symlink_target_starts_with(&real_path, prefix),
+                    fixture.symlink_target_starts_with(Path::new(&fixture_path), prefix),
+                    "prefix disagreement on {fixture_path} for {prefix:?}"
+                );
+            }
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
