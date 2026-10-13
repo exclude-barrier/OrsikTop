@@ -4,6 +4,51 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
+### Added
+
+- **Scrollable server selector.** `s` opens a selector that lists every known
+  server with its connection state, activity phase, measurement age, backend
+  type, slot counts, context and throughput. Up/Down scroll with a visible
+  marker that stays in view, Enter selects and Esc closes. On terminals too
+  small for the full list a reduced variant is drawn instead of a dead end.
+- **Compact layout for small terminals.** Between the compact floor (54x16) and
+  the full dashboard floor (72x22) the reduced layout is drawn rather than the
+  "terminal too small" notice; only below the compact floor does the notice
+  remain. The narrowest width still fits the compact LLM/context summary line.
+- **Per-server activity phase, measurement age and backend type.** The selector
+  and overview show each server's own state without switching to it. Missing
+  evidence stays unavailable (`—`) and is never rendered as a guessed `IDLE`.
+- **Hardware and UX evidence documentation.** `docs/HARDWARE_TEST_MATRIX.md`
+  states the evidence level per telemetry path (live-verified vs fixture-only vs
+  not implemented), `docs/UX_EVALUATION.md` records the evaluated UX findings and
+  the baseline regression tests behind them, and `docs/LIVE_VS_FIXTURE.md` is the
+  live-vs-fixture verification matrix.
+
+### Fixed
+
+- **The context high-water mark is no longer shown as the current occupancy.**
+  CTX `used` comes only from a slot's direct `n_prompt_tokens`; the high-water
+  mark (`llamacpp:n_tokens_max`) appears only as a named watermark, never as the
+  current figure. A slot that reports no direct occupancy leaves `used`
+  unavailable (`—`) instead of borrowing another number.
+- **Narrow LLM panels keep the full CTX pair visible** instead of truncating the
+  tail of the line, so `used / capacity` stays readable down to the compact
+  width.
+
+### Changed
+
+- **Repaints happen only when the rendered view changes** (dirty-only redraw)
+  instead of on a fixed cadence; the refresh control still sets the upper bound.
+  At a 1000 ms refresh this is roughly 4 to 5 repaints per second in practice.
+- **The DRM fdinfo scan allocates less per file descriptor**, lowering the cost
+  of the per-process GPU-usage pass on machines with many open descriptors.
+- **`src/ui.rs` and `src/llama.rs` were split into cohesive submodules** and
+  their imports made explicit (no more wildcard re-exports). Behavior-preserving
+  and purely internal; the wildcard suppression `#[allow(unused_imports)]` is
+  gone, so a dead import in either module is now a compiler warning again.
+
 ## [0.3.2] - 2026-10-09
 
 ### Fixed
