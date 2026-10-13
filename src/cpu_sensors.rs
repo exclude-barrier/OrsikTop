@@ -467,6 +467,74 @@ mod tests {
     }
 
     #[test]
+    fn temperature_reads_an_amd_k10temp_tctl_sensor() {
+        // AMD's k10temp exposes the package temperature as `Tctl`, not Intel's
+        // `Package id 0`. Both the CPU thermal-driver filter (k10temp) and the
+        // package-label preference (Tctl) must accept the AMD shape, and the
+        // preferred Tctl reading must win over a per-CCD one.
+        let mut fixture = FixtureSys::default();
+        fixture
+            .dir_entry("/sys/class/hwmon", "hwmon0", true, false)
+            .file("/sys/class/hwmon/hwmon0/name", "k10temp\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_input", "47000\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_label", "Tctl\n")
+            .file("/sys/class/hwmon/hwmon0/temp2_input", "52000\n")
+            .file("/sys/class/hwmon/hwmon0/temp2_label", "Tccd1\n")
+            .dir_entry("/sys/class/hwmon/hwmon0", "name", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_input", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_label", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp2_input", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp2_label", false, false);
+        let mut sensors = CpuSensors::default();
+        sensors.discover(&fixture);
+        assert_eq!(sensors.sample_temperature_c(&fixture), Some(47.0));
+    }
+
+    #[test]
+    fn temperature_reads_a_zenpower_package_sensor() {
+        // The zenpower driver (AMD Zen, older kernels / zenscripted setups)
+        // exposes the package temperature as `temp1_input` with a `Tctl`-style
+        // label. The CPU thermal-driver filter must accept the `zenpower`
+        // driver name even though no production code path is AMD-specific.
+        let mut fixture = FixtureSys::default();
+        fixture
+            .dir_entry("/sys/class/hwmon", "hwmon0", true, false)
+            .file("/sys/class/hwmon/hwmon0/name", "zenpower\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_input", "47000\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_label", "Tctl\n")
+            .dir_entry("/sys/class/hwmon/hwmon0", "name", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_input", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_label", false, false);
+        let mut sensors = CpuSensors::default();
+        sensors.discover(&fixture);
+        assert_eq!(sensors.sample_temperature_c(&fixture), Some(47.0));
+    }
+
+    #[test]
+    fn temperature_reads_x86_pkg_and_skips_a_non_cpu_hwmon() {
+        // `x86_pkg` (e.g. AMD package sensors exposed via x86_pkg_temp) must
+        // pass the CPU thermal-driver filter, while a sibling non-CPU hwmon
+        // (nvme) must stay ignored even though it carries a valid temp input.
+        let mut fixture = FixtureSys::default();
+        fixture
+            .dir_entry("/sys/class/hwmon", "hwmon0", true, false)
+            .dir_entry("/sys/class/hwmon", "hwmon1", true, false)
+            .file("/sys/class/hwmon/hwmon0/name", "x86_pkg\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_input", "55000\n")
+            .file("/sys/class/hwmon/hwmon0/temp1_label", "Package id 0\n")
+            .file("/sys/class/hwmon/hwmon1/name", "nvme\n")
+            .file("/sys/class/hwmon/hwmon1/temp1_input", "49000\n")
+            .dir_entry("/sys/class/hwmon/hwmon0", "name", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_input", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon0", "temp1_label", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon1", "name", false, false)
+            .dir_entry("/sys/class/hwmon/hwmon1", "temp1_input", false, false);
+        let mut sensors = CpuSensors::default();
+        sensors.discover(&fixture);
+        assert_eq!(sensors.sample_temperature_c(&fixture), Some(55.0));
+    }
+
+    #[test]
     fn rapl_watts_delta_math_and_unmeasurable_windows() {
         // 250_000 µJ over 50_000 µs (50 ms) = 5 W.
         let watts = rapl_watts(1_000_000, 1_250_000, 50_000).expect("measurable window");
