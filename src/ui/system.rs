@@ -9,8 +9,8 @@ use ratatui::{
 
 use super::gpu_panel::temperature_color;
 use super::widgets::{
-    bytes_to_gib, clamp_percent, compact_cpu_model, interpolate_stops, label_span, meter_line,
-    percent, truncate_title, unavailable_meter_line, value_span,
+    bytes_to_gib, clamp_percent, compact_cpu_model, display_width, interpolate_stops, label_span,
+    meter_line, percent, truncate_title, unavailable_meter_line, value_span,
 };
 use super::{
     BAR_EMPTY, BRIGHT_GREEN, CYAN, DIM_GREEN, MUTED, ORANGE, ORK_GREEN, RED, WHITE, YELLOW,
@@ -285,7 +285,7 @@ pub(super) fn system_panel_title(topology: &CpuTopology, width: u16) -> String {
     };
 
     let max_len = width.saturating_sub(2) as usize;
-    if title.chars().count() > max_len && max_len > 4 {
+    if display_width(&title) > max_len && max_len > 4 {
         title = truncate_title(&title, max_len);
     }
     title
