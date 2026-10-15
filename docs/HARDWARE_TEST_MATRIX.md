@@ -18,6 +18,11 @@ The source code and its tests remain the source of truth. This matrix records
 `docs/HARDWARE_SUPPORT.md` / `docs/LIVE_VS_FIXTURE.md`, and where hardware is
 missing the gap is named, never filled with a fabricated value.
 
+Matrix baseline: OrsikTop **v0.4.0**, git `e9600d6` (2026-10-14). Every test
+name and `file:line` below was re-checked against this revision. Test *names*
+are the stable key; Rust line numbers move with the tree and are indicative
+only.
+
 ## Evidence levels
 
 Three levels, identical to `docs/LIVE_VS_FIXTURE.md`:
@@ -47,7 +52,43 @@ The five roadmap priorities in roadmap order; the hardware name is bold.
 | 2 | **Intel i915 / Arc dGPU** | fixture-tested | **Open** (only the *xe iGPU* branch is live) | `src/providers/intel.rs`: i915 root-GT `rps_cur_freq_mhz` + `throttle_reason_*` (card dir, then `gt/gt0` fallback); dGfx hwmon `temp1_input` + `power1_max` (PL1) | `samples_i915_from_card_directory` (`src/providers/intel.rs:471`), `i915_reads_clock_and_reasons_from_gt_gt0_fallback` (`:502`), `missing_throttle_source_is_unavailable_not_none` (`:484`), `samples_xe_dgpu_with_hwmon` (`:373`), `pl1_limit_of_zero_is_treated_as_unavailable` (`:564`) | xe iGPU only (dev box, `intel_real_system_smoke`); i915 and Arc dGfx **not** live | an i915 kernel (pre-Xe host) or an Intel Arc dGPU |
 | 3 | **AMD Ryzen/EPYC CPU sensors** | fixture-tested | **Open** | `src/cpu.rs` vendor-neutral identity; `src/cpu_sensors.rs` hwmon walker accepts the AMD driver names `k10temp` and `zenpower` (out-of-tree) plus the generic `x86_pkg` package-temp name (`is_cpu_thermal_driver`, `src/cpu_sensors.rs:315`) and the `Tctl` package label (`is_package_label`, `:325`); no hybrid-PMU files → `cpu_capacity` fallback | `temperature_reads_an_amd_k10temp_tctl_sensor` (`src/cpu_sensors.rs:470`), `temperature_reads_a_zenpower_package_sensor` (`src/cpu_sensors.rs:494`), `parses_amd_identity` (`src/cpu.rs:516`) | — (both boxes are Intel) | an AMD Ryzen or EPYC host |
 | 4 | **NVIDIA Multi-GPU** | partially live | **Partially confirmed** | `src/discovery.rs` enumerates every display-class PCI GPU, sorted by BDF; `src/gpu.rs` `resolve_discovered` / `GpuSelector::Index(n)`; `src/gpu_map.rs` `Multi` mapping state | `discovers_intel_xe_igpu_and_amd_dgpu_sorted_by_bdf` (`src/discovery.rs:299`), `index_selects_the_nth_nvidia_on_igpu_dgpu_machines` (`src/gpu.rs:285`), `multi_gpu_when_process_opens_two_render_nodes` (`src/gpu_map.rs:460`) | cf-desktop **iGPU + one NVIDIA** (both enumerated, BDF-sorted, `Auto`→NVIDIA) | a second NVIDIA GPU (2× NVIDIA index selection) |
-| 5 | **NVIDIA MIG** | fixture-tested | **Open** | `src/providers/nvidia.rs` MIG topology at construction; `src/domain.rs` `MIG-…` identity; `src/gpu_map.rs` `gpu_instance_id`/`compute_instance_id` attribution; `src/ui.rs` parent↔child chip | `mig_child_key_prefers_driver_uuid` (`src/providers/nvidia.rs:653`) ff.; `mig_uuid_detection` (`src/domain.rs:672`); `attribute_mig_child_when_instance_evidence_matches` (`src/gpu_map.rs:617`); `gpu_in_mapping_matches_mig_parent_and_child` (`src/ui.rs:3728`) | — (no MIG-capable A100/H100) | an A100/H100-class MIG host |
+| 5 | **NVIDIA MIG** | fixture-tested | **Open** | `src/providers/nvidia.rs` MIG topology at construction; `src/domain.rs` `MIG-…` identity; `src/gpu_map.rs` `gpu_instance_id`/`compute_instance_id` attribution; `src/ui.rs` parent↔child chip | `mig_child_key_prefers_driver_uuid` (`src/providers/nvidia.rs:653`) ff.; `mig_uuid_detection` (`src/domain.rs:672`); `attribute_mig_child_when_instance_evidence_matches` (`src/gpu_map.rs:617`); `gpu_in_mapping_matches_mig_parent_and_child` (`src/ui.rs:3753`) | — (no MIG-capable A100/H100) | an A100/H100-class MIG host |
+
+## Evidence required per category (the open rows)
+
+The priority matrix says **what** is implemented and fixture-tested; this table
+states **what a live row must carry** — the HW-01 field list (exact model,
+kernel/driver version, OrsikTop version, test method, real measurement, field
+availability, reproducibility) — and which of those fields is still missing. A
+missing field is left `—`; it is never filled by inference. The whole table is
+`Open` for the same reason: neither test box carries the device (see *Live
+environments*), so no live value can be recorded.
+
+| Required field | AMD Radeon dGPU | AMD APU | Intel i915 | Intel Arc dGPU | AMD Ryzen/EPYC | 2× NVIDIA | NVIDIA MIG |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| exact model | — | — | — | — | — | — | — |
+| kernel / driver version | — | — | — | — | — | — | — |
+| OrsikTop version | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 |
+| test method | §4.1 | §4.1 | §4.2 | §4.2 | §4.3 | §4.4 | §4.5 |
+| real measurement | — | — | — | — | — | — | — |
+| field availability (provider; implemented + fixture-tested) | busy %, VRAM total/used, `product_name`, temp, sclk/mclk, power, fan | VRAM carveout via `mem_info_vram_*` | graphics clock, throttle reasons | `temp1_input`, `power1_max` (PL1) | `Tctl`/package temp (k10temp, zenpower) | per-GPU provider sample + `Index(n)` selection | MIG child identity + instance attribution |
+| reproducibility | §4.1 | §4.1 | §4.2 | §4.2 | §4.3 | §4.4 | §4.5 |
+
+`—` = not captured. Each `—` cell is filled only by a real run on the named
+hardware, following the §4 procedure for that row and recorded as §5 requires.
+
+Two notes that keep the open rows honest:
+
+- **Intel iGPU on cf-desktop.** cf-desktop's iGPU *is* enumerated live (row 4
+  above, `discovery_real_system_smoke`), but the Intel *provider* sample is not:
+  the operator helper's fixed allow-list exposes the CI gate list only and does
+  **not** include the `#[ignore]`d `intel_real_system_smoke`, so no live provider
+  sample (clock, throttle reasons) was produced and the i915 provider branch
+  stays **Open**. §2 and §4.2 record how the operator runs that smoke on the
+  target host.
+- **A fixture is not a live value.** A fixture test proves the parser shape on
+  checked-in data; it never turns a row into *live-verified*. The `(fixture)`
+  names in the matrix and in the table above stay evidence of parsing only.
 
 ## Reproducible test instructions
 
@@ -55,7 +96,9 @@ Every command below is a real OrsikTop entry point. The **CI/fixture** suite
 runs anywhere Rust builds; the **live smokes** are `#[ignore]`d and must be
 run explicitly on the target hardware. Per the project rules, CPU-intensive
 builds/tests run through the operator-managed cf-desktop helper
-(`pc-project cargo ...`), never as a local laptop workaround.
+(`pc-project cargo ...`), never as a local laptop workaround. That helper's
+allow-list covers the **CI/fixture** gates only; the `#[ignore]`d live smokes
+are *not* part of it, so the operator runs them directly on the target host.
 
 ### 1. CI / fixture suite (no hardware required)
 
@@ -256,6 +299,12 @@ no server contact and no benchmark was performed. Every test name and file:line
 was checked against the source at the current HEAD. Where a live claim could not
 be traced to a recorded run it is not asserted; where hardware is absent the row
 is marked **Open**, not guessed.
+
+Re-verified 2026-10-14 against git `e9600d6`: all cited test/function names and
+their `file:line` were re-resolved in the working tree; one stale reference was
+corrected (`gpu_in_mapping_matches_mig_parent_and_child`, `src/ui.rs` 3728 →
+3753). The evidence-required table above was added for HW-01; it asserts no new
+live result and leaves every hardware-dependent cell `—`.
 
 ## Cross-references
 
