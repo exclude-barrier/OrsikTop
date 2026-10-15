@@ -539,7 +539,14 @@ src/
 ├── config.rs       persistent runtime settings
 ├── domain.rs       normalized, vendor-neutral telemetry models
 ├── app.rs          event loop and telemetry workers
-├── llama.rs        llama.cpp /metrics, /slots, /props and server discovery
+├── llama.rs        llama.cpp client: polling and metric mapping (LlamaMonitor)
+│   └── llama/       extracted submodules (behaviour-preserving split)
+│       ├── http.rs         HTTP fetch helpers for the telemetry endpoints
+│       ├── metrics.rs      /metrics body dispatch (Prometheus text or Strata JSON)
+│       ├── props.rs        /props parsing and display-safe error text
+│       ├── slots.rs        /slots parsing and per-slot throughput
+│       └── speculative.rs  speculative-decoding / MTP config detection
+├── strata.rs       Strata inference server JSON /metrics adapter
 ├── discovery.rs    vendor-neutral GPU discovery (Linux DRM/sysfs)
 ├── discovery_llm.rs  llama.cpp server discovery (processes + config)
 ├── gpu_map.rs      llama.cpp server → GPU(s) mapping
@@ -554,10 +561,18 @@ src/
 ├── diagnostics.rs  `orsiktop diag` bug-report summary
 ├── redact.rs       no-secrets URL rendering shared by diagnostics and telemetry errors
 ├── system.rs       filesystem abstraction (real + fixture)
-└── ui.rs           ratatui rendering, controls and histories
+└── ui.rs           ratatui rendering, event handling and histories
+    └── ui/          extracted per-panel submodules (behaviour-preserving split)
+        ├── dialogs.rs     help, settings and server-selection dialogs
+        ├── gpu_panel.rs   GPU panel
+        ├── history.rs     history and sparkline rendering
+        ├── llm.rs         LLM telemetry panel
+        ├── processes.rs   process list and grouping
+        ├── system.rs      CPU / RAM system panel
+        └── widgets.rs     shared table and text widgets
 ```
 
-GPU/system sampling and llama.cpp HTTP polling run independently. A slow `/metrics` or `/slots` response therefore does not block keyboard/mouse input or fast GPU updates.
+Two worker threads publish snapshots and the UI renders only the latest one: a fast worker samples system, GPU and process data, and a separate LLM worker performs the llama.cpp HTTP polling. A slow `/metrics` or `/slots` response therefore does not block keyboard/mouse input or fast GPU updates. `llama.rs` (`LlamaMonitor`, polling, metric mapping) and `ui.rs` (layout, event handling, state) remain the main modules; focused helpers were extracted into `src/llama/` and `src/ui/`. Put new helper code in the matching submodule where one exists.
 
 ## Design goals
 

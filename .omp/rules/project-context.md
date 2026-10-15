@@ -5,9 +5,10 @@ Compact standing rules. Long-term decisions live in Honcho, not here.
 ## What OrsikTop is
 
 Small, fast Rust/ratatui TUI monitor for local LLM inference on Linux:
-llama.cpp (`llama-server` / `llama serve`) plus GPU telemetry for NVIDIA,
-AMD and Intel (discrete GPUs and APUs/iGPUs) plus system/process load.
-Local-only: no accounts, browsers, or daemons.
+llama.cpp (`llama-server` / `llama serve`) and the Strata inference server
+(through its JSON `/metrics`) plus GPU telemetry for NVIDIA, AMD and Intel
+(discrete GPUs and APUs/iGPUs) plus system/process load. Local-only: no
+accounts, browsers, or daemons.
 
 ## Architecture (current)
 
@@ -36,6 +37,19 @@ Local-only: no accounts, browsers, or daemons.
 - llama.cpp: `llama.rs` (`LlamaMonitor`) polls `/metrics` (Prometheus),
   `/slots` (optional), `/props` (cached). `discovery_llm.rs` auto-discovers
   the local server from `/proc` — endpoint-based selection, never by PID.
+- Strata: `strata.rs` is the explicit adapter for the Strata inference
+  server's JSON `/metrics` body. It is recognised by body shape (not by
+  endpoint) and normalised into the same canonical metric names the
+  Prometheus path produces, so the existing field mapping, counter-reset
+  handling and throughput logic are reused. Only fields the verified schema
+  actually exposes are mapped; an absent field stays absent, never a
+  fabricated `0`.
+- Module layout: `llama.rs` (`LlamaMonitor`, polling, metric mapping) and
+  `ui.rs` (layout, event handling, state) remain the main modules; focused
+  helpers were extracted into `src/llama/` (`http`, `metrics`, `props`,
+  `slots`, `speculative`) and `src/ui/` (`dialogs`, `gpu_panel`, `history`,
+  `llm`, `processes`, `system`, `widgets`, plus the TestBackend regression
+  modules). Put new helper code in the matching submodule where one exists.
 - Two worker threads (fast: system/GPU/processes; LLM: HTTP) publish
   snapshots; the UI renders only the latest snapshot. `orsiktop diag`
   (`diagnostics.rs`) prints a no-secrets state dump for bug reports.
