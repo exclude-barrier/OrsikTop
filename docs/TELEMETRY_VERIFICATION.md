@@ -49,8 +49,9 @@ Rein lesende Verifikation. Ergebnis differenziert:
   Fixtures belegbaren, aber nicht live bestätigten) Eingaben semantisch
   irreführend; sie werden unten als offene Befunde **F1** und **F2** geführt
   und gehören in Folgetickets, nicht in CFA-33:
-  - **F1 — CACHE-Quote** wird auf 100 % geklemmt und als „% of PP“ ausgegeben,
+  - **F1 — CACHE-Quote** wurde auf 100 % geklemmt und als „% of PP“ ausgegeben,
     obwohl der Zähler keine Teilmenge belegen muss (`src/ui/llm.rs:165-170,324`).
+    **Behoben in CFA-87** (siehe F1 unten).
   - **F2 — REQUEST prompt** zeigte im Fallback ohne `n_prompt_tokens_processed`
     die **KV-Belegung** des Slots, nicht den Prompt-Fortschritt
     (`src/llama/slots.rs:75-78`; belegt durch `slots_strata_new.json`).
@@ -78,7 +79,17 @@ Rein lesende Verifikation. Ergebnis differenziert:
 
 ## Offene Befunde (Folgetickets, nicht in CFA-33)
 
-### F1 — CACHE-Quote wird auf 100 % geklemmt (MUST)
+### F1 — CACHE-Quote wird auf 100 % geklemmt (MUST) — behoben (CFA-87)
+
+- **Status:** Behoben durch CFA-87. Es wird keine Quote mehr berechnet; die
+  Verhältniszelle der CACHE-Zeile zeigt immer `—`, der absolute Zähler bleibt
+  sichtbar (ungültige/negative Werte → `—`). Begründung: Kein unterstütztes
+  Backend dokumentiert, ob `prompt_tokens_cached_total` eine Teilmenge von
+  `prompt_tokens_total` ist (Fixture: `cached > total`) oder disjunkt gezählt
+  wird; jede Quote setzte einen unbelegten Vertrag voraus. Regressionstests:
+  `cache_row_*` in `src/ui.rs` (TestBackend; `cached > total`, `cached == 0`,
+  `total == 0`, fehlend, ungültig). Die folgenden Punkte beschreiben den
+  Befund am Stand `2e0d37f`.
 
 - **Ort:** `src/ui/llm.rs:165-170` (`(cached / total * 100.0).clamp(0.0, 100.0)`),
   Ausgabe `{value:.1}% of PP` (`src/ui/llm.rs:324`).
@@ -173,7 +184,7 @@ LLM-Untergrenze ist 250 ms — `src/domain.rs:21`, angewandt in
 | **AVG (LIFE) PP** | `prompt_total` / `prompt_seconds_total` (`src/llama.rs:489`) | `average_over_seconds`, Fallback Legacy-Gauge `prompt_tokens_seconds` | 1 s | Lebenszeit-Durchschnitt Prefill tok/s | Nenner ≤ 0 oder Feld absent → `None` → `— tok/s` | `derives_average_throughput_from_time_counters` (`src/llama.rs:1730`), `maps_the_verified_strata_schema` (`src/strata.rs:439`) |
 | **AVG (LIFE) TG** | `generated_total` / `generation_seconds_total` (`src/llama.rs:499`) | `average_over_seconds`, Fallback `predicted_tokens_seconds` | 1 s | Lebenszeit-Durchschnitt Decode tok/s | Wie AVG PP | `derives_average_throughput_from_time_counters` (`src/llama.rs:1730`), `maps_the_verified_strata_schema` (`src/strata.rs:439`) |
 | **TOTAL PP/TG** | `prompt_total` / `generated_total` (`src/llama.rs:463,474`) | Monotone Counter verbatim | 1 s | Kumulierte Token seit Serverstart | Absent → `— tok`; Formatwechsel (llama.cpp↔Strata) verwirft die Delta-Basis | `parses_current_llama_metrics_fixture` (`src/llama.rs:1657`), `a_wire_format_switch_resets_the_counter_baseline` (`:1505`) |
-| **CACHE** | `/metrics` `llamacpp:prompt_tokens_cached_total` (`src/llama.rs:472`) | Wert verbatim; Ratio = cached/prompt_total, nur bei `total>0`, **auf 0–100 % geklemmt** (`src/ui/llm.rs:165-170`) | 1 s | Zwischengespeicherte Prompt-Tokens (Lebenszeit) | llama.cpp ohne Feld **oder Strata** (nicht gemappt) → `None` → `—`, Ratio `—`. **Siehe F1:** der geklemmte `% of PP`-Anteil ist bei `cached > total` irreführend | `parses_current_llama_metrics_fixture` (`src/llama.rs:1657`); `maps_the_verified_strata_schema` belegt fehlendes Cache-Mapping (`src/strata.rs:439`); **kein** Test für die Quote |
+| **CACHE** | `/metrics` `llamacpp:prompt_tokens_cached_total` (`src/llama.rs:472`) | Wert verbatim; **keine** Quote (CFA-87, `valid_cache_counter` in `src/ui/llm.rs`) | 1 s | Zwischengespeicherte Prompt-Tokens (Lebenszeit) | llama.cpp ohne Feld **oder Strata** (nicht gemappt) → `None` → `—`; nicht-endlich/negativ → `—`; Verhältniszelle immer `—` (Teilmengen-Semantik unbelegt, F1 behoben) | `parses_current_llama_metrics_fixture` (`src/llama.rs:1657`); `maps_the_verified_strata_schema` belegt fehlendes Cache-Mapping (`src/strata.rs:439`); `cache_row_*` (`src/ui.rs`, TestBackend) |
 | **SPEC drafts/accepted tokens** | `/metrics` `spec_decode_num_draft_tokens_total` / `_num_accepted_tokens_total` (`src/llama.rs:534,536`); Strata `drafts_offered`/`drafts_accepted` (`src/strata.rs:136,146`) | Counter verbatim | 1 s | Spekulative Draft-/Akzeptanz-Tokens (Lebenszeit) | Nur Draft vorhanden → Accepted `—`; beide absent bei `spec_enabled` → „no counters“ (`src/ui/llm.rs:542`) | `speculative_fixture_preserves_position_labels` (`src/llama.rs:1686`), `spec_row_hints_when_enabled_but_counters_unavailable` (`src/ui.rs:3267`), `spec_row_shows_values_when_any_counter_reported` (`src/ui.rs:3279`) |
 | **SPEC Lebenszeit-Akzeptanz (SPEC TOK)** | `spec_draft_tokens` / `spec_accepted_tokens` (`src/ui/llm.rs:171-176`) | `accepted/draft * 100`, geklemmt 0–100 | 1 s | Kumulierte Akzeptanzrate | Draft `0` oder Feld absent → kein Prozent (`—`), nur `accepted`-Zahl | `spec_row_shows_values_when_any_counter_reported` (`src/ui.rs:3279`) |
 | **SPEC acceptance % (ACC)** | Delta `spec_draft_tokens` & `spec_accepted_tokens` (`src/llama.rs:744-765`) | `accepted_delta / draft_delta * 100`, geklemmt 0–100 | 1 s, bei Ruhe max. 3 s gehalten (`SPEC_ACCEPTANCE_HOLD`) | Live-Akzeptanzrate der Spekulation | Kein identifiziertes Delta → letzten Wert max. 3 s halten, dann `—`; nie `0 %` erfunden | `spec_acceptance_computes_from_deltas_and_holds_after_quiet` (`src/llama.rs:2752`), `spec_acceptance_expires_after_the_hold_window` (`:2783`), `spec_counter_reset_does_not_create_fake_acceptance` (`:2833`) |

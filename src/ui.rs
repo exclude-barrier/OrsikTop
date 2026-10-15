@@ -50,6 +50,7 @@ use llm::{draw_llm, friendly_llm_error, llm_link_status, metrics_unavailable_rea
 #[cfg(test)]
 use llm::{
     llm_last_sample_text, llm_phase, llm_slot_overview_line, llm_spec_row, slot_overview_entries,
+    valid_cache_counter,
 };
 use processes::{
     draw_processes, grouped_process_rows_filtered, process_row_target, take_pinned_group_rows,
@@ -4293,6 +4294,83 @@ mod tests {
             text.contains("0 tok"),
             "a real zero request count must render 0:\n{text}"
         );
+    }
+
+    /// The rendered `CACHE` detail row of an LLM panel, or an empty string.
+    fn cache_row(text: &str, width: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        chars
+            .chunks(width)
+            .map(|row| row.iter().collect::<String>())
+            .find(|row| row.contains(" CACHE      "))
+            .unwrap_or_default()
+    }
+
+    fn cache_llm(cached: Option<f64>, total: Option<f64>) -> LlmStats {
+        LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            context_size: 4096,
+            context_used: Some(100),
+            prompt_cached_total: cached,
+            prompt_total: total,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_row_never_shows_a_clamped_share_when_cached_exceeds_total() {
+        // metrics_current.prom: cached 26,000 > prompt total 12,000. The old
+        // clamped `100.0% of PP` was an invented ratio; the absolute counter
+        // must stay visible and the ratio cell must be `—`.
+        let text = render_llm_panel(&cache_llm(Some(26000.0), Some(12000.0)), 100, 14);
+        let row = cache_row(&text, 100);
+        assert!(row.contains("26,000 tok"), "absolute counter:\n{text}");
+        assert!(!row.contains('%'), "no ratio may be shown:\n{row}");
+        assert!(row.contains('—'), "ratio cell must be unavailable:\n{row}");
+        assert!(!text.contains("100.0%"), "no clamped 100%:\n{text}");
+        assert!(!text.contains("of PP"), "no share of PP:\n{text}");
+    }
+
+    #[test]
+    fn cache_row_keeps_a_real_zero_counter_without_a_ratio() {
+        for total in [Some(12000.0), Some(0.0), None] {
+            let text = render_llm_panel(&cache_llm(Some(0.0), total), 100, 14);
+            let row = cache_row(&text, 100);
+            assert!(row.contains("0 tok"), "real zero counter:\n{row}");
+            assert!(!row.contains('%'), "no 0.0% share ({total:?}):\n{row}");
+        }
+    }
+
+    #[test]
+    fn cache_row_with_zero_or_missing_total_shows_only_the_counter() {
+        for total in [Some(0.0), None, Some(f64::NAN)] {
+            let text = render_llm_panel(&cache_llm(Some(500.0), total), 100, 14);
+            let row = cache_row(&text, 100);
+            assert!(row.contains("500 tok"), "counter stays visible:\n{row}");
+            assert!(!row.contains('%'), "no ratio ({total:?}):\n{row}");
+        }
+    }
+
+    #[test]
+    fn cache_row_with_missing_or_invalid_counter_is_unavailable() {
+        for cached in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-5.0)] {
+            assert_eq!(valid_cache_counter(cached), None, "{cached:?}");
+            let text = render_llm_panel(&cache_llm(cached, Some(12000.0)), 100, 14);
+            let row = cache_row(&text, 100);
+            assert!(
+                row.contains('—'),
+                "unavailable counter ({cached:?}):\n{row}"
+            );
+            assert!(
+                !row.contains("tok"),
+                "no fabricated count ({cached:?}):\n{row}"
+            );
+            assert!(!row.contains('%'), "no ratio ({cached:?}):\n{row}");
+        }
+        assert_eq!(valid_cache_counter(Some(0.0)), Some(0.0));
+        assert_eq!(valid_cache_counter(Some(26000.0)), Some(26000.0));
     }
 
     #[test]

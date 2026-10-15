@@ -164,21 +164,13 @@ pub(super) fn draw_llm(
         || "— tok".to_string(),
         |value| format!("{} tok", grouped_f64(value)),
     );
-    let cache = llm
-        .prompt_cached_total
+    // The absolute lifetime cache counter is shown verbatim; a missing or
+    // invalid (non-finite / negative) counter renders `—`.
+    let cached_total = valid_cache_counter(llm.prompt_cached_total);
+    let cache = cached_total
         .map(grouped_f64)
         .unwrap_or_else(|| "—".to_string());
-    let cache_color = if llm.prompt_cached_total.is_some() {
-        CYAN
-    } else {
-        MUTED
-    };
-    let cache_share = llm
-        .prompt_cached_total
-        .zip(llm.prompt_total)
-        .and_then(|(cached, total)| {
-            (total > 0.0).then_some((cached / total * 100.0).clamp(0.0, 100.0))
-        });
+    let cache_color = if cached_total.is_some() { CYAN } else { MUTED };
     let spec_total_acceptance = llm
         .spec_draft_tokens
         .zip(llm.spec_accepted_tokens)
@@ -327,17 +319,14 @@ pub(super) fn draw_llm(
     // The LLM pane is usually taller than its core metric set because it shares a row
     // with the system pane. Use that spare vertical space for useful cumulative detail.
     if inner.height >= 10 {
-        let cache_tokens = llm
-            .prompt_cached_total
+        let cache_tokens = cached_total
             .map(|value| format!("{} tok", grouped_f64(value)))
             .unwrap_or_else(|| "—".to_string());
-        let cache_ratio = cache_share
-            .map(|value| format!("{value:.1}% of PP"))
-            .unwrap_or_else(|| "—".to_string());
+        // No cache ratio is shown: see `valid_cache_counter`.
         lines.push(Line::from(vec![
             label_span(" CACHE      "),
             llm_metric_cell(&cache_tokens, metric_width, cache_color, false),
-            llm_metric_cell(&cache_ratio, metric_width, MUTED, false),
+            llm_metric_cell("—", metric_width, MUTED, false),
         ]));
     }
 
@@ -784,6 +773,22 @@ pub(super) fn llm_slot_overview_line(
         spans.push(value_span(&format!("  +{hidden}"), MUTED));
     }
     Some(Line::from(spans))
+}
+
+/// The lifetime `prompt_tokens_cached_total` counter, or `None` when it is
+/// absent or not a valid count (non-finite / negative).
+///
+/// Deliberately no ratio is derived from it. A `cached / prompt_total` share
+/// would require the cached tokens to be a subset of `prompt_tokens_total`,
+/// which no supported backend documents: the recorded llama.cpp fixtures
+/// report `cached > total` (cache hits are counted separately from evaluated
+/// prompt tokens), so the former clamped `% of PP` turned into an invented
+/// `100%`. A `cached / (cached + total)` hit rate would assume the opposite,
+/// equally unverified, contract. The ratio cell therefore stays `—` for every
+/// input (`cached > total`, `cached == 0`, `total == 0`, missing or invalid
+/// counters) while the absolute counter remains visible.
+pub(super) fn valid_cache_counter(cached: Option<f64>) -> Option<f64> {
+    cached.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 pub(super) fn context_color(percent: f64) -> Color {
