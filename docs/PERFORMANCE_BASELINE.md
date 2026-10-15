@@ -529,10 +529,311 @@ regulären (nicht-`#[ignore]`) Gate; die Testzahl steigt dadurch 477 → 480.
   Komponenten-Aufteilung Thread-Read vs. DRM-Scan.
 - Kein Release-Profil; alle Werte gelten für das Debug-Testprofil (s. o.).
 
+## CFA-92 — Release-Binary-Baseline (Anwendungsprozess, extern über `/proc`)
+
+**Ticket:** CFA-92 (EPIC 3 / PERF-01 „Release-Binary-Benchmark“). Dieser
+Abschnitt misst erstmals die **ausgelieferte Release-Binary** (`[profile.release]`,
+`optimized`) statt des Debug-Testprofils der Abschnitte CFA-35/CFA-36. Er trennt
+strikt zwischen dem **Anwendungsprozess** (von außen über `/proc/<pid>` und den
+Pty-Ausgabestrom gemessen) und dem **Harness-/Testprozess** (im `#[ignore]`-Test
+gemessen). Beide werden **nie** zu einer Zahl vermischt. Die DRM-fd-Scan-
+Optimierung aus CFA-36 wird **nicht** erneut durchgeführt.
+
+### Messobjekt, Trennung und „kein echter Inferenzserver“
+
+- **Anwendungsprozess:** `target/release/orsiktop`, gestartet auf einem eigenen
+  Pty (160×48). Alle CPU-, RSS-, Thread-, Frame- und Latenzwerte stammen aus
+  `/proc/<app-pid>/{stat,status,task}` bzw. aus dem rohen Pty-Byte-Strom und
+  beschreiben **ausschließlich** die Anwendung.
+- **Mock-Server:** je Szenario 1/4/16 llama.cpp-artige Loopback-HTTP-Mocks, die
+  in **eigenen Prozessen** laufen; ihre CPU wird nie als Anwendungskosten
+  gezählt. „Idle ohne Mock“ pollt einen geschlossenen Loopback-Port.
+- **Erzwungene Isolation:** Die Anwendung läuft mit einer isolierten
+  `XDG_CONFIG_HOME` und `auto_discovery=false`, die Konfiguration setzt den
+  Endpunkt auf den jeweiligen Mock. Der auf dem Host real laufende
+  `llama-server` wird daher **nicht** entdeckt und **nicht** kontaktiert; es
+  werden keine echten Inferenzserver befragt. `ORSIKTOP_*`- und Proxy-
+  Umgebungsvariablen werden entfernt.
+
+### Herkunft jeder Metrik (Trennung Anwendung vs. Harness)
+
+| Metrik | Quelle | Klasse |
+| --- | --- | --- |
+| Prozess-CPU (gesamt + je Thread) | `/proc/<app-pid>/stat`, `/task/*/stat` | Anwendung |
+| RSS / VmHWM | `/proc/<app-pid>/status` | Anwendung |
+| Thread-Anzahl | `/proc/<app-pid>/status` | Anwendung |
+| Renderhäufigkeit / Frame-Intervall | Hide-Cursor-Escape (`ESC[?25l`) je `Terminal::draw` auf der Pty | Anwendung |
+| Eingabelatenz (Taste → Frame) | Zeitstempel im Runner zwischen Pty-Write und nächstem Frame | Anwendung (Pty) |
+| LLM-Poll-Zyklus (Periode, Fan-out) | Request-Log der Mock-Prozesse | Harness (Netzseite) |
+| Startdauer (erste Ausgabe / erstes Frame) | Zeitstempel ab `exec` bis erstes Pty-Byte / Frame 2 | Anwendung |
+| **Prozesskollektor-Laufzeit** | `ORSKTOP_BENCH` im `#[ignore]`-Release-Test | **Harness-/Testprozess — getrennt** |
+
+### Reproduzierbarer Runner
+
+`scripts/perf_release_bench.py` (nur Python-Standardbibliothek; Linux, `/proc`,
+`pty`). Erzeugt `ORSKTOP_RELEASE_BENCH|<szenario>#<rep>|<key>=<value>`-Rohzeilen
+und schreibt ein JSON nach `target/perf-bench/` (`target/` ist gitignored, die
+aggregierten Rohwerte stehen deshalb unten im Dokument).
+
+```bash
+cargo build --release --locked
+python3 scripts/perf_release_bench.py \
+  --scenarios idle_no_mock mock_1 mock_4 mock_16 \
+              mock_1_refresh_100 mock_1_refresh_250 mock_1_refresh_5000 \
+              large_proc_list_mock_1 \
+  --duration 30 --warmup 5 --input-reps 40 --repeat 3 --out target/perf-bench
+python3 scripts/perf_release_bench.py \
+  --scenarios soak_mock_4 --soak-duration 600 --warmup 5 --repeat 2 \
+  --out target/perf-bench
+# Harness-/Testprozess, getrennt vom Anwendungsprozess:
+cargo test --release --all-targets --locked -- --ignored --test-threads=1 \
+  perf_baseline_soak_and_process_collection_benchmark
+```
+
+### Messbedingungen (belegt)
+
+| Feld | Wert | Quelle |
+| --- | --- | --- |
+| Host | `cf-laptop` | `hostname` (Runner) |
+| CPU | Intel(R) Core(TM) Ultra 9 288V, **8 logische CPUs** (kein SMT) | `/proc/cpuinfo`, `lscpu` |
+| RAM | 32 319 768 kB (≈ 30,8 GiB) | `host_mem_total_kb` |
+| Kernel | `7.2.5-3-omarchy` (`Linux cf-laptop … x86_64 GNU/Linux`) | `uname -a` |
+| Toolchain | `rustc 1.100.0-nightly (feaadeeac 2026-09-19)`, `cargo 1.100.0-nightly` | `rustc -V` / `cargo -V` |
+| CPU-Frequenz-Governor | `powersave`; EPP `performance`; Netzbetrieb (`ac_online=1`) | Runner |
+| Quellstand | HEAD `536e424`, `git_dirty=false` | Runner |
+| **Build-Profil** | **`release` (optimized)** | `Finished \`release\` profile [optimized]` |
+| Last (wichtig!) | **Geteilter Laptop unter Fremdlast:** parallel liefen mehrere `rustc`/`clippy`-Prozesse anderer Agenten (Last…1 min ≈ **10–20** auf 8 CPUs) sowie ein realer `llama-server` (~180 % CPU). | `loadavg_start/end`, `ps` |
+
+**Konsequenz:** Die Last liegt während der Messung **deutlich über** der
+CPU-Zahl. Die Absolutwerte (Frame-Zeiten, CPU-Prozentsätze, Eingabelatenz) sind
+daher **maschinen- und lastabhängige Referenzwerte**, kein sauberer
+Ruhe-Baseline-Lauf. Zur Belastbarkeit dient die **Spanne über Wiederholungen**;
+aus diesem Grund wurde jedes Szenario **dreimal** (Soak: zweimal) gemessen. Eine
+Wiederholung auf einem unbelasteten Host steht aus (offener Punkt).
+
+### Rohdaten — Anwendungsprozess (Release, 3 Wiederholungen)
+
+Angegeben ist **Mittelwert [Min–Max]** über die Wiederholungen. `—` = nicht
+zutreffend (kein Mock). CPU in **% einer logischen CPU**, RSS/VmHWM in **MB**,
+Poll-Zyklus in **ms**.
+
+| Szenario | SRV | refresh ms | Dummy-Proz. | CPU % | main % | fast % | llm % | Frames/s | Eing. ms | RSS MB | VmHWM MB | Thr. | Zyklus ms | Req/s | Ctx/s | Host-P. |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| idle_no_mock | 0 | 1000 | 0 | 22,28 [21,81–22,64] | 0,64 | 21,53 | 0,01 | 4,82 [4,76–4,86] | 4,22 [3,85–4,47] | 17,27 [17,19–17,32] | 31,14 [30,99–31,27] | 5,01 | — | — | 27,5 | 514 |
+| mock_1 | 1 | 1000 | 0 | 19,84 [15,28–22,93] | 0,63 | 19,09 | 0,03 | 4,93 [4,90–4,96] | 3,93 [2,31–5,11] | 17,25 [16,96–17,42] | 31,14 [31,02–31,27] | 5,02 | 1000,19 | 2,08 | 26,6 | 520 |
+| mock_4 | 4 | 1000 | 0 | 21,68 [17,11–26,38] | 0,73 | 20,68 | 0,03 | 5,16 [4,99–5,30] | 5,46 [2,64–7,93] | 18,13 [17,96–18,26] | 31,79 [31,68–31,90] | 8,05 | 1000,20 | 8,39 | 27,1 | 521 |
+| mock_16 | 16 | 1000 | 0 | 22,16 [18,88–26,19] | 0,72 | 20,48 | 0,06 | 5,23 [5,13–5,32] | 4,31 [2,32–6,23] | 20,56 [20,41–20,75] | 33,94 [33,76–34,05] | 20,36 | 1000,26 | 33,55 | 25,4 | 515 |
+| mock_1_refresh_100 | 1 | 100 | 0 | 27,19 [20,30–31,23] | 1,27 | 25,58 | 0,04 | 9,41 [9,02–10,00] | 3,60 [1,82–4,74] | 17,42 [17,20–17,65] | 31,06 [30,79–31,21] | 5,07 | 250,19 | 8,07 | 31,7 | 514 |
+| mock_1_refresh_250 | 1 | 250 | 0 | 26,57 [19,52–30,37] | 0,81 | 25,43 | 0,04 | 6,32 [5,76–6,80] | 4,33 [2,28–6,04] | 17,39 [17,32–17,47] | 31,12 [31,05–31,22] | 5,06 | 250,22 | 8,06 | 27,4 | 522 |
+| mock_1_refresh_5000 | 1 | 5000 | 0 | 7,59 [5,19–8,89] | 0,50 | 7,02 | 0,03 | 4,20 [4,16–4,23] | 3,71 [2,00–5,11] | 16,88 [16,78–17,02] | 31,16 [30,95–31,31] | 5,00 | 5000,05 | 0,47 | 23,5 | 527 |
+| large_proc_list_mock_1 | 1 | 1000 | 2000 | 23,90 [15,79–28,33] | 0,87 | 22,86 | 0,01 | 4,90 [4,80–5,00] | 6,14 [2,82–8,32] | 22,17 [20,95–23,18] | 31,14 [31,04–31,30] | 5,02 | 1000,16 | 2,05 | 27,3 | 2511 |
+
+Erläuterungen zu den Spalten:
+
+- **fast %** ist der Fast-Worker (Prozesskollektor + System/GPU-Sampling),
+  **main %** der UI-/Render-Thread (`tid == pid`), **llm %** der LLM-Worker.
+  In \(app::run\) wird der Fast-Worker **vor** dem LLM-Worker gestartet, daher
+  ist `thread_1` = Fast-Worker und `thread_2` = LLM-Worker (Reihenfolge, nicht
+  geraten — siehe `src/app.rs:195-210`). Der Fast-Worker trägt **den gesamten**
+  CPU-Aufwand: z. B. `idle_no_mock` 21,53 von 22,28 % ≈ **96 %**.
+- **Threads**: die Anwendung startet mit **5** Threads; je Mock-Server kommt
+  **genau ein** Thread hinzu (1/4/16 → 5/8/20). Der Runner selbst und die Mocks
+  sind separate Prozesse und zählen nicht.
+- **Req/s** sind die tatsächlich vom Mock gesehenen HTTP-Requests (je Zyklus
+  `/metrics` **und** `/slots`, also ≈ 2 × Zyklen/s). Der Zyklus folgt dem
+  wirksamen Poll-Intervall: 100 ms und 250 ms laufen beide mit **250 ms**
+  (Untergrenze des Pollings in `src/app.rs:1454`), 1000 ms und 5000 ms
+  unverändert. Bei `mock_16` ergeben 16 Server × 2 Requests ≈ 32 Req/s.
+- **Frames/s**: Leerlauf-Redraws liegen bei **~4,8/s** (idle-Tick 4/s plus
+  Fast-Snapshots); bei `refresh_ms=100` steigen sie auf **~9,4/s** (Fast-Worker
+  sendet alle 100 ms einen Snapshot). Bei `refresh_ms=5000` bleibt es bei
+  ~4,2/s (idle-Tick). Die Redraw-Rate folgt also dem Fast-Worker-Takt, nicht der
+  Modellgröße — und sie ist hier **direkt am echten Terminal gemessen**, nicht
+  modelliert.
+- **CPU** korreliert klar mit der **wirksamen Kollektor-Frequenz**: bei
+  `refresh_ms=5000` läuft der Prozesszyklus nur alle 5 s (die
+  `process_refresh_ms=1000`-Prüfung liegt **innerhalb** der `refresh_ms`-
+  Schleife, `src/app.rs:926-942` und `sleep_until_next_cycle`, `src/app.rs:1038`),
+  daher fällt die CPU von ~22 % auf ~7,6 %.
+- **large_proc_list_mock_1**: 2000 zusätzliche `sleep`-Prozesse erhöhen die
+  Host-Prozesszahl auf ~2500 und den RSS der Anwendung leicht (mehr
+  Prozesszeilen), die CPU der Anwendung bleibt aber im Bereich der übrigen
+  Szenarien (der Kollektor skaliert mit **Prozess-/fd-Zahl des Hosts**, s. u.).
+
+### Rohdaten — Startdauer (Release)
+
+Zeit ab `exec` bis zum ersten Pty-Byte bzw. bis zum zweiten Frame-Marker; für
+Mock-Szenarien zusätzlich bis der Modellname (`benchmodel-q4`) auf dem Schirm
+erscheint.
+
+| Szenario | erste Ausgabe ms | erstes Frame ms | Modell sichtbar ms |
+| --- | --- | --- | --- |
+| idle_no_mock | 3,26 [1,76–4,35] | 5,03 [3,79–5,76] | — |
+| mock_1 | 3,10 [2,35–3,84] | 6,35 [5,93–7,08] | 77,88 [58,46–112,80] |
+| mock_4 | 3,23 [1,29–6,54] | 5,52 [2,81–8,80] | 73,53 [53,39–109,86] |
+| mock_16 | 4,39 [1,17–10,47] | 7,82 [2,65–16,82] | 91,94 [53,19–116,93] |
+| mock_1_refresh_100 | 1,76 [1,15–2,90] | 4,00 [2,71–6,47] | 54,72 [53,24–57,57] |
+| mock_1_refresh_250 | 1,79 [0,80–2,92] | 3,99 [2,01–6,68] | 54,81 [52,48–57,33] |
+| mock_1_refresh_5000 | 1,55 [1,21–2,19] | 3,15 [2,57–3,99] | 53,83 [53,17–54,96] |
+| large_proc_list_mock_1 | 1,56 [0,95–2,35] | 2,85 [2,20–3,48] | 71,59 [52,69–108,63] |
+
+Die Anwendung ist bis zur **ersten Ausgabe in ~1,2–4,4 ms** und bis zum
+**ersten Frame in ~2,7–8,8 ms** da (Release, hoch ausgelasteter Host). „Modell
+sichtbar“ ist die Zeit bis zum **ersten erfolgreichen LLM-Sample** inklusive
+HTTP-Roundtrip zu 1/4/16 Mocks (~54 ms bei 1 Server bis ~92 ms bei 16). Das ist
+**nicht** der vollständige Programmstart: die GPU-/NVML-/Sensor-Discovery läuft
+im Fast-Worker **nebenläufig** und ist in diesen Zahlen nicht garantiert
+abgeschlossen (s. „Nicht gemessen“).
+
+### Rohdaten — längerer stabiler Betrieb (Soak, `soak_mock_4`, 4 Mocks, 600 s)
+
+| Wdh. | Frames/s | CPU % | RSS erste 10 s MB | RSS letzte 10 s MB | VmHWM MB | Thr. | Eing. ms | Zyklus ms | Host-P. | Last 1 min (Start → Ende) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 5,15 | 24,59 | 17,68 | 20,23 | 31,73 | 8,06 | 4,06 | 1000,25 | 469 | 16,16 → 20,07 |
+| 1 | 5,05 | 24,23 | 17,45 | 19,28 | 31,40 | 8,06 | 2,15 | 1000,23 | 480 | 19,35 → 4,22 |
+
+Über 10 Minuten bleiben Frames/s, CPU und Zyklus **stabil** (keine Zunahme der
+Redraw- oder Poll-Frequenz). **RSS wächst leicht** (≈ +2,0/+1,8 MB in 10 min);
+das ist eine **Beobachtung**, kein belegtes Leck — die Host-Last änderte sich
+zwischen Start und Ende (s. Spalte), und HWM enthält bereits den Startpeak. Der
+Wert verdient bei einem echten Mehrstunden-Soak (EPIC 4.1) Nachverfolgung.
+
+### Rohdaten — Harness-/Testprozess (getrennt!) — Prozesskollektor in `release`
+
+Aus dem `#[ignore]`-Release-Test (`-- --ignored --test-threads=1`), der **im
+Testprozess** die reale `/proc`+DRM-Sammlung ausführt. Diese Zahlen gehören zum
+**Testprozess**, nicht zur TUI und werden nicht mit den Anwendungswerten oben
+verrechnet.
+
+```
+ORSKTOP_BENCH|process_count=1425
+ORSKTOP_BENCH|process_refresh_mean_us=23140
+ORSKTOP_BENCH|process_collect_mean_us=237082
+ORSKTOP_BENCH|process_collect_max_us=238430
+ORSKTOP_BENCH|process_cycle_mean_us=260223
+ORSKTOP_BENCH|process_cycle_max_us=283985
+ORSKTOP_BENCH|process_threads_read_total_us=8191
+ORSKTOP_BENCH|process_threads_read_failures=0
+ORSKTOP_BENCH|process_drm_scan_total_us=233898
+ORSKTOP_BENCH|process_drm_procs_with_gpu=148
+ORSKTOP_BENCH|soak_rss_kb_at_1s=9224
+ORSKTOP_BENCH|soak_rss_kb_at_10s=9224
+ORSKTOP_BENCH|soak_threads_at_1s=2
+ORSKTOP_BENCH|soak_threads_at_10s=2
+ORSKTOP_BENCH|soak_frames_total=28920
+ORSKTOP_BENCH|soak_window_s=10
+```
+
+Auch im Release-Profil ist der **DRM-fd-Scan mit 233 898 µs ≈ 89,9 %** die
+dominierende Komponente des Kollektorzyklus (260 223 µs), der Thread-Zähler nur
+8 191 µs (~3 %). `process_count=1425`; der Testprozess selbst hat konstant
+**9 224 kB RSS** und 2 Threads.
+
+### Rohdaten — Beispiel eines vollständigen Rohblocks (Anwendung)
+
+`idle_no_mock#0` (gekürzt auf die Kernfelder; vollständige Blöcke je Szenario
+und Wiederholung über den Runner reproduzierbar):
+
+```
+ORSKTOP_RELEASE_BENCH|host|cpu_model=Intel(R) Core(TM) Ultra 9 288V
+ORSKTOP_RELEASE_BENCH|host|logical_cpus=8
+ORSKTOP_RELEASE_BENCH|host|mem_total_kb=32319768
+ORSKTOP_RELEASE_BENCH|host|kernel=7.2.5-3-omarchy
+ORSKTOP_RELEASE_BENCH|host|rustc=rustc 1.100.0-nightly (feaadeeac 2026-09-19)
+ORSKTOP_RELEASE_BENCH|host|git_head=536e424
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|host_processes=514
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|loadavg_start=14.71 8.83 5.84 21/1597 235143
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|startup_first_output_ms=1.755
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|startup_first_frame_ms=3.787
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|cpu_pct_one_cpu=22.64
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|cpu_pct_by_thread.main_ui=0.732
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|cpu_pct_by_thread.thread_1=21.808
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|cpu_pct_by_thread.thread_2=0.0
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|cpu_pct_by_thread.exited_or_new=0.1
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|frames_per_s=4.861
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|rss_kb.mean=17740.793
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|vm_hwm_kb=32024
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|threads.mean=5.015
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|input_to_frame_ms.mean=4.468
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|input_to_frame_ms.p95=8.801
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|exit_code=0
+ORSKTOP_RELEASE_BENCH|idle_no_mock#0|shutdown_ms=220.154
+```
+
+### Interpretation (was die Release-Messung zeigt)
+
+- **Der Prozesskollektor ist der dominierende Kostenblock der Anwendung.** Der
+  Fast-Worker trägt > 95 % der Anwendungs-CPU; main- und LLM-Thread liegen
+  zusammen meist unter 1 %. Das deckt sich mit dem getrennt gemessenen
+  Kollektorzyklus (260 ms bei 1425 Prozessen, davon ~90 % DRM-fd-Scan). Die
+  **Refresh-Intervalle** wirken vor allem indirekt: Sie bestimmen den Takt, in
+  dem der Kollektor läuft (`refresh_ms=5000` → ~7,6 % statt ~22 %).
+- **Polling und Rendering sind im Release klein.** Die 1/4/16 Mocks verändern
+  die Anwendungs-CPU kaum (fast-Anteil bleibt ~20 %); der LLM-Worker bleibt bei
+  ~0,01–0,06 % einer CPU. Die Renderlast ist bei 4–10 Frames/s (< 1 % CPU)
+  vernachlässigbar.
+- **Der Speicher ist niedrig und stabil:** RSS ~17–22 MB, VmHWM ~31–34 MB; je
+  Mock-Server genau ein zusätzlicher Thread.
+- **Eingabelatenz (Taste → Frame):** Mittel ~2–6 ms, p95 bis ~8 ms — auf einem
+  ausgelasteten Host und damit nur als Größenordnung belastbar.
+
+### Nicht gemessen (ausdrücklich offen)
+
+- **Vollständiger Programmstart inkl. GPU-/NVML-/Sensor-Discovery.** Der
+  Fast-Worker startet die Discovery **nebenläufig**; „erstes Frame“ garantiert
+  nicht, dass sie abgeschlossen ist. Gemessen ist nur bis zum ersten Frame.
+- **Client-seitige LLM-Poll-Latenz (Request → geparster Sample) im Release.**
+  Von außen messbar ist nur der **Zyklus** (Mock-Request-Zeitpunkte) und die
+  Rechenzeit des LLM-Workers. Die Mock-eigene Servicezeit ist Harness-Kosten und
+  wird nicht als Client-Latenz ausgegeben.
+- **CPU-Spitzen pro Frame** liegen unter der 10-ms-Jiffy-Auflösung und werden
+  deshalb nicht berichtet.
+- **GPU-Rechnerkosten** (NVML/DRM) sind Teil des Fast-Workers, aber nicht
+  getrennt von der `refresh_ms`-Kadenz isoliert.
+- **Ruhe-Baseline ohne Fremdlast** fehlt (dieser Lauf war lastbehaftet).
+- Nur **eine** Maschine (cf-laptop, Core Ultra 9 288V); die Werte sind
+  maschinenspezifisch. Transport ist **Loopback**, kein reales Netz.
+
+## CFA-93 — Messbasierte Optimierung: Entscheid (mit Zahlen)
+
+**Ticket:** CFA-93 (EPIC 3 / PERF-02). Auftrag: nur einen durch PERF-01
+**reproduzierbar bestätigten Engpass** optimieren, vorher/nachher gemessen, ohne
+Verlust der Telemetrie-Aktualität — andernfalls die Entscheidung mit Zahlen
+dokumentieren (gültiger Abschluss).
+
+**Befund (CFA-92):** Der einzige reproduzierbare Engpass ist der
+**Prozesskollektor im Fast-Worker**, und darin der **DRM-fd-Scan**
+(89,9 % des Zyklus, s. o.). Genau dieser ist **bereits in CFA-36 optimiert**
+worden (~10 % gepaarter Gewinn durch Vermeidung von Allokationen um den
+`readlink`-Syscall). Der verbleibende, **je fd anfallende `readlink`-Syscall**
+ist ohne Caching nicht reduzierbar; Caching (fd→DRM-Menge seltener neu scannen)
+würde die Telemetrie-Aktualität verschlechtern und verstößt gegen das
+Abnahmekriterium.
+
+**Entscheidung: keine weitere Code-Änderung in diesem Lauf** (gültiger
+Abschluss nach Aufgabenstellung). Begründung mit Zahlen:
+
+1. Der Engpass ist **bestätigt**, aber die dominierende Komponente ist bereits
+   optimiert (CFA-36); die Restkosten sind der Syscall selbst.
+2. Die verbleibende kandidatische Mikro-Optimierung (die `String`-Allokation je
+   fd-Name in `Sys::read_dir_names`, `src/system.rs:79-87`) liegt nach der
+   CFA-36-Analyse im **einstelligen Prozentbereich** des Scans und damit **unter
+   der Messstreuung dieses lastbehafteten Hosts** (Anwendungs-CPU z. B.
+   `mock_4` 17,1–26,4 %; der Kollektor selbst schwankt über Läufe stark). Ein
+   belastbarer Vorher/Nachher-Beleg ist hier nicht führbar.
+3. Kein **pauschales Caching** (verboten); keine Verschlechterung der
+   Aktualität; die Semantik bleibt unverändert.
+
+Damit wird **kein Performancegewinn behauptet**. CFA-93 ist als
+**dokumentierte Entscheidung** abgeschlossen; ein erneuter Optimierungsanlauf
+lohnt nur mit einem **lastfreien** Messfenster (dann ist auch die fd-Allokation
+prüfbar) oder einem Messpunkt für den Client-Poll.
+
 ## Querverweise
 
 - `src/app.rs` — `RedrawScheduler`, `simulated_idle_redraws`, die zwei
-  Benchmark-Tests.
+  Benchmark-Tests; Fast-Worker/Prozesskollektor (`spawn_fast_worker`,
+  `collect_process_stats`).
 - `src/llama.rs` — `LlamaMonitor::sample` (Polling-Pfad).
 - `docs/TELEMETRY_VERIFICATION.md` — Telemetrie-Semantik (CFA-33).
 - `docs/LIVE_VS_FIXTURE.md` — Live-/Fixture-Evidenzstufen.
