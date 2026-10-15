@@ -50,6 +50,7 @@ use llm::{draw_llm, friendly_llm_error, llm_link_status, metrics_unavailable_rea
 #[cfg(test)]
 use llm::{
     llm_last_sample_text, llm_phase, llm_slot_overview_line, llm_spec_row, slot_overview_entries,
+    valid_cache_counter,
 };
 use processes::{
     draw_processes, grouped_process_rows_filtered, process_row_target, take_pinned_group_rows,
@@ -1302,6 +1303,13 @@ fn draw_compact(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The STATE label the selected-server panel shows for `llm`, so other
+/// modules' tests can check it against the per-server overview.
+#[cfg(test)]
+pub(crate) fn llm_phase_label(llm: &LlmStats) -> &'static str {
+    llm_phase(llm).0
 }
 
 /// Whether the terminal is large enough for the full dashboard layout. The
@@ -2787,6 +2795,32 @@ mod tests {
     }
 
     #[test]
+    fn server_selector_marks_held_values_stale_and_shows_unknown_phase() {
+        // CFA-88: a reconnecting server still lists its held CTX/tok/s, so its
+        // freshness cell must say the values are stale; a connected server
+        // without activity evidence reads UNKNOWN, never IDLE.
+        let area = Rect::new(0, 0, 80, 20);
+        let mut held = summary("held", false, true, 1, 1);
+        held.reconnecting = true;
+        held.phase = Some(ActivityPhase::Reconnecting);
+        held.age_ms = Some(1_200);
+        held.generation_tps = Some(42.0);
+        let mut bare = summary("bare", true, false, 0, 0);
+        bare.phase = Some(ActivityPhase::Unknown);
+        let rows = render_selector_rows(&[held, bare], "held", area);
+
+        let (held_header, held_detail) = selector_entry(&rows, "held");
+        assert!(held_header.contains("reconnecting"), "{rows:?}");
+        assert!(
+            held_detail.contains("stale 1.2 s ago"),
+            "held values must be marked stale: {rows:?}"
+        );
+        let (bare_header, _) = selector_entry(&rows, "bare");
+        let cell = selector_cell_after_label(bare_header, "bare", PHASE_OFFSET, PHASE_WIDTH);
+        assert_eq!(cell.trim(), "UNKNOWN", "{rows:?}");
+    }
+
+    #[test]
     fn server_selector_keeps_phase_age_ctx_tps_and_backend_visible_at_80_columns() {
         // Required fields must all be readable on an 80-column terminal without
         // any value being sliced in half (a truncated CTX would look like a
@@ -2953,6 +2987,149 @@ mod tests {
             "help must be visible at 54x16:\n{text}"
         );
         assert!(!text.contains("needs at least"), "{text}");
+    }
+
+    #[test]
+    fn help_popup_legend_explains_context_and_request_at_72x22() {
+        // CFA-91: the dense panel/selector cells cannot explain themselves, so
+        // the full help popup carries a field legend, above all the CTX vs.
+        // REQUEST distinction. 72x22 is the full-layout floor.
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        let text = render_dashboard(72, 22, 1000, &llm, &mut state);
+        assert!(
+            text.contains("READING THE PANEL"),
+            "legend missing:\n{text}"
+        );
+        assert!(text.contains("CTX"), "CTX row missing:\n{text}");
+        assert!(
+            text.contains("context occupancy"),
+            "CTX explanation missing:\n{text}"
+        );
+        assert!(text.contains("REQUEST"), "REQUEST row missing:\n{text}");
+        assert!(
+            text.contains("in-flight request"),
+            "REQUEST explanation missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn help_popup_legend_stays_readable_on_a_large_terminal() {
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        let text = render_dashboard(120, 40, 1000, &llm, &mut state);
+        assert!(text.contains("READING THE PANEL"), "{text}");
+        assert!(
+            text.contains("STALE"),
+            "the freshness rule must be explained:\n{text}"
+        );
+        assert!(
+            text.contains("unknown or unavailable"),
+            "the unknown-value rule must be explained:\n{text}"
+        );
+    }
+
+    #[test]
+    fn compact_help_names_context_and_request_at_the_hard_floor() {
+        // The compact help (54x16) still has to distinguish the two central
+        // fields, even though the full legend does not fit there.
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        let text = render_dashboard(54, 16, 1000, &llm, &mut state);
+        assert!(
+            text.contains("CTX") && text.contains("REQUEST"),
+            "compact help must name CTX and REQUEST:\n{text}"
+        );
+    }
+
+    #[test]
+    fn panel_labels_freshness_as_sample_not_poll() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            text.contains("SAMPLE"),
+            "freshness field must be labelled SAMPLE:\n{text}"
+        );
+        assert!(
+            !text.contains("POLL"),
+            "the ambiguous POLL label is gone:\n{text}"
+        );
+    }
+
+    #[test]
+    fn offline_panel_states_the_concrete_backend_failure() {
+        // CFA-91: name the actual failure from the sanitized sample instead of
+        // a generic "connection lost".
+        let llm = LlmStats {
+            connected: false,
+            error: "cannot reach llama.cpp: connection refused".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 8);
+        assert!(text.contains("SERVER OFFLINE"), "{text}");
+        assert!(
+            text.contains("connection refused"),
+            "reason must name the failure:\n{text}"
+        );
+    }
+
+    #[test]
+    fn offline_panel_without_an_error_suggests_checking_the_endpoint() {
+        let llm = LlmStats {
+            connected: false,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 8);
+        assert!(
+            text.contains("check host and port"),
+            "an empty sample must give an actionable hint:\n{text}"
+        );
+        assert!(!text.contains("connection lost"), "{text}");
+    }
+
+    #[test]
+    fn unknown_metrics_and_slots_stay_dash_at_all_target_layouts() {
+        // A reachable server with neither /metrics nor /slots has unknown
+        // values: they must render `—`, never a fabricated 0, at every target
+        // size (54x16, 72x22, large).
+        for (width, height) in [(54u16, 16u16), (72, 22), (120, 40)] {
+            let llm = LlmStats {
+                connected: true,
+                metrics_available: false,
+                model: "m".to_string(),
+                ..Default::default()
+            };
+            let text = render_llm_panel(&llm, width, height);
+            assert!(
+                text.contains("UNAVAILABLE"),
+                "metrics-unavailable panel missing at {width}x{height}:\n{text}"
+            );
+            assert!(
+                !text.contains("0/0"),
+                "no fabricated slot counts at {width}x{height}:\n{text}"
+            );
+            assert!(
+                text.contains('—'),
+                "unknown placeholder missing at {width}x{height}:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -3337,11 +3514,57 @@ mod tests {
     }
 
     #[test]
-    fn llm_phase_marks_idle_without_activity() {
-        let stats = LlmStats::default();
+    fn llm_phase_without_activity_evidence_is_unknown_not_idle() {
+        // Connected, /metrics answered, but no /slots, no request gauge and no
+        // server-reported phase: nothing says the server is idle (CFA-88).
+        let stats = LlmStats {
+            connected: true,
+            metrics_available: true,
+            ..LlmStats::default()
+        };
         let (phase, color) = llm_phase(&stats);
-        assert_eq!(phase, "IDLE");
+        assert_eq!(phase, "UNKNOWN");
         assert_eq!(color, MUTED);
+    }
+
+    #[test]
+    fn llm_phase_marks_idle_only_with_evidence() {
+        let connected = LlmStats {
+            connected: true,
+            metrics_available: true,
+            ..LlmStats::default()
+        };
+        // A valid /slots array with no busy slot.
+        let slots_idle = LlmStats {
+            slots_available: true,
+            slot_count: 2,
+            ..connected.clone()
+        };
+        assert_eq!(llm_phase(&slots_idle), ("IDLE", MUTED));
+        // An active-requests gauge reporting a real 0.
+        let gauge_idle = LlmStats {
+            active_requests: Some(0.0),
+            ..connected.clone()
+        };
+        assert_eq!(llm_phase(&gauge_idle).0, "IDLE");
+        // Only a deferred gauge of 0 is not evidence of no active request.
+        let deferred_only = LlmStats {
+            deferred_requests: Some(0.0),
+            ..connected
+        };
+        assert_eq!(llm_phase(&deferred_only).0, "UNKNOWN");
+    }
+
+    #[test]
+    fn llm_phase_distinguishes_offline_and_reconnecting() {
+        assert_eq!(llm_phase(&LlmStats::default()), ("OFFLINE", RED));
+        let held = LlmStats {
+            connected: true,
+            reconnecting: true,
+            generation_tps: Some(40.0),
+            ..LlmStats::default()
+        };
+        assert_eq!(llm_phase(&held).0, "RECONNECTING");
     }
 
     #[test]
@@ -3351,26 +3574,29 @@ mod tests {
         // Prefill is labeled PREFILL even though Strata reports no live prefill
         // rate; generating is GENERATING without needing a live rate.
         let reading = LlmStats {
+            connected: true,
             strata_phase: Some(StrataPhase::Reading),
             ..LlmStats::default()
         };
         assert_eq!(llm_phase(&reading).0, "PREFILL");
 
         let generating = LlmStats {
+            connected: true,
             strata_phase: Some(StrataPhase::Generating),
             ..LlmStats::default()
         };
         assert_eq!(llm_phase(&generating).0, "GENERATING");
 
-        // An idle phase falls through to the existing heuristics (no activity
-        // reported -> IDLE), and a programmatic rate still wins when there is
-        // no phase.
+        // A reported idle phase is evidence for IDLE, and a programmatic rate
+        // still wins when there is no phase.
         let idle = LlmStats {
+            connected: true,
             strata_phase: Some(StrataPhase::Idle),
             ..LlmStats::default()
         };
         assert_eq!(llm_phase(&idle).0, "IDLE");
         let rate_only = LlmStats {
+            connected: true,
             generation_tps: Some(50.0),
             ..LlmStats::default()
         };
@@ -4293,6 +4519,117 @@ mod tests {
             text.contains("0 tok"),
             "a real zero request count must render 0:\n{text}"
         );
+    }
+
+    /// The rendered `CACHE` detail row of an LLM panel, or an empty string.
+    fn cache_row(text: &str, width: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        chars
+            .chunks(width)
+            .map(|row| row.iter().collect::<String>())
+            .find(|row| row.contains(" CACHE      "))
+            .unwrap_or_default()
+    }
+
+    fn cache_llm(cached: Option<f64>, total: Option<f64>) -> LlmStats {
+        LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            context_size: 4096,
+            context_used: Some(100),
+            prompt_cached_total: cached,
+            prompt_total: total,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_row_never_shows_a_clamped_share_when_cached_exceeds_total() {
+        // metrics_current.prom: cached 26,000 > prompt total 12,000. The old
+        // clamped `100.0% of PP` was an invented ratio; the absolute counter
+        // must stay visible and the ratio cell must be `—`.
+        let text = render_llm_panel(&cache_llm(Some(26000.0), Some(12000.0)), 100, 14);
+        let row = cache_row(&text, 100);
+        assert!(row.contains("26,000 tok"), "absolute counter:\n{text}");
+        assert!(!row.contains('%'), "no ratio may be shown:\n{row}");
+        assert!(row.contains('—'), "ratio cell must be unavailable:\n{row}");
+        assert!(!text.contains("100.0%"), "no clamped 100%:\n{text}");
+        assert!(!text.contains("of PP"), "no share of PP:\n{text}");
+    }
+
+    #[test]
+    fn cache_row_keeps_a_real_zero_counter_without_a_ratio() {
+        for total in [Some(12000.0), Some(0.0), None] {
+            let text = render_llm_panel(&cache_llm(Some(0.0), total), 100, 14);
+            let row = cache_row(&text, 100);
+            assert!(row.contains("0 tok"), "real zero counter:\n{row}");
+            assert!(!row.contains('%'), "no 0.0% share ({total:?}):\n{row}");
+        }
+    }
+
+    #[test]
+    fn cache_row_with_zero_or_missing_total_shows_only_the_counter() {
+        for total in [Some(0.0), None, Some(f64::NAN)] {
+            let text = render_llm_panel(&cache_llm(Some(500.0), total), 100, 14);
+            let row = cache_row(&text, 100);
+            assert!(row.contains("500 tok"), "counter stays visible:\n{row}");
+            assert!(!row.contains('%'), "no ratio ({total:?}):\n{row}");
+        }
+    }
+
+    #[test]
+    fn cache_row_with_missing_or_invalid_counter_is_unavailable() {
+        for cached in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-5.0)] {
+            assert_eq!(valid_cache_counter(cached), None, "{cached:?}");
+            let text = render_llm_panel(&cache_llm(cached, Some(12000.0)), 100, 14);
+            let row = cache_row(&text, 100);
+            assert!(
+                row.contains('—'),
+                "unavailable counter ({cached:?}):\n{row}"
+            );
+            assert!(
+                !row.contains("tok"),
+                "no fabricated count ({cached:?}):\n{row}"
+            );
+            assert!(!row.contains('%'), "no ratio ({cached:?}):\n{row}");
+        }
+        assert_eq!(valid_cache_counter(Some(0.0)), Some(0.0));
+        assert_eq!(valid_cache_counter(Some(26000.0)), Some(26000.0));
+    }
+
+    #[test]
+    fn held_reconnecting_sample_is_marked_stale_in_the_panel() {
+        // During the offline grace the last good sample is still drawn; the
+        // panel must say it is not fresh and must not highlight held rates as
+        // live activity (CFA-88).
+        let live = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            slots_available: true,
+            slot_count: 1,
+            busy_slots: 1,
+            generation_tps: Some(42.0),
+            ..Default::default()
+        };
+        let fresh_text = render_llm_panel(&live, 100, 14);
+        assert!(!fresh_text.contains("STALE"), "{fresh_text}");
+        assert!(fresh_text.contains("GENERATING"), "{fresh_text}");
+
+        let held = LlmStats {
+            reconnecting: true,
+            ..live
+        };
+        for (width, height) in [(54, 16), (72, 22), (100, 14)] {
+            let text = render_llm_panel(&held, width, height);
+            assert!(
+                text.contains("STALE (held sample)"),
+                "held sample must be marked stale at {width}x{height}:\n{text}"
+            );
+            assert!(text.contains("RECONNECTING"), "{text}");
+            assert!(!text.contains("GENERATING"), "{text}");
+        }
     }
 
     #[test]

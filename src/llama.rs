@@ -135,10 +135,13 @@ pub struct LlmStats {
 
 /// Classify a server's activity phase from its own telemetry using the shared
 /// heuristic: a server-reported Strata phase is authoritative, otherwise the
-/// live rates and slot activity decide. This never inspects connection state —
-/// callers that need to distinguish "offline" from "idle" use
-/// [`activity_phase`]; the selected-server panel uses it directly (an offline
-/// server keeps its last-known idle presentation there).
+/// live rates and slot activity decide. `Idle` requires positive evidence of
+/// no activity — a valid `/slots` array (whose busy count is then real), an
+/// `active requests` gauge reporting `0`, or Strata's `live.state = idle`.
+/// Without any of these the phase is `Unknown`, never a guessed `Idle`. This
+/// never inspects connection state — callers that need to distinguish
+/// "offline" from the activity phase use [`activity_phase`]; the
+/// selected-server panel is only drawn with phases while connected.
 pub(crate) fn classify_phase(llm: &LlmStats) -> crate::domain::ActivityPhase {
     let strata_phase = llm.strata_phase;
     let generating = strata_phase == Some(crate::strata::StrataPhase::Generating)
@@ -153,16 +156,21 @@ pub(crate) fn classify_phase(llm: &LlmStats) -> crate::domain::ActivityPhase {
         crate::domain::ActivityPhase::Processing
     } else if llm.deferred_requests.is_some_and(|value| value > 0.0) {
         crate::domain::ActivityPhase::Queued
-    } else {
+    } else if strata_phase == Some(crate::strata::StrataPhase::Idle)
+        || llm.slots_available
+        || llm.active_requests == Some(0.0)
+    {
         crate::domain::ActivityPhase::Idle
+    } else {
+        crate::domain::ActivityPhase::Unknown
     }
 }
 
-/// The activity phase shown per server in the overview. `None` means there is
-/// no reliable evidence — a server that has never answered, or is currently
-/// offline — and must render `—` rather than a guessed `IDLE`. A server being
-/// reconnected keeps an explicit `RECONNECTING` label (held state, not live
-/// activity).
+/// The activity phase shown per server in the overview. `None` means the
+/// server has never answered or is currently offline and must render `—`
+/// rather than a guessed `IDLE`; a connected server without activity evidence
+/// is `Unknown` (see [`classify_phase`]). A server being reconnected keeps an
+/// explicit `RECONNECTING` label (held state, not live activity).
 pub(crate) fn activity_phase(llm: &LlmStats) -> Option<crate::domain::ActivityPhase> {
     if llm.reconnecting {
         return Some(crate::domain::ActivityPhase::Reconnecting);
@@ -1938,7 +1946,9 @@ mod tests {
         assert_eq!(stats.busy_slots, 2);
         assert_eq!(stats.context_used, Some(4000));
         assert_eq!(stats.context_size, 150000);
-        assert_eq!(stats.request_prompt_tokens, Some(6000));
+        // Occupancy only (no `n_prompt_tokens_processed`): the busy slots'
+        // request prompt progress is unknown, not the summed CTX figures.
+        assert_eq!(stats.request_prompt_tokens, None);
         assert_eq!(stats.context_slot_id, Some(1));
     }
 
@@ -2235,12 +2245,82 @@ mod tests {
         };
         let slots: Value =
             serde_json::from_str(include_str!("../tests/fixtures/slots_strata_new.json")).unwrap();
-        apply_slots_json(&mut stats, &slots).unwrap();
+        let counters = apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.context_used, Some(113274));
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(stats.slot_overview[0].context_used, Some(113274));
-        // The same field (as prompt_processed) feeds the busy REQUEST row.
-        assert_eq!(stats.request_prompt_tokens, Some(113274));
+        // The slot is busy but reports no `n_prompt_tokens_processed`: request
+        // prompt progress is unknown. The CTX occupancy must not be reused as
+        // REQUEST progress (CFA-86), neither for the row nor for the per-slot
+        // prefill delta.
+        assert_eq!(stats.busy_slots, 1);
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(counters[0].prompt_processed, None);
+    }
+
+    #[test]
+    fn llama_slot_without_processed_counter_keeps_request_prompt_unknown() {
+        // A llama.cpp-shaped busy slot that reports occupancy and decode
+        // progress but no `n_prompt_tokens_processed`: CTX stays the direct
+        // occupancy, REQUEST prompt stays unknown, REQUEST generated is real.
+        let mut stats = LlmStats::default();
+        let slots = json!([{
+            "id": 0,
+            "id_task": 7,
+            "n_ctx": 8192,
+            "is_processing": true,
+            "n_prompt_tokens": 3000,
+            "next_token": [{"n_decoded": 40}]
+        }]);
+        let counters = apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, Some(3000));
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(stats.request_generated_tokens, Some(40));
+        assert_eq!(counters[0].prompt_processed, None);
+        assert_eq!(counters[0].decoded, Some(40));
+
+        // A growing occupancy across two samples is not prefill progress: the
+        // slot path abstains for the prompt dimension instead of deriving a
+        // rate from CTX.
+        let mut next = LlmStats::default();
+        let later = json!([{
+            "id": 0,
+            "id_task": 7,
+            "n_ctx": 8192,
+            "is_processing": true,
+            "n_prompt_tokens": 3500,
+            "next_token": [{"n_decoded": 60}]
+        }]);
+        let later_counters = apply_slots_json(&mut next, &later).unwrap();
+        let (prompt_tps, generation_tps) = slot_delta_tps(&counters, &later_counters, 1.0);
+        assert_eq!(prompt_tps, None);
+        assert_eq!(generation_tps, Some(20.0));
+    }
+
+    #[test]
+    fn sample_uses_strata_live_prompt_not_new_slots_occupancy_for_request() {
+        // Newer Strata: /slots carries only the occupancy (`n_prompt_tokens`),
+        // /metrics `live` carries the active request's prompt length. REQUEST
+        // prompt must come from the request field, CTX from the occupancy —
+        // the two must never collapse into the same figure.
+        let backend = spawn_backend(|path, _n| {
+            let body = if path.contains("/props") {
+                r#"{"total_slots":1,"model_alias":"strata-model"}"#.to_string()
+            } else if path.contains("/slots") {
+                include_str!("../tests/fixtures/slots_strata_new.json").to_string()
+            } else if path.contains("/metrics") {
+                r#"{"engine":{"max_context":196608},"live":{"state":"reading","prompt_tokens":2048,"generated":0},"requests_kept":1,"totals":{"since":1.0,"prompt_tokens":5,"output_tokens":5,"prompt_ms":1000.0,"decode_ms":1000.0}}"#.to_string()
+            } else {
+                "{}".to_string()
+            };
+            (200, "application/json", body)
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let stats = monitor.sample();
+        assert!(stats.connected && stats.metrics_available);
+        assert_eq!(stats.context_used, Some(113274));
+        assert_eq!(stats.request_prompt_tokens, Some(2048));
+        assert_eq!(stats.request_generated_tokens, Some(0));
     }
 
     #[test]
@@ -2950,6 +3030,34 @@ mod tests {
             base: format!("http://{addr}"),
             stop,
         }
+    }
+
+    #[test]
+    fn missing_slots_and_activity_fields_leave_the_phase_unknown() {
+        // CFA-88: /slots 404 and a /metrics body without
+        // `requests_processing`: nothing proves the server is idle, so the
+        // phase is UNKNOWN. Once the gauge reports a real 0 it is IDLE.
+        use crate::domain::ActivityPhase;
+        let backend = spawn_backend(|path, n| {
+            if path.contains("/slots") {
+                return (404, "text/plain", "not found".to_string());
+            }
+            if path.contains("/metrics") {
+                let mut body = "llamacpp:prompt_tokens_total 10\n".to_string();
+                if n > 0 {
+                    body.push_str("llamacpp:requests_processing 0\n");
+                }
+                return (200, "text/plain", body);
+            }
+            (200, "application/json", r#"{"total_slots":1}"#.to_string())
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let first = monitor.sample();
+        assert!(first.connected && first.metrics_available && !first.slots_available);
+        assert_eq!(activity_phase(&first), Some(ActivityPhase::Unknown));
+        let second = monitor.sample();
+        assert_eq!(second.active_requests, Some(0.0));
+        assert_eq!(activity_phase(&second), Some(ActivityPhase::Idle));
     }
 
     #[test]

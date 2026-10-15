@@ -67,8 +67,9 @@ OrsikTop reads llama.cpp telemetry and displays:
 - speculative decoding / MTP state and acceptance data when available
 - cumulative prompt and generation time
 - 60-second prefill and decode history
-- connection state, uptime and smoothed polling latency
-- transient reconnect handling so short polling interruptions do not immediately show the server as offline
+- connection state, uptime and the smoothed sample interval (`SAMPLE`)
+- an activity phase (`IDLE`/`PREFILL`/`GENERATING`/`PROCESSING`/`QUEUED`) shown only when the telemetry supports it: a connected server with no activity evidence at all reads `UNKNOWN` rather than a guessed `IDLE`, while an offline or never-answered server shows no phase (`—`)
+- transient reconnect handling so short polling interruptions do not immediately show the server as offline; while such a last-good sample is held it is marked as not fresh (`STALE (held sample)` in the panel, `stale … ago` in the server selector) and its rates are not highlighted as live
 
 With a `--parallel` server (multiple slots) the panel aggregates across slots: `SLOTS busy/total` counts active slots, and the live prefill / decode throughput lines sum the per-slot deltas of slots with a verified identity — the server's own slot `id`, matched against the previous sample with the same task. Array position is never treated as identity: if any slot lacks a unique `id`, a slot appears or disappears, or the task changes, the per-slot path abstains and OrsikTop falls back to the aggregated `/metrics` counters instead of fabricating throughput (so reordering or replacing slots cannot create activity). The context pair (`used / size`) is always read from a single slot — the most-used busy slot, or the most-used slot overall when no slot is busy — because an idle slot keeps its last task's context, so mixing a maximum `used` with a maximum `n_ctx` across slots could pair values from two different slots.
 
@@ -98,10 +99,12 @@ reported figure, not an exact physical KV-cache measurement). Strata 0.1.40
 predates that field and reports
 only `id`, `n_ctx` and `is_processing`, so its CTX `used` stays `—` against the
 configured capacity rather than being inferred from prompt or generated counts
-(an upstream API limitation, fixed in newer Strata). On such a version the
-active request's prompt length and generated-token progress appear in the
-REQUEST row instead, taken from the already-fetched `/metrics` `live` fields —
-never presented as KV occupancy.
+(an upstream API limitation, fixed in newer Strata). On every Strata version
+the active request's prompt length and generated-token progress appear in the
+REQUEST row, taken from the already-fetched `/metrics` `live` fields. The
+slot's `n_prompt_tokens` is context occupancy only and is never shown as
+REQUEST progress; without an explicit `n_prompt_tokens_processed` counter (or
+Strata `live` field) REQUEST prompt stays `—`.
 
 ### GPU
 
@@ -376,6 +379,12 @@ For a locally running server, the LLM panel shows the GPU it uses (`GPU <id>`) �
 | Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` |
 
 The main telemetry refresh interval can be changed live from **100 ms to 10,000 ms**.
+
+The `h` help popup also carries a short legend for the LLM panel and selector
+fields — what `CTX` and `REQUEST` mean (current context occupancy vs. the
+in-flight request's tokens), the `PP`/`TG` rate columns, the `STATE` phases,
+the `SAMPLE` freshness field and the rule that an unknown value is shown as
+`—`, never as a fabricated zero.
 
 ## Settings
 

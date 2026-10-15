@@ -25,8 +25,16 @@ pub(super) fn draw_llm(
     state: &UiState,
     gpu_map: &GpuMapping,
 ) {
+    // While the connection is being re-established the panel keeps showing the
+    // last good sample (offline grace). Mark the whole panel as not fresh so
+    // the held values cannot be mistaken for live telemetry.
+    let title = if llm.reconnecting {
+        " LLM INFERENCE · STALE (held sample) "
+    } else {
+        " LLM INFERENCE "
+    };
     let block = Block::default()
-        .title(" LLM INFERENCE ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM_GREEN));
     let inner = block.inner(area);
@@ -38,19 +46,31 @@ pub(super) fn draw_llm(
 
     if !llm.connected {
         let metrics_off = llm_metrics_disabled(&llm.error);
-        let (status, color, message) = if metrics_off {
-            ("METRICS OFF", YELLOW, "restart server with --metrics")
+        let (status, color) = if metrics_off {
+            ("METRICS OFF", YELLOW)
         } else if llm.reconnecting {
-            ("RECONNECTING", YELLOW, "connection lost · retrying")
+            ("RECONNECTING", YELLOW)
         } else {
-            ("SERVER OFFLINE", RED, "connection lost")
+            ("SERVER OFFLINE", RED)
+        };
+        // Prefer the concrete, already-sanitized backend text over a generic
+        // "connection lost" so the reason names the actual failure; fall back
+        // to an actionable hint only when the sample carries no error at all.
+        let reason = if metrics_off {
+            "restart server with --metrics".to_string()
+        } else if llm.reconnecting {
+            "connection lost · retrying (held sample)".to_string()
+        } else if llm.error.trim().is_empty() {
+            "no response from the server — check host and port".to_string()
+        } else {
+            llm.error.clone()
         };
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![label_span(" STATUS      "), value_span(status, color)]),
                 Line::from(vec![
-                    label_span(" LLAMA       "),
-                    Span::styled(message, Style::default().fg(MUTED)),
+                    label_span(" REASON      "),
+                    Span::styled(reason, Style::default().fg(MUTED)),
                 ]),
                 Line::from(vec![
                     label_span(" LAST SAMPLE "),
@@ -164,21 +184,13 @@ pub(super) fn draw_llm(
         || "— tok".to_string(),
         |value| format!("{} tok", grouped_f64(value)),
     );
-    let cache = llm
-        .prompt_cached_total
+    // The absolute lifetime cache counter is shown verbatim; a missing or
+    // invalid (non-finite / negative) counter renders `—`.
+    let cached_total = valid_cache_counter(llm.prompt_cached_total);
+    let cache = cached_total
         .map(grouped_f64)
         .unwrap_or_else(|| "—".to_string());
-    let cache_color = if llm.prompt_cached_total.is_some() {
-        CYAN
-    } else {
-        MUTED
-    };
-    let cache_share = llm
-        .prompt_cached_total
-        .zip(llm.prompt_total)
-        .and_then(|(cached, total)| {
-            (total > 0.0).then_some((cached / total * 100.0).clamp(0.0, 100.0))
-        });
+    let cache_color = if cached_total.is_some() { CYAN } else { MUTED };
     let spec_total_acceptance = llm
         .spec_draft_tokens
         .zip(llm.spec_accepted_tokens)
@@ -195,13 +207,20 @@ pub(super) fn draw_llm(
         MUTED
     };
 
-    let pp_active = llm.prompt_tps.is_some_and(|value| value > 0.05);
-    let tg_active = llm.generation_tps.is_some_and(|value| value > 0.05);
+    // Held (reconnecting) rates are not current activity: never highlight
+    // them as live.
+    let fresh = !llm.reconnecting;
+    let pp_active = fresh && llm.prompt_tps.is_some_and(|value| value > 0.05);
+    let tg_active = fresh && llm.generation_tps.is_some_and(|value| value > 0.05);
     let pp_header_color = if pp_active { CYAN } else { MUTED };
     let tg_header_color = if tg_active { ORK_GREEN } else { MUTED };
     let pp_live_color = if pp_active { CYAN } else { MUTED };
     let tg_live_color = if tg_active { ORK_GREEN } else { MUTED };
-    let request_color = if llm.busy_slots > 0 { WHITE } else { MUTED };
+    let request_color = if fresh && llm.busy_slots > 0 {
+        WHITE
+    } else {
+        MUTED
+    };
 
     let metric_width = ((inner.width as usize).saturating_sub(12) / 2).clamp(16, 30);
     let mut state_line = vec![
@@ -269,7 +288,7 @@ pub(super) fn draw_llm(
             label_span("UPTIME "),
             value_span(&llm_uptime_text(state), MUTED),
             llm_sep(),
-            label_span("POLL "),
+            label_span("SAMPLE "),
             value_span(&llm_last_sample_text(state, llm), MUTED),
         ]),
         Line::from(state_line),
@@ -327,17 +346,14 @@ pub(super) fn draw_llm(
     // The LLM pane is usually taller than its core metric set because it shares a row
     // with the system pane. Use that spare vertical space for useful cumulative detail.
     if inner.height >= 10 {
-        let cache_tokens = llm
-            .prompt_cached_total
+        let cache_tokens = cached_total
             .map(|value| format!("{} tok", grouped_f64(value)))
             .unwrap_or_else(|| "—".to_string());
-        let cache_ratio = cache_share
-            .map(|value| format!("{value:.1}% of PP"))
-            .unwrap_or_else(|| "—".to_string());
+        // No cache ratio is shown: see `valid_cache_counter`.
         lines.push(Line::from(vec![
             label_span(" CACHE      "),
             llm_metric_cell(&cache_tokens, metric_width, cache_color, false),
-            llm_metric_cell(&cache_ratio, metric_width, MUTED, false),
+            llm_metric_cell("—", metric_width, MUTED, false),
         ]));
     }
 
@@ -537,7 +553,7 @@ pub(super) fn draw_llm_metrics_unavailable(
             label_span("UPTIME "),
             value_span(&llm_uptime_text(state), MUTED),
             llm_sep(),
-            label_span("POLL "),
+            label_span("SAMPLE "),
             value_span(&llm_last_sample_text(state, llm), MUTED),
         ]),
         Line::from(vec![
@@ -657,18 +673,17 @@ pub(super) fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     // A server-reported phase (Strata) is authoritative for the request phase:
     // PREFILL while reading the prompt, and GENERATING even when the windowed
     // rate momentarily reads zero. An absent/unknown phase falls through to the
-    // existing activity heuristics, so llama.cpp is unchanged. Connection
-    // state is handled here (a lost connection is its own phase), while the
-    // per-server overview additionally suppresses a phase entirely when there
-    // is no reliable evidence.
+    // existing activity heuristics, so llama.cpp is unchanged. The phase is
+    // derived exactly like the per-server overview (`activity_phase`), so the
+    // selector and this panel can never disagree: RECONNECTING while a held
+    // sample is shown, UNKNOWN for a connected server without activity
+    // evidence, and OFFLINE when the server is not answering at all.
     use crate::domain::ActivityPhase;
-    let phase = if llm.reconnecting {
-        ActivityPhase::Reconnecting
-    } else {
-        crate::llama::classify_phase(llm)
+    let Some(phase) = crate::llama::activity_phase(llm) else {
+        return ("OFFLINE", RED);
     };
     let color = match phase {
-        ActivityPhase::Idle => MUTED,
+        ActivityPhase::Idle | ActivityPhase::Unknown => MUTED,
         ActivityPhase::Prefill => CYAN,
         ActivityPhase::Generating => ORK_GREEN,
         ActivityPhase::Processing | ActivityPhase::Queued | ActivityPhase::Reconnecting => YELLOW,
@@ -784,6 +799,22 @@ pub(super) fn llm_slot_overview_line(
         spans.push(value_span(&format!("  +{hidden}"), MUTED));
     }
     Some(Line::from(spans))
+}
+
+/// The lifetime `prompt_tokens_cached_total` counter, or `None` when it is
+/// absent or not a valid count (non-finite / negative).
+///
+/// Deliberately no ratio is derived from it. A `cached / prompt_total` share
+/// would require the cached tokens to be a subset of `prompt_tokens_total`,
+/// which no supported backend documents: the recorded llama.cpp fixtures
+/// report `cached > total` (cache hits are counted separately from evaluated
+/// prompt tokens), so the former clamped `% of PP` turned into an invented
+/// `100%`. A `cached / (cached + total)` hit rate would assume the opposite,
+/// equally unverified, contract. The ratio cell therefore stays `—` for every
+/// input (`cached > total`, `cached == 0`, `total == 0`, missing or invalid
+/// counters) while the absolute counter remains visible.
+pub(super) fn valid_cache_counter(cached: Option<f64>) -> Option<f64> {
+    cached.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 pub(super) fn context_color(percent: f64) -> Color {
