@@ -763,7 +763,8 @@ ORSKTOP_RELEASE_BENCH|idle_no_mock#0|shutdown_ms=220.154
 ### Interpretation (was die Release-Messung zeigt)
 
 - **Der Prozesskollektor ist der dominierende Kostenblock der Anwendung.** Der
-  Fast-Worker trägt > 95 % der Anwendungs-CPU; main- und LLM-Thread liegen
+  Fast-Worker trägt den Großteil der Anwendungs-CPU (über alle Läufe 90–97 %,
+  Median ~95 %); main- und LLM-Thread liegen
   zusammen meist unter 1 %. Das deckt sich mit dem getrennt gemessenen
   Kollektorzyklus (260 ms bei 1425 Prozessen, davon ~90 % DRM-fd-Scan). Die
   **Refresh-Intervalle** wirken vor allem indirekt: Sie bestimmen den Takt, in
