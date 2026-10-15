@@ -3860,15 +3860,19 @@ mod tests {
         assert!(screen.contains("1 beyond the 16-server limit"), "{screen}");
         assert!(screen.contains("10.0.0.15:9090"), "{screen}");
         assert!(screen.contains("not monitored"), "{screen}");
-        for secret in [
+        for (index, secret) in [
             "secret",
             "primarypw",
             "primarykey",
             "tok1",
             "admin",
             "user:",
-        ] {
-            assert!(!screen.contains(secret), "{secret} leaked:\n{screen}");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Name the probe by index only so no secret value reaches the output.
+            assert!(!screen.contains(secret), "synthetic secret #{index} leaked");
         }
     }
 
@@ -3883,8 +3887,9 @@ mod tests {
         press(&mut state, &[KeyCode::Char('e')]);
         let screen = render_settings(&state, 80, 24).join("\n");
         assert!(screen.contains("llm.invalid:8443"), "{screen}");
-        for secret in ["bob", "hunter2", "sk-123"] {
-            assert!(!screen.contains(secret), "{secret} leaked:\n{screen}");
+        for (index, secret) in ["bob", "hunter2", "sk-123"].into_iter().enumerate() {
+            // Name the probe by index only so no secret value reaches the output.
+            assert!(!screen.contains(secret), "synthetic secret #{index} leaked");
         }
         // A rejected entry reports a redacted reason.
         press(&mut state, &[KeyCode::Esc, KeyCode::Char('a')]);
@@ -3896,8 +3901,9 @@ mod tests {
         press(&mut state, &[KeyCode::Enter]);
         let screen = render_settings(&state, 80, 24).join("\n");
         assert!(screen.contains("already configured"), "{screen}");
-        for secret in ["eve", "hunter2", "sk-123"] {
-            assert!(!screen.contains(secret), "{secret} leaked:\n{screen}");
+        for (index, secret) in ["eve", "hunter2", "sk-123"].into_iter().enumerate() {
+            // Name the probe by index only so no secret value reaches the output.
+            assert!(!screen.contains(secret), "synthetic secret #{index} leaked");
         }
     }
 
