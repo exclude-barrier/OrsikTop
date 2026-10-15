@@ -4792,4 +4792,19 @@ mod tests {
             "RSS grew by {rss_growth} KiB over {MANY} SetServers rounds (uncontrolled growth?)"
         );
     }
+
+    /// F1 (docs/RUNTIME_RISKS.md): the shutdown path joins each worker through a
+    /// helper that only waits for the thread to end and drops the panic payload
+    /// (`join_bounded`, `src/app.rs:544-563`; the test helper `join_within`
+    /// mirrors that pattern). A worker that panicked therefore ends exactly like
+    /// a healthy one, and nothing ever reports it. This test pins the current
+    /// behaviour — it does not fix it (CFA-95 is analysis only).
+    #[test]
+    fn runtime_risk_worker_panic_is_not_distinguishable_from_a_clean_exit() {
+        let worker = thread::spawn(|| panic!("simulated LLM worker panic"));
+        assert!(
+            join_within(worker, Duration::from_secs(2)),
+            "the bounded join reports a panicked worker as finished, with no error surfaced"
+        );
+    }
 }
