@@ -326,15 +326,11 @@ pub fn run(
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press && ui_state.is_settings_open() =>
                 {
-                    match key.code {
-                        KeyCode::Esc => ui_state.close_settings(),
-                        KeyCode::Tab | KeyCode::Down => ui_state.settings_next_field(),
-                        KeyCode::BackTab | KeyCode::Up => ui_state.settings_previous_field(),
-                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
-                            ui_state.settings_toggle_selected();
-                        }
-                        KeyCode::Backspace => ui_state.settings_backspace(),
-                        KeyCode::Enter => match ui_state.settings_config() {
+                    // Field navigation, editing and the server-list editor
+                    // live in `UiState`; only an actual save request touches
+                    // the runtime here.
+                    if ui_state.settings_handle_key(key.code) {
+                        match ui_state.settings_config() {
                             Ok(next_settings) => match config::save(&next_settings) {
                                 Ok(()) => {
                                     settings = next_settings;
@@ -376,9 +372,7 @@ pub fn run(
                                     .set_settings_error(format!("Could not save settings: {err}")),
                             },
                             Err(err) => ui_state.set_settings_error(err),
-                        },
-                        KeyCode::Char(ch) => ui_state.settings_insert_char(ch),
-                        _ => {}
+                        }
                     }
                 }
                 Event::Key(key)

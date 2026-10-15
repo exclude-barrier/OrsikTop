@@ -346,7 +346,7 @@ For a remote or fixed endpoint, disable Auto discovery in Settings and enter the
 OrsikTop monitors every locally discovered llama.cpp server **and** every configured endpoint at the same time, polling them all in the background. The details and LLM panels show the currently selected server; use the server selector to switch.
 
 - Press `s` to open the server selector: it lists every known server with its connection state, slot counts, context and throughput. `↑`/`↓` highlight a row, `Enter` selects it and `Esc` closes the selector. The header shows the selected server as `[n/N]` when more than one server is monitored.
-- Add extra endpoints to the config, comma-separated, next to the existing `server=`:
+- Add, edit or remove extra endpoints in **Settings → SERVER LIST** (see [Settings](#settings)), or edit the config directly, comma-separated, next to the existing `server=`:
 
 ```text
 server=http://127.0.0.1:8080
@@ -398,6 +398,11 @@ Refresh          100 ms
 Process refresh  1000 ms
 Offline grace    2500 ms
 Auto discovery   ON
+
+SERVER LIST  2 additional · monitored 3/16
+  http://127.0.0.1:8081        primary
+> http://192.168.1.20:8080     monitored
+  https://llm.example:8443/…?… monitored
 ```
 
 Settings can be changed without restarting OrsikTop.
@@ -407,6 +412,19 @@ Settings can be changed without restarting OrsikTop.
 - `Space`, `←`, `→` — toggle Auto discovery
 - `Enter` — validate, save and apply
 - `Esc` — discard changes and close
+
+**SERVER LIST** manages the additional endpoints (`servers=`) next to the primary one. Focus it with `Tab` (or `↑` from the first field); then:
+
+- `↑` / `↓` — highlight an entry (at either end of the list they move on to the neighbouring field)
+- `a` (or `Insert`) — add an endpoint; type the full URL, e.g. `http://192.168.1.20:8080`
+- `e` — edit the highlighted endpoint
+- `d` (or `Delete`) — remove the highlighted endpoint
+- while typing an entry: `Enter` keeps it, `Esc` discards only that entry
+- `Enter` (outside an entry) — save and apply the whole dialog, as for the other fields; `Esc` discards every change, including list edits
+
+An entry must be an absolute URL with a host. A duplicate — the same target as the primary endpoint or another entry, written differently (trailing slash, case, default port, other credentials) — is rejected with a message. The saved list is adopted live: newly added servers start being polled and removed ones stop, without a restart. Up to **16** configured endpoints are monitored; entries beyond that are kept in the config and marked *not monitored*.
+
+Credentials, paths and query values are never shown: list rows and messages show only scheme, host and port (`…` marks a hidden path or query), and while you type an entry its userinfo and query values are masked with `•`. The stored value keeps them unchanged.
 
 Configuration is stored in:
 
@@ -420,7 +438,7 @@ or, when `XDG_CONFIG_HOME` is not set:
 ~/.config/orsiktop/config
 ```
 
-Saved settings include the LLM endpoint, GPU selection, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
+Saved settings include the LLM endpoint, the additional server list, GPU selection, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
 
 **LLM Host/IP** and **LLM Port** edit the endpoint in place. The scheme (including `https`), path, credentials and query of an existing endpoint are preserved, and saving without changing host or port keeps the stored endpoint exactly as it was — changing only the refresh interval or the GPU can never rewrite `https://…` to `http://…` or drop a path.
 
@@ -569,6 +587,7 @@ src/
 ├── cpu_sensors.rs  CPU frequency, temperature and RAPL power
 ├── diagnostics.rs  `orsiktop diag` bug-report summary
 ├── redact.rs       no-secrets URL rendering shared by diagnostics and telemetry errors
+├── server_editor.rs  pure helpers for the Settings server list (identity, validation, masking)
 ├── system.rs       filesystem abstraction (real + fixture)
 └── ui.rs           ratatui rendering, event handling and histories
     └── ui/          extracted per-panel submodules (behaviour-preserving split)
