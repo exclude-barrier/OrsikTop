@@ -1485,6 +1485,8 @@ fn sleep_until_next_cycle(
 mod tests {
     use super::*;
 
+    mod soak;
+
     fn test_spec(key: &str, endpoint: &str) -> ServerSpec {
         ServerSpec {
             key: key.to_string(),
