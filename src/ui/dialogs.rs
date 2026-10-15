@@ -591,6 +591,27 @@ pub(super) fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Base URL of an endpoint, tolerating the legacy scheme-less form.
+///
+/// A value that parses with a host (`https://…`) is returned unchanged so
+/// scheme, path, query and userinfo are preserved on save. A scheme-less
+/// legacy endpoint (`host:port`, optionally `user:pass@host:port`) is parsed
+/// as `http://…` so the dialog can still rewrite host and port while keeping
+/// userinfo and path, instead of failing on a cannot-be-a-base URL. Returns
+/// `None` when no host can be recovered, so the caller can fall back to the
+/// historical `http://host:port` builder.
+pub(super) fn parse_endpoint_base(server: &str) -> Option<reqwest::Url> {
+    let trimmed = server.trim();
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        if url.has_host() {
+            return Some(url);
+        }
+    }
+    reqwest::Url::parse(&format!("http://{trimmed}"))
+        .ok()
+        .filter(reqwest::Url::has_host)
+}
+
 pub(super) fn endpoint_parts(server: &str) -> (String, u16) {
     // Prefer the URL parser: it is scheme-aware (https without an explicit
     // port shows 443, not a made-up 8080) and keeps IPv6 hosts readable.
@@ -608,6 +629,15 @@ pub(super) fn endpoint_parts(server: &str) -> (String, u16) {
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');
+
+    // Legacy scheme-less `host:port` (optionally `user:pass@host:port`): parse
+    // it as http so userinfo is not swallowed into the host field and the port
+    // stays the explicit legacy default of 8080 (never the http default 80).
+    if let Ok(url) = reqwest::Url::parse(&format!("http://{compact}")) {
+        if let Some(host) = url.host_str() {
+            return (host.to_string(), url.port().unwrap_or(8080));
+        }
+    }
 
     if let Some(rest) = compact.strip_prefix('[') {
         if let Some((host, after)) = rest.split_once(']') {
