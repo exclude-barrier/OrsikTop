@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -89,6 +90,9 @@ const PROCESS_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// notice is shown. The width is the narrowest that still fits the compact
 /// LLM/context summary line (labels plus a model/context value); the height
 /// leaves room for the status line plus that summary.
+/// Upper bound for a typed additional-server endpoint (long enough for
+/// token-bearing URLs, short enough to keep the draft line bounded).
+const MAX_SERVER_DRAFT_CHARS: usize = 1024;
 const COMPACT_MIN_WIDTH: u16 = 54;
 const COMPACT_MIN_HEIGHT: u16 = 16;
 /// Floor of the full dashboard layout. Between the compact floor and this the
@@ -140,6 +144,8 @@ enum SettingsField {
     ProcessRefresh,
     OfflineGrace,
     AutoDiscovery,
+    /// The additional-server list (add/edit/delete of `servers`).
+    ServerList,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -222,6 +228,17 @@ pub struct UiState {
     /// Additional configured endpoints, preserved verbatim across a settings
     /// save (the dialog edits host/port of the primary endpoint).
     settings_servers: Vec<String>,
+    /// Highlighted entry of the additional-server list.
+    settings_server_index: usize,
+    /// Text of the not-yet-committed server entry. `Some` means the list is in
+    /// edit/insert mode and key presses type into the draft.
+    settings_server_draft: Option<String>,
+    /// Index of the additional-server entry being edited, or `None` when the
+    /// active draft inserts a new entry.
+    settings_server_edit_index: Option<usize>,
+    /// Validation/duplicate error for the additional-server list, kept apart
+    /// from the save error so a list hint never hides a save failure.
+    settings_server_error: Option<String>,
     settings_error: Option<String>,
     /// Multi-server selector: open state and highlighted row.
     server_selector_open: bool,
@@ -268,6 +285,10 @@ impl Default for UiState {
             settings_offline_grace_ms: "2500".to_string(),
             settings_auto_discovery: true,
             settings_servers: Vec::new(),
+            settings_server_index: 0,
+            settings_server_draft: None,
+            settings_server_edit_index: None,
+            settings_server_error: None,
             settings_error: None,
             server_selector_open: false,
             server_selector_index: 0,
@@ -733,11 +754,18 @@ impl UiState {
         self.settings_offline_grace_ms = settings.offline_grace_ms.to_string();
         self.settings_auto_discovery = settings.auto_discovery;
         self.settings_servers = settings.servers.clone();
+        self.settings_server_index = 0;
+        self.settings_server_draft = None;
+        self.settings_server_edit_index = None;
+        self.settings_server_error = None;
         self.settings_error = None;
     }
 
     pub fn close_settings(&mut self) {
         self.settings_open = false;
+        self.settings_server_draft = None;
+        self.settings_server_edit_index = None;
+        self.settings_server_error = None;
         self.settings_error = None;
     }
 
@@ -753,21 +781,25 @@ impl UiState {
             SettingsField::Refresh => SettingsField::ProcessRefresh,
             SettingsField::ProcessRefresh => SettingsField::OfflineGrace,
             SettingsField::OfflineGrace => SettingsField::AutoDiscovery,
-            SettingsField::AutoDiscovery => SettingsField::Host,
+            SettingsField::AutoDiscovery => SettingsField::ServerList,
+            SettingsField::ServerList => SettingsField::Host,
         };
+        self.settings_server_error = None;
         self.settings_error = None;
     }
 
     pub fn settings_previous_field(&mut self) {
         self.settings_field = match self.settings_field {
-            SettingsField::Host => SettingsField::AutoDiscovery,
+            SettingsField::Host => SettingsField::ServerList,
             SettingsField::Port => SettingsField::Host,
             SettingsField::Gpu => SettingsField::Port,
             SettingsField::Refresh => SettingsField::Gpu,
             SettingsField::ProcessRefresh => SettingsField::Refresh,
             SettingsField::OfflineGrace => SettingsField::ProcessRefresh,
-            SettingsField::AutoDiscovery => SettingsField::OfflineGrace,
+            SettingsField::AutoDiscovery => SettingsField::ServerList,
+            SettingsField::ServerList => SettingsField::AutoDiscovery,
         };
+        self.settings_server_error = None;
         self.settings_error = None;
     }
 
@@ -792,6 +824,7 @@ impl UiState {
                 self.settings_offline_grace_ms.pop();
             }
             SettingsField::AutoDiscovery => {}
+            SettingsField::ServerList => {}
         }
         self.settings_error = None;
     }
@@ -832,11 +865,219 @@ impl UiState {
         self.settings_error = None;
     }
 
+    /// Apply one key press to the open settings dialog.
+    ///
+    /// Returns `true` when the key requests "validate, save and apply"
+    /// (`Enter` outside a server draft); the caller then persists
+    /// [`Self::settings_config`] and adopts it at runtime. While a server
+    /// entry is being typed the dialog behaves as a plain text field: `Enter`
+    /// commits the entry, `Esc` abandons it, every other key edits the draft.
+    pub fn settings_handle_key(&mut self, code: KeyCode) -> bool {
+        if self.settings_server_is_editing() {
+            match code {
+                KeyCode::Esc => self.settings_server_draft_cancel(),
+                KeyCode::Backspace => self.settings_server_draft_backspace(),
+                KeyCode::Enter => self.settings_server_draft_commit(),
+                KeyCode::Char(ch) => self.settings_server_draft_insert_char(ch),
+                _ => {}
+            }
+            return false;
+        }
+        let on_list = self.settings_server_list_focused();
+        match code {
+            KeyCode::Esc => self.close_settings(),
+            KeyCode::Tab => self.settings_next_field(),
+            KeyCode::BackTab => self.settings_previous_field(),
+            // On the server list, Up/Down move the highlight and leave the
+            // list at either end; elsewhere they move between fields.
+            KeyCode::Down if on_list => self.settings_server_step(true),
+            KeyCode::Up if on_list => self.settings_server_step(false),
+            KeyCode::Down => self.settings_next_field(),
+            KeyCode::Up => self.settings_previous_field(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                self.settings_toggle_selected();
+            }
+            KeyCode::Backspace => self.settings_backspace(),
+            // Enter always saves — also on the server list — so the save key
+            // never changes meaning with focus.
+            KeyCode::Enter => {
+                self.settings_server_error = None;
+                return true;
+            }
+            KeyCode::Char('a') | KeyCode::Insert if on_list => self.settings_server_begin_add(),
+            KeyCode::Char('e') if on_list => self.settings_server_begin_edit(),
+            KeyCode::Char('d') | KeyCode::Delete if on_list => self.settings_server_delete(),
+            KeyCode::Char(ch) => self.settings_insert_char(ch),
+            _ => {}
+        }
+        false
+    }
+
     pub fn settings_toggle_selected(&mut self) {
         if self.settings_field == SettingsField::AutoDiscovery {
             self.settings_auto_discovery = !self.settings_auto_discovery;
             self.settings_error = None;
         }
+    }
+
+    /// True while the additional-server list is focused (its own key map).
+    pub fn settings_server_list_focused(&self) -> bool {
+        self.settings_field == SettingsField::ServerList
+    }
+
+    /// True while a new/edited server entry is being typed.
+    pub fn settings_server_is_editing(&self) -> bool {
+        self.settings_server_draft.is_some()
+    }
+
+    /// Additional configured endpoints (`servers`) currently being edited.
+    pub fn settings_server_entries(&self) -> &[String] {
+        &self.settings_servers
+    }
+
+    /// Current text of the server-entry draft, if any.
+    pub fn settings_server_draft(&self) -> Option<&str> {
+        self.settings_server_draft.as_deref()
+    }
+
+    /// Error of the additional-server list (validation or duplicate), if any.
+    pub fn settings_server_error(&self) -> Option<&str> {
+        self.settings_server_error.as_deref()
+    }
+
+    /// Move the highlight one entry up (`down == false`) or down within the
+    /// additional-server list. At either end of the list (or on an empty
+    /// list) focus leaves the list for the neighbouring field instead, so
+    /// `↑`/`↓` never trap the user inside the list.
+    pub fn settings_server_step(&mut self, down: bool) {
+        let len = self.settings_servers.len();
+        let index = self.settings_server_index.min(len.saturating_sub(1));
+        if down && index + 1 < len {
+            self.settings_server_index = index + 1;
+            self.settings_server_error = None;
+        } else if !down && len > 0 && index > 0 {
+            self.settings_server_index = index - 1;
+            self.settings_server_error = None;
+        } else if down {
+            self.settings_next_field();
+        } else {
+            self.settings_previous_field();
+        }
+    }
+
+    /// Begin inserting a new additional endpoint.
+    pub fn settings_server_begin_add(&mut self) {
+        self.settings_server_draft = Some(String::new());
+        self.settings_server_edit_index = None;
+        self.settings_server_error = None;
+    }
+
+    /// Begin editing the highlighted additional endpoint.
+    pub fn settings_server_begin_edit(&mut self) {
+        if let Some(entry) = self.settings_servers.get(self.settings_server_index) {
+            self.settings_server_draft = Some(entry.clone());
+            self.settings_server_edit_index = Some(self.settings_server_index);
+            self.settings_server_error = None;
+        }
+    }
+
+    /// Remove the highlighted additional endpoint.
+    pub fn settings_server_delete(&mut self) {
+        if self.settings_server_index < self.settings_servers.len() {
+            self.settings_servers.remove(self.settings_server_index);
+            if self.settings_server_index >= self.settings_servers.len() {
+                self.settings_server_index = self.settings_servers.len().saturating_sub(1);
+            }
+            self.settings_server_error = None;
+        }
+    }
+
+    pub fn settings_server_draft_insert_char(&mut self, ch: char) {
+        if let Some(draft) = self.settings_server_draft.as_mut() {
+            if !ch.is_control()
+                && !ch.is_whitespace()
+                && draft.chars().count() < MAX_SERVER_DRAFT_CHARS
+            {
+                draft.push(ch);
+            }
+        }
+        self.settings_server_error = None;
+    }
+
+    pub fn settings_server_draft_backspace(&mut self) {
+        if let Some(draft) = self.settings_server_draft.as_mut() {
+            draft.pop();
+        }
+        self.settings_server_error = None;
+    }
+
+    /// Abandon the current draft without changing the list.
+    pub fn settings_server_draft_cancel(&mut self) {
+        self.settings_server_draft = None;
+        self.settings_server_edit_index = None;
+        self.settings_server_error = None;
+    }
+
+    /// Commit the current draft: validate and de-duplicate against the primary
+    /// endpoint and every other additional entry, then insert or replace it.
+    /// A rejected entry keeps the draft open and shows a redacted reason.
+    pub fn settings_server_draft_commit(&mut self) {
+        let Some(draft) = self.settings_server_draft.clone() else {
+            return;
+        };
+        let endpoint = match crate::server_editor::normalize_endpoint(&draft) {
+            Ok(endpoint) => endpoint,
+            Err(message) => {
+                self.settings_server_error = Some(message);
+                return;
+            }
+        };
+        // The primary endpoint is the first source of truth; reject a candidate
+        // that resolves to the same target as the primary before looking at the
+        // additional entries.
+        if let Ok(primary) = self.settings_endpoint() {
+            if crate::server_editor::endpoint_key(&primary)
+                == crate::server_editor::endpoint_key(&endpoint)
+            {
+                let label = crate::server_editor::display_label(&primary);
+                self.settings_server_error =
+                    Some(format!("Duplicates the primary endpoint: {label}"));
+                return;
+            }
+        }
+        // Identity of every additional endpoint except the one being replaced.
+        let others: Vec<String> = self
+            .settings_servers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != self.settings_server_edit_index)
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        if let Some(duplicate) = crate::server_editor::find_duplicate(&others, &endpoint) {
+            let label = crate::server_editor::display_label(duplicate);
+            self.settings_server_error = Some(format!("Endpoint already configured: {label}"));
+            return;
+        }
+        match self.settings_server_edit_index {
+            Some(index) if index < self.settings_servers.len() => {
+                self.settings_servers[index] = endpoint;
+                self.settings_server_index = index;
+            }
+            _ => {
+                self.settings_servers.push(endpoint);
+                self.settings_server_index = self.settings_servers.len() - 1;
+            }
+        }
+        self.settings_server_draft = None;
+        self.settings_server_edit_index = None;
+        self.settings_server_error = None;
+    }
+
+    /// Monitoring status of the configured endpoints, given the primary
+    /// endpoint the dialog would save (see [`crate::server_editor::monitored_flags`]).
+    pub fn settings_server_monitoring(&self) -> crate::server_editor::Monitoring {
+        let primary = self.settings_endpoint().ok();
+        crate::server_editor::monitored_flags(primary.as_deref(), &self.settings_servers)
     }
 
     pub fn settings_config(&self) -> Result<AppConfig, String> {
@@ -3324,6 +3565,393 @@ mod tests {
                 "endpoint {server} changed"
             );
         }
+    }
+
+    fn type_into_draft(state: &mut UiState, text: &str) {
+        for ch in text.chars() {
+            state.settings_server_draft_insert_char(ch);
+        }
+    }
+
+    fn add_server(state: &mut UiState, endpoint: &str) {
+        state.settings_server_begin_add();
+        type_into_draft(state, endpoint);
+        state.settings_server_draft_commit();
+    }
+
+    fn clear_draft(state: &mut UiState) {
+        while matches!(state.settings_server_draft(), Some(d) if !d.is_empty()) {
+            state.settings_server_draft_backspace();
+        }
+    }
+
+    #[test]
+    fn server_list_add_persists_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("orsiktop-ui-servers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        state.settings_field = SettingsField::ServerList;
+        add_server(&mut state, "http://10.0.0.5:9090");
+        add_server(&mut state, "https://other.invalid:8443/v1");
+
+        let saved = state.settings_config().unwrap();
+        assert_eq!(saved.server.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(
+            saved.servers,
+            vec![
+                "http://10.0.0.5:9090".to_string(),
+                "https://other.invalid:8443/v1".to_string()
+            ]
+        );
+
+        // Real persistence round-trip through the atomic config writer.
+        crate::config::save_to_path(&path, &saved).unwrap();
+        let loaded = crate::config::load_from_path(&path).unwrap();
+        assert_eq!(loaded.server.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(loaded.servers, saved.servers);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_list_rejects_duplicates_against_primary_and_extras() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        state.settings_field = SettingsField::ServerList;
+        add_server(&mut state, "http://10.0.0.5:9090");
+        assert_eq!(state.settings_server_entries().len(), 1);
+
+        // A different surface form of the primary endpoint is a duplicate.
+        add_server(&mut state, "http://127.0.0.1:8080/");
+        assert!(state.settings_server_error().is_some());
+        assert_eq!(state.settings_server_entries().len(), 1);
+
+        // A different surface form of an existing extra is a duplicate.
+        add_server(&mut state, "http://10.0.0.5:9090/");
+        assert!(state.settings_server_error().is_some());
+        assert_eq!(state.settings_server_entries().len(), 1);
+    }
+
+    #[test]
+    fn server_list_duplicate_error_redacts_credentials() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        add_server(&mut state, "http://user:secretpw@10.0.0.5:9090");
+        // Same endpoint through different credentials: a duplicate whose error
+        // must not echo either secret.
+        add_server(&mut state, "http://other:topsecret@10.0.0.5:9090");
+        let error = state.settings_server_error().expect("duplicate error");
+        assert!(!error.contains("secret"), "secret leaked: {error}");
+        assert!(!error.contains("topsecret"), "secret leaked: {error}");
+        assert!(!error.contains("secretpw"), "secret leaked: {error}");
+    }
+
+    #[test]
+    fn server_list_edit_and_delete_update_the_set() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        add_server(&mut state, "http://a:1");
+        add_server(&mut state, "http://b:2");
+
+        // Edit the second entry in place.
+        state.settings_server_index = 1;
+        state.settings_server_begin_edit();
+        assert_eq!(state.settings_server_draft(), Some("http://b:2"));
+        clear_draft(&mut state);
+        type_into_draft(&mut state, "http://c:3");
+        state.settings_server_draft_commit();
+        assert_eq!(
+            state.settings_server_entries(),
+            ["http://a:1".to_string(), "http://c:3".to_string()]
+        );
+
+        // Delete the first entry.
+        state.settings_server_index = 0;
+        state.settings_server_delete();
+        assert_eq!(state.settings_server_entries(), ["http://c:3".to_string()]);
+
+        // Deleting the last entry clears the list and clamps the highlight.
+        state.settings_server_delete();
+        assert!(state.settings_server_entries().is_empty());
+        assert_eq!(state.settings_server_index, 0);
+    }
+
+    #[test]
+    fn server_list_rejects_an_invalid_endpoint_without_changing_the_list() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        add_server(&mut state, "not a url");
+        assert!(state.settings_server_error().is_some());
+        assert!(state.settings_server_entries().is_empty());
+    }
+
+    #[test]
+    fn server_list_marks_entries_beyond_the_cap_as_not_monitored() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        // Primary plus 16 additional = 17 configured; exactly one is beyond the
+        // 16-server monitoring cap.
+        for index in 0..16u16 {
+            add_server(&mut state, &format!("http://extra{index}:1"));
+        }
+        assert_eq!(state.settings_server_entries().len(), 16);
+        let status = state.settings_server_monitoring();
+        assert_eq!((status.monitored, status.overflow), (16, 1));
+        assert_eq!(status.flags.iter().filter(|flag| **flag).count(), 15);
+        assert!(
+            !status.flags[15],
+            "the 17th configured endpoint is not monitored"
+        );
+        // Saving keeps the unmonitored entry: nothing is silently dropped.
+        assert_eq!(state.settings_config().unwrap().servers.len(), 16);
+    }
+
+    fn press(state: &mut UiState, keys: &[KeyCode]) -> bool {
+        let mut saved = false;
+        for key in keys {
+            saved |= state.settings_handle_key(*key);
+        }
+        saved
+    }
+
+    fn type_keys(state: &mut UiState, text: &str) {
+        for ch in text.chars() {
+            assert!(!state.settings_handle_key(KeyCode::Char(ch)));
+        }
+    }
+
+    /// Focus the server list from a freshly opened dialog (Host field).
+    fn focus_server_list(state: &mut UiState) {
+        assert!(!state.settings_handle_key(KeyCode::BackTab));
+        assert!(state.settings_server_list_focused());
+    }
+
+    #[test]
+    fn settings_keys_add_edit_delete_servers_and_save() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        focus_server_list(&mut state);
+
+        // Add two entries by keyboard.
+        press(&mut state, &[KeyCode::Char('a')]);
+        type_keys(&mut state, "http://10.0.0.5:9090");
+        assert!(
+            !state.settings_handle_key(KeyCode::Enter),
+            "Enter commits the draft, not the dialog"
+        );
+        press(&mut state, &[KeyCode::Insert]);
+        type_keys(&mut state, "http://10.0.0.6:9090");
+        press(&mut state, &[KeyCode::Enter]);
+        assert_eq!(state.settings_server_entries().len(), 2);
+
+        // Edit the first one: ↑ to it, `e`, replace the port.
+        press(&mut state, &[KeyCode::Up, KeyCode::Char('e')]);
+        assert_eq!(state.settings_server_draft(), Some("http://10.0.0.5:9090"));
+        press(&mut state, &[KeyCode::Backspace; 4]);
+        type_keys(&mut state, "9191");
+        press(&mut state, &[KeyCode::Enter]);
+        assert_eq!(
+            state.settings_server_entries(),
+            [
+                "http://10.0.0.5:9191".to_string(),
+                "http://10.0.0.6:9090".to_string()
+            ]
+        );
+
+        // Esc in a draft only discards the draft; the dialog stays open.
+        press(&mut state, &[KeyCode::Char('a')]);
+        type_keys(&mut state, "http://discard.me");
+        press(&mut state, &[KeyCode::Esc]);
+        assert!(state.is_settings_open());
+        assert_eq!(state.settings_server_entries().len(), 2);
+
+        // Delete the highlighted (first) entry, then Enter requests a save.
+        press(&mut state, &[KeyCode::Char('d')]);
+        assert_eq!(
+            state.settings_server_entries(),
+            ["http://10.0.0.6:9090".to_string()]
+        );
+        assert!(
+            state.settings_handle_key(KeyCode::Enter),
+            "Enter on the list saves"
+        );
+        assert_eq!(
+            state.settings_config().unwrap().servers,
+            vec!["http://10.0.0.6:9090".to_string()]
+        );
+    }
+
+    #[test]
+    fn settings_keys_on_other_fields_are_unchanged_by_the_server_list() {
+        let settings = settings_for("http://127.0.0.1:8080");
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        // `a`, `e`, `d` still type into a text field outside the list.
+        press(&mut state, &[KeyCode::Tab, KeyCode::Tab]); // GPU
+        press(&mut state, &[KeyCode::Backspace]);
+        type_keys(&mut state, "ade");
+        assert_eq!(state.settings_gpu, "ade");
+        assert!(state.settings_server_entries().is_empty());
+        assert!(!state.settings_server_is_editing());
+        // ↓ from Auto discovery enters the list; ↓ on an empty list leaves it
+        // for the first field again, ↑ from Host enters the list from the top.
+        state.settings_field = SettingsField::AutoDiscovery;
+        press(&mut state, &[KeyCode::Char(' ')]);
+        assert!(state.settings_auto_discovery);
+        press(&mut state, &[KeyCode::Down]);
+        assert!(state.settings_server_list_focused());
+        press(&mut state, &[KeyCode::Down]);
+        assert_eq!(state.settings_field, SettingsField::Host);
+        press(&mut state, &[KeyCode::Up]);
+        assert!(state.settings_server_list_focused());
+        press(&mut state, &[KeyCode::Up]);
+        assert_eq!(state.settings_field, SettingsField::AutoDiscovery);
+        // Esc outside a draft still closes the dialog.
+        press(&mut state, &[KeyCode::Esc]);
+        assert!(!state.is_settings_open());
+    }
+
+    fn render_settings(state: &UiState, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_settings_popup(frame, frame.area(), state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn settings_popup_lists_servers_redacted_with_monitoring_state() {
+        let mut settings = settings_for("http://admin:primarypw@127.0.0.1:8080/?key=primarykey");
+        settings.servers = (0..16)
+            .map(|i| format!("http://user:pw{i}secret@10.0.0.{i}:9090/v1?token=tok{i}"))
+            .collect();
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        focus_server_list(&mut state);
+        // Highlight the last entry: the window must follow it.
+        for _ in 0..15 {
+            press(&mut state, &[KeyCode::Down]);
+        }
+        let screen = render_settings(&state, 100, 40).join("\n");
+        assert!(screen.contains("SERVER LIST"), "{screen}");
+        assert!(
+            screen.contains("16 additional · monitored 16/16"),
+            "{screen}"
+        );
+        assert!(screen.contains("1 beyond the 16-server limit"), "{screen}");
+        assert!(screen.contains("10.0.0.15:9090"), "{screen}");
+        assert!(screen.contains("not monitored"), "{screen}");
+        for (index, secret) in [
+            "secret",
+            "primarypw",
+            "primarykey",
+            "tok1",
+            "admin",
+            "user:",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Name the probe by index only so no secret value reaches the output.
+            assert!(!screen.contains(secret), "synthetic secret #{index} leaked");
+        }
+    }
+
+    #[test]
+    fn settings_popup_masks_secrets_in_the_server_draft() {
+        let mut settings = settings_for("http://127.0.0.1:8080");
+        settings.servers =
+            vec!["https://bob:hunter2@llm.invalid:8443/v1?api_key=sk-123".to_string()];
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        focus_server_list(&mut state);
+        press(&mut state, &[KeyCode::Char('e')]);
+        let screen = render_settings(&state, 80, 24).join("\n");
+        assert!(screen.contains("llm.invalid:8443"), "{screen}");
+        for (index, secret) in ["bob", "hunter2", "sk-123"].into_iter().enumerate() {
+            // Name the probe by index only so no secret value reaches the output.
+            assert!(!screen.contains(secret), "synthetic secret #{index} leaked");
+        }
+        // A rejected entry reports a redacted reason.
+        press(&mut state, &[KeyCode::Esc, KeyCode::Char('a')]);
+        // Same target, other credentials: a duplicate (userinfo is not identity).
+        type_keys(
+            &mut state,
+            "https://eve:pw@llm.invalid:8443/v1?api_key=sk-123",
+        );
+        press(&mut state, &[KeyCode::Enter]);
+        let screen = render_settings(&state, 80, 24).join("\n");
+        assert!(screen.contains("already configured"), "{screen}");
+        for (index, secret) in ["eve", "hunter2", "sk-123"].into_iter().enumerate() {
+            // Name the probe by index only so no secret value reaches the output.
+            assert!(!screen.contains(secret), "synthetic secret #{index} leaked");
+        }
+    }
+
+    #[test]
+    fn settings_popup_fits_small_terminals_with_a_long_server_list() {
+        let mut settings = settings_for("http://127.0.0.1:8080");
+        settings.servers = (0..20).map(|i| format!("http://10.0.0.{i}:9090")).collect();
+        let mut state = UiState::default();
+        state.open_settings("http://127.0.0.1:8080", &settings);
+        focus_server_list(&mut state);
+        for _ in 0..19 {
+            press(&mut state, &[KeyCode::Down]);
+        }
+        // Smallest supported size (60x19) up to a roomy one: the fields, the
+        // highlighted entry and the list hint must always be visible, and the
+        // popup must stay inside the terminal.
+        for (width, height) in [(60, 19), (60, 22), (80, 24), (120, 50)] {
+            let rows = render_settings(&state, width, height);
+            let screen = rows.join("\n");
+            assert!(screen.contains("SETTINGS"), "{width}x{height}:\n{screen}");
+            assert!(
+                screen.contains("Auto discovery"),
+                "{width}x{height}:\n{screen}"
+            );
+            assert!(
+                screen.contains("10.0.0.19:9090"),
+                "{width}x{height}:\n{screen}"
+            );
+            assert!(screen.contains("a add"), "{width}x{height}:\n{screen}");
+            assert!(
+                screen.contains("20 additional"),
+                "{width}x{height}:\n{screen}"
+            );
+            assert!(
+                rows.iter().filter(|row| row.contains('└')).count() == 1,
+                "bottom border must be drawn once at {width}x{height}:\n{screen}"
+            );
+        }
+        // With a draft and an error both visible at the minimum size.
+        press(&mut state, &[KeyCode::Char('a')]);
+        type_keys(&mut state, "http://10.0.0.3:9090/");
+        press(&mut state, &[KeyCode::Enter]);
+        let screen = render_settings(&state, 60, 19).join("\n");
+        assert!(screen.contains("already configured"), "{screen}");
+        assert!(screen.contains("10.0.0.3:9090/_"), "{screen}");
+        // Below the minimum the compact notice is shown instead.
+        let screen = render_settings(&state, 59, 18).join("\n");
+        assert!(screen.contains("too small"), "{screen}");
     }
 
     #[test]
