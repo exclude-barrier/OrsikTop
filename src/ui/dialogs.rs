@@ -302,7 +302,14 @@ pub(super) fn draw_server_selector(
                 (None, None) => "—".to_string(),
             }
         } else if let Some(age_ms) = server.age_ms {
-            format!("{} ago", format_sample_age(Duration::from_millis(age_ms)))
+            // A reconnecting server still shows its held CTX/tok/s values;
+            // label them as stale rather than just aged.
+            let age = format_sample_age(Duration::from_millis(age_ms));
+            if server.reconnecting {
+                format!("stale {age} ago")
+            } else {
+                format!("{age} ago")
+            }
         } else {
             "—".to_string()
         };

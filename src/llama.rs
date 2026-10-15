@@ -135,10 +135,13 @@ pub struct LlmStats {
 
 /// Classify a server's activity phase from its own telemetry using the shared
 /// heuristic: a server-reported Strata phase is authoritative, otherwise the
-/// live rates and slot activity decide. This never inspects connection state —
-/// callers that need to distinguish "offline" from "idle" use
-/// [`activity_phase`]; the selected-server panel uses it directly (an offline
-/// server keeps its last-known idle presentation there).
+/// live rates and slot activity decide. `Idle` requires positive evidence of
+/// no activity — a valid `/slots` array (whose busy count is then real), an
+/// `active requests` gauge reporting `0`, or Strata's `live.state = idle`.
+/// Without any of these the phase is `Unknown`, never a guessed `Idle`. This
+/// never inspects connection state — callers that need to distinguish
+/// "offline" from the activity phase use [`activity_phase`]; the
+/// selected-server panel is only drawn with phases while connected.
 pub(crate) fn classify_phase(llm: &LlmStats) -> crate::domain::ActivityPhase {
     let strata_phase = llm.strata_phase;
     let generating = strata_phase == Some(crate::strata::StrataPhase::Generating)
@@ -153,16 +156,21 @@ pub(crate) fn classify_phase(llm: &LlmStats) -> crate::domain::ActivityPhase {
         crate::domain::ActivityPhase::Processing
     } else if llm.deferred_requests.is_some_and(|value| value > 0.0) {
         crate::domain::ActivityPhase::Queued
-    } else {
+    } else if strata_phase == Some(crate::strata::StrataPhase::Idle)
+        || llm.slots_available
+        || llm.active_requests == Some(0.0)
+    {
         crate::domain::ActivityPhase::Idle
+    } else {
+        crate::domain::ActivityPhase::Unknown
     }
 }
 
-/// The activity phase shown per server in the overview. `None` means there is
-/// no reliable evidence — a server that has never answered, or is currently
-/// offline — and must render `—` rather than a guessed `IDLE`. A server being
-/// reconnected keeps an explicit `RECONNECTING` label (held state, not live
-/// activity).
+/// The activity phase shown per server in the overview. `None` means the
+/// server has never answered or is currently offline and must render `—`
+/// rather than a guessed `IDLE`; a connected server without activity evidence
+/// is `Unknown` (see [`classify_phase`]). A server being reconnected keeps an
+/// explicit `RECONNECTING` label (held state, not live activity).
 pub(crate) fn activity_phase(llm: &LlmStats) -> Option<crate::domain::ActivityPhase> {
     if llm.reconnecting {
         return Some(crate::domain::ActivityPhase::Reconnecting);
@@ -3022,6 +3030,34 @@ mod tests {
             base: format!("http://{addr}"),
             stop,
         }
+    }
+
+    #[test]
+    fn missing_slots_and_activity_fields_leave_the_phase_unknown() {
+        // CFA-88: /slots 404 and a /metrics body without
+        // `requests_processing`: nothing proves the server is idle, so the
+        // phase is UNKNOWN. Once the gauge reports a real 0 it is IDLE.
+        use crate::domain::ActivityPhase;
+        let backend = spawn_backend(|path, n| {
+            if path.contains("/slots") {
+                return (404, "text/plain", "not found".to_string());
+            }
+            if path.contains("/metrics") {
+                let mut body = "llamacpp:prompt_tokens_total 10\n".to_string();
+                if n > 0 {
+                    body.push_str("llamacpp:requests_processing 0\n");
+                }
+                return (200, "text/plain", body);
+            }
+            (200, "application/json", r#"{"total_slots":1}"#.to_string())
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let first = monitor.sample();
+        assert!(first.connected && first.metrics_available && !first.slots_available);
+        assert_eq!(activity_phase(&first), Some(ActivityPhase::Unknown));
+        let second = monitor.sample();
+        assert_eq!(second.active_requests, Some(0.0));
+        assert_eq!(activity_phase(&second), Some(ActivityPhase::Idle));
     }
 
     #[test]

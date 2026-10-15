@@ -1672,6 +1672,40 @@ mod tests {
     }
 
     #[test]
+    fn held_llm_sample_expires_after_the_offline_grace() {
+        // The held sample is bounded: once the grace window has passed, the
+        // failed sample is reported as offline and no held value survives.
+        let now = Instant::now();
+        let grace = Duration::from_millis(2500);
+        let mut last_good = None;
+        let good = LlmStats {
+            connected: true,
+            generation_tps: Some(55.0),
+            context_used: Some(1000),
+            ..LlmStats::default()
+        };
+        stabilize_llm_sample(good, &mut last_good, now, grace);
+        let failed = || LlmStats {
+            error: "cannot reach llama.cpp: timeout".to_string(),
+            ..LlmStats::default()
+        };
+        let held = stabilize_llm_sample(failed(), &mut last_good, now + grace, grace);
+        assert!(held.connected && held.reconnecting);
+        assert_eq!(held.generation_tps, Some(55.0));
+
+        let expired = stabilize_llm_sample(
+            failed(),
+            &mut last_good,
+            now + grace + Duration::from_millis(1),
+            grace,
+        );
+        assert!(!expired.connected && !expired.reconnecting);
+        assert_eq!(expired.generation_tps, None);
+        assert_eq!(expired.context_used, None);
+        assert_eq!(crate::llama::activity_phase(&expired), None);
+    }
+
+    #[test]
     fn parses_linux_cpu_times_and_iowait_delta() {
         let previous = parse_cpu_times(
             "cpu  100 0 50 800 20 0 10 0 0 0
@@ -2773,6 +2807,57 @@ mod tests {
     }
 
     #[test]
+    fn build_server_summaries_keep_unevidenced_activity_unknown_and_match_the_panel() {
+        use crate::domain::ActivityPhase;
+
+        // Connected with /metrics only: no /slots, no request gauge and no
+        // server-reported phase. The overview must say UNKNOWN (not IDLE), and
+        // a held reconnecting sample must say RECONNECTING — in both cases the
+        // same phase the selected-server panel derives (CFA-88).
+        let order = vec!["bare".to_string(), "held".to_string(), "off".to_string()];
+        let mut endpoints = BTreeMap::new();
+        for key in &order {
+            endpoints.insert(key.clone(), format!("http://{key}:8080"));
+        }
+        let bare = LlmStats {
+            connected: true,
+            metrics_available: true,
+            ..Default::default()
+        };
+        let held = LlmStats {
+            connected: true,
+            reconnecting: true,
+            metrics_available: true,
+            slots_available: true,
+            slot_count: 1,
+            ..Default::default()
+        };
+        let off = LlmStats::default();
+        let mut registry = BTreeMap::new();
+        registry.insert("bare".to_string(), bare.clone());
+        registry.insert("held".to_string(), held.clone());
+        registry.insert("off".to_string(), off.clone());
+
+        let summaries = build_server_summaries(
+            &order,
+            &endpoints,
+            &registry,
+            &UiState::default(),
+            Instant::now(),
+        );
+        assert_eq!(summaries[0].phase, Some(ActivityPhase::Unknown));
+        assert_eq!(summaries[1].phase, Some(ActivityPhase::Reconnecting));
+        assert!(summaries[1].reconnecting && !summaries[1].connected);
+        assert_eq!(summaries[2].phase, None);
+        for (summary, stats) in summaries.iter().zip([&bare, &held, &off]) {
+            assert_eq!(summary.phase, crate::llama::activity_phase(stats));
+            let panel = crate::ui::llm_phase_label(stats);
+            let overview = summary.phase.map_or("OFFLINE", ActivityPhase::label);
+            assert_eq!(panel, overview, "panel and selector disagree");
+        }
+    }
+
+    #[test]
     fn build_server_summaries_derives_phase_age_and_backend() {
         use crate::domain::ActivityPhase;
         use crate::strata::StrataPhase;
@@ -2799,11 +2884,14 @@ mod tests {
                 ..Default::default()
             },
         );
+        // IDLE needs evidence: here a valid /slots array with no busy slot.
         registry.insert(
             "quiet".to_string(),
             LlmStats {
                 connected: true,
                 metrics_available: true,
+                slots_available: true,
+                slot_count: 1,
                 backend: ServerBackend::LlamaCpp,
                 ..Default::default()
             },

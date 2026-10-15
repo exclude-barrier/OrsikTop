@@ -25,8 +25,16 @@ pub(super) fn draw_llm(
     state: &UiState,
     gpu_map: &GpuMapping,
 ) {
+    // While the connection is being re-established the panel keeps showing the
+    // last good sample (offline grace). Mark the whole panel as not fresh so
+    // the held values cannot be mistaken for live telemetry.
+    let title = if llm.reconnecting {
+        " LLM INFERENCE · STALE (held sample) "
+    } else {
+        " LLM INFERENCE "
+    };
     let block = Block::default()
-        .title(" LLM INFERENCE ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM_GREEN));
     let inner = block.inner(area);
@@ -187,13 +195,20 @@ pub(super) fn draw_llm(
         MUTED
     };
 
-    let pp_active = llm.prompt_tps.is_some_and(|value| value > 0.05);
-    let tg_active = llm.generation_tps.is_some_and(|value| value > 0.05);
+    // Held (reconnecting) rates are not current activity: never highlight
+    // them as live.
+    let fresh = !llm.reconnecting;
+    let pp_active = fresh && llm.prompt_tps.is_some_and(|value| value > 0.05);
+    let tg_active = fresh && llm.generation_tps.is_some_and(|value| value > 0.05);
     let pp_header_color = if pp_active { CYAN } else { MUTED };
     let tg_header_color = if tg_active { ORK_GREEN } else { MUTED };
     let pp_live_color = if pp_active { CYAN } else { MUTED };
     let tg_live_color = if tg_active { ORK_GREEN } else { MUTED };
-    let request_color = if llm.busy_slots > 0 { WHITE } else { MUTED };
+    let request_color = if fresh && llm.busy_slots > 0 {
+        WHITE
+    } else {
+        MUTED
+    };
 
     let metric_width = ((inner.width as usize).saturating_sub(12) / 2).clamp(16, 30);
     let mut state_line = vec![
@@ -646,18 +661,17 @@ pub(super) fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     // A server-reported phase (Strata) is authoritative for the request phase:
     // PREFILL while reading the prompt, and GENERATING even when the windowed
     // rate momentarily reads zero. An absent/unknown phase falls through to the
-    // existing activity heuristics, so llama.cpp is unchanged. Connection
-    // state is handled here (a lost connection is its own phase), while the
-    // per-server overview additionally suppresses a phase entirely when there
-    // is no reliable evidence.
+    // existing activity heuristics, so llama.cpp is unchanged. The phase is
+    // derived exactly like the per-server overview (`activity_phase`), so the
+    // selector and this panel can never disagree: RECONNECTING while a held
+    // sample is shown, UNKNOWN for a connected server without activity
+    // evidence, and OFFLINE when the server is not answering at all.
     use crate::domain::ActivityPhase;
-    let phase = if llm.reconnecting {
-        ActivityPhase::Reconnecting
-    } else {
-        crate::llama::classify_phase(llm)
+    let Some(phase) = crate::llama::activity_phase(llm) else {
+        return ("OFFLINE", RED);
     };
     let color = match phase {
-        ActivityPhase::Idle => MUTED,
+        ActivityPhase::Idle | ActivityPhase::Unknown => MUTED,
         ActivityPhase::Prefill => CYAN,
         ActivityPhase::Generating => ORK_GREEN,
         ActivityPhase::Processing | ActivityPhase::Queued | ActivityPhase::Reconnecting => YELLOW,

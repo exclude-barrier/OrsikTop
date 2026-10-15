@@ -56,6 +56,12 @@ Rein lesende Verifikation. Ergebnis differenziert:
     die **KV-Belegung** des Slots, nicht den Prompt-Fortschritt
     (`src/llama/slots.rs:75-78`; belegt durch `slots_strata_new.json`).
     **Behoben in CFA-86** (siehe F2 unten).
+  - **F3 — STATE ohne Slot-Evidenz** ließ einen verbundenen Server, der weder
+    `/slots` noch ein Request-Gauge noch einen Server-Phase-Wert meldet, als
+    `IDLE` erscheinen. **Behoben in CFA-88** (siehe F3 unten).
+  - **F4 — Stale-Kennzeichnung** war zu schwach: die gehaltene Probe war nur
+    über `RECONNECTING` in LINK/STATE markiert, nicht die Werte selbst.
+    **Behoben in CFA-88** (siehe F4 unten).
 - **CTX-Kernverhalten korrekt.** Die CTX-Zeile zeigt ausschließlich die aktuelle
   Slot-Occupancy; der High-Water-Mark wird **nirgends** als aktuelle Belegung
   substituiert und erscheint nur explizit als `watermark` in `orsiktop diag`.
@@ -69,12 +75,13 @@ Rein lesende Verifikation. Ergebnis differenziert:
   (`src/ui.rs:4074`), `absent_metrics_render_as_unavailable_not_zero`
   (`src/ui.rs:4137`), `present_zero_prompt_tokens_is_a_real_zero_not_the_progress`
   (`src/llama.rs:2178`), `explicit_zero_slot_counter_is_a_real_zero`
-  (`src/llama.rs:2501`). Einschränkung: siehe **F3** (STATE kann ohne
-  Slot-Evidenz IDLE zeigen).
+  (`src/llama.rs:2501`). **CFA-88** hebt die frühere Einschränkung auf: ein
+  verbundener Server ohne Slot-/Gauge-Evidenz zeigt jetzt `UNKNOWN` statt
+  `IDLE` (siehe **F3**).
 - **Behauptete Korrekturen durch Tests belegt.** Der High-Water-Fix `c83230f`
   ist am HEAD wirksam und durch Regressionstests abgesichert (siehe Abschnitt
-  „High-Water-Fallback“). Für die Stale-Wert-Behandlung gilt das nur
-  eingeschränkt (siehe **F4**).
+  „High-Water-Fallback“). **CFA-88** kennzeichnet die während der Grace
+  gehaltene Probe zusätzlich als nicht frisch (siehe **F4**).
 - **Keine Änderung an Strata.** `src/strata.rs` unverändert (protected hash).
 
 ## Offene Befunde (Folgetickets, nicht in CFA-33)
@@ -134,7 +141,19 @@ Rein lesende Verifikation. Ergebnis differenziert:
   Fallback, `src/llama.rs:607-609`, UI-Label. AC: REQUEST PP nur bei echtem
   Prompt-Fortschritt, sonst `—`; Regressionstest mit `slots_strata_new.json`.
 
-### F3 — STATE kann ohne Slot-Evidenz IDLE zeigen (SHOULD)
+### F3 — STATE kann ohne Slot-Evidenz IDLE zeigen (SHOULD) — behoben (CFA-88)
+
+- **Status:** Behoben durch CFA-88. `classify_phase` liefert `Idle` nur noch
+  bei positiver Evidenz für „keine Aktivität“ (ein gültiges `/slots`-Array, ein
+  `requests_processing`-Gauge mit echtem `0` oder Strata `live.state = idle`);
+  ohne jede Evidenz ist die Phase `Unknown` (gerendert `UNKNOWN`, nie `IDLE`).
+  Ein offline/nie geantworteter Server bleibt `None` → `—`. Regressionstests:
+  `missing_slots_and_activity_fields_leave_the_phase_unknown` (`src/llama.rs`),
+  `llm_phase_without_activity_evidence_is_unknown_not_idle`,
+  `llm_phase_marks_idle_only_with_evidence`,
+  `build_server_summaries_keep_unevidenced_activity_unknown_and_match_the_panel`
+  (`src/app.rs`). Die folgenden Punkte beschreiben den Befund am Stand
+  `2e0d37f`.
 
 - **Ort:** `src/llama.rs:141-158` (`classify_phase`), `src/ui/llm.rs:573-586`.
   `classify_phase` liefert `Idle`, wenn alle Eingaben fehlen; `busy_slots` ist
@@ -149,18 +168,29 @@ Rein lesende Verifikation. Ergebnis differenziert:
 - **Empfehlung:** Einschränkung dokumentieren; ggf. Phase auf „—“ statt IDLE
   heben, wenn Slot-Evidenz fehlt (Folgeticket).
 
-### F4 — Abschnitt „Veraltet“ war zu stark
+### F4 — Abschnitt „Veraltet“ war zu stark (SHOULD) — behoben (CFA-88)
+
+- **Status:** Behoben durch CFA-88. Die während `offline_grace` gehaltene
+  letzte Probe wird jetzt sichtbar als **nicht frisch** gekennzeichnet: das
+  Panel trägt den Titel `LLM INFERENCE · STALE (held sample)`, LIVE PP/TG und
+  REQUEST werden nicht mehr als aktuelle Aktivität hervorgehoben, und der
+  Server-Selector zeigt `stale <Alter> ago`. Default 2500 ms, konfigurierbar
+  bis 60 000 ms (`src/config.rs:21,24`) — die Anzeige bleibt
+  **begrenzt/befristet**. Regressionstests:
+  `held_reconnecting_sample_is_marked_stale_in_the_panel` (`src/ui.rs`),
+  `server_selector_marks_held_values_stale_and_shows_unknown_phase`
+  (`src/ui.rs`), `held_llm_sample_expires_after_the_offline_grace`
+  (`src/app.rs`, deckt auch den bislang ungetesteten Ablauf der Frist ab). Die
+  folgenden Punkte beschreiben den Befund am Stand `2e0d37f`.
 
 - Während `offline_grace` wird die **komplette** letzte Probe weiter angezeigt,
   inklusive LIVE PP/TG, REQUEST und CTX (`src/app.rs:1438-1443`); das Panel
-  verzweigt nur auf `!connected` (`src/ui/llm.rs:22`), die Kennzeichnung läuft
-  nur über LINK/STATE `RECONNECTING`. Default 2500 ms, konfigurierbar bis
-  60 000 ms (`src/config.rs:21,24`). Das ist **begrenzt/befristet**, nicht
+  verzweigte nur auf `!connected` (`src/ui/llm.rs:22`), die Kennzeichnung lief
+  nur über LINK/STATE `RECONNECTING`. Das war **begrenzt/befristet**, nicht
   „verhindert“.
 - Korrekter Belegtest: `transient_llm_failure_keeps_last_sample_and_marks_reconnecting`
   (`src/app.rs:1645`, prüft `held.prompt_tps == Some(123.0)`), **nicht**
-  `build_server_summaries_derives_phase_age_and_backend`. Ein Test für den
-  Ablauf der Grace-Frist existiert nicht.
+  `build_server_summaries_derives_phase_age_and_backend`.
 
 ## Verifikationstabelle
 
@@ -189,7 +219,7 @@ LLM-Untergrenze ist 250 ms — `src/domain.rs:21`, angewandt in
 | **SPEC Lebenszeit-Akzeptanz (SPEC TOK)** | `spec_draft_tokens` / `spec_accepted_tokens` (`src/ui/llm.rs:171-176`) | `accepted/draft * 100`, geklemmt 0–100 | 1 s | Kumulierte Akzeptanzrate | Draft `0` oder Feld absent → kein Prozent (`—`), nur `accepted`-Zahl | `spec_row_shows_values_when_any_counter_reported` (`src/ui.rs:3279`) |
 | **SPEC acceptance % (ACC)** | Delta `spec_draft_tokens` & `spec_accepted_tokens` (`src/llama.rs:744-765`) | `accepted_delta / draft_delta * 100`, geklemmt 0–100 | 1 s, bei Ruhe max. 3 s gehalten (`SPEC_ACCEPTANCE_HOLD`) | Live-Akzeptanzrate der Spekulation | Kein identifiziertes Delta → letzten Wert max. 3 s halten, dann `—`; nie `0 %` erfunden | `spec_acceptance_computes_from_deltas_and_holds_after_quiet` (`src/llama.rs:2752`), `spec_acceptance_expires_after_the_hold_window` (`:2783`), `spec_counter_reset_does_not_create_fake_acceptance` (`:2833`) |
 | **MTP/SPEC Kennzeichen** | `/props`+`/slots` speculative config (`src/llama.rs:686-713`); lokale CLI/env (`src/llama/speculative.rs`); `/metrics`-Counter als Enable-Hinweis (`src/llama.rs:540`) | Server-`/props` autoritativ; sonst lokale Prozess-Config | 30 s (/props + lokaler Scan) | `MTPn` / `SPEC` / `MTP OFF` | Kein Hinweis → `MTP OFF`; Server nennt Typ → autoritativ; reine Counter >0 → `SPEC` | `successful_props_response_replaces_spec_state_instead_of_accumulating` (`src/llama.rs:1186`), `props_without_spec_info_keeps_the_cached_state` (`:1228`), `reads_draft_mtp_type_from_custom_slot_shape` (`:2939`) |
-| **Activity-Phase (STATE)** | Strata `live.state` (`src/strata.rs:236-247`) autoritativ; sonst Heuristik aus `generation_tps`/`prompt_tps`/`busy_slots`/`active_requests`/`deferred_requests` (`src/llama.rs:141-158`) | Erste zutreffende Regel: Generating > Prefill > Processing > Queued > Idle | 1 s | IDLE/PREFILL/GENERATING/PROCESSING/QUEUED/(RECONNECTING) | Offline/nie geantwortet → Phase `None` → `—` (nie geratenes IDLE); Reconnect explizit. **Siehe F3:** ein *verbundener* Server ohne Slot-Evidenz kann IDLE zeigen | `llm_phase_marks_idle_without_activity` (`src/ui.rs:3226`), `llm_phase_uses_a_reported_server_phase` (`:3234`), `build_server_summaries_derives_phase_age_and_backend` (`src/app.rs:2774`) |
+| **Activity-Phase (STATE)** | Strata `live.state` (`src/strata.rs:236-247`) autoritativ; sonst Heuristik aus `generation_tps`/`prompt_tps`/`busy_slots`/`active_requests`/`deferred_requests` (`src/llama.rs:141-158`) | Erste zutreffende Regel: Generating > Prefill > Processing > Queued > Idle (nur bei Evidenz) > Unknown | 1 s | IDLE/PREFILL/GENERATING/PROCESSING/QUEUED/UNKNOWN/(RECONNECTING) | Offline/nie geantwortet → Phase `None` → `—`; ein verbundener Server **ohne** Slot-/Gauge-/Phasen-Evidenz → `UNKNOWN` (nie geratenes IDLE, CFA-88, F3 behoben); Reconnect explizit. Selector und Detailpanel nutzen dieselbe `activity_phase`-Ableitung | `activity_phase` (`src/llama.rs`), `missing_slots_and_activity_fields_leave_the_phase_unknown` (`src/llama.rs`), `llm_phase_without_activity_evidence_is_unknown_not_idle` (`src/ui.rs`), `llm_phase_uses_a_reported_server_phase` (`:3234`), `build_server_summaries_keep_unevidenced_activity_unknown_and_match_the_panel` (`src/app.rs`) |
 | **SLOTS busy/total** | `/slots` `is_processing` / Array-Länge (`src/llama/slots.rs:26,61`) | Busy-Zähler / Slot-Anzahl | 1 s | Belegte Slots von Gesamt | `/slots` nicht verfügbar → `—/props_slots` oder `—`; nie `0/0` (Gate `slots_available`) | `idle_slots_fixture_reports_no_busy_slots` (`src/llama.rs:1842`), `server_selector_renders_unavailable_slots_without_a_fake_zero` (`src/ui.rs:2406`), `build_server_summaries_distinguishes_unavailable_slots_from_real_zero` (`src/app.rs:2688`) |
 | **Slot-Übersicht (`S<n>`)** | `/slots` je Slot `id`,`n_prompt_tokens`,`n_ctx` (`src/llama/slots.rs:134`) | Aufsteigend nach `id`, Wert/Kapazität | 1 s | Belegung je Slot bei Multi-Slot | Slot ohne `id` wird ausgelassen; fehlende Werte `—` | `slot_overview_reports_each_slot_with_own_id_state_and_usage` (`src/llama.rs:2061`), `slot_overview_keeps_missing_values_unknown_and_drops_unidentified_slots` (`:2147`), `slot_overview_entries_never_print_a_fake_zero_for_missing_usage` (`src/ui.rs:4324`) |
 | **Backend** | Klassifikation des geparsten `/metrics`-Bodys (`src/llama.rs:181`) | Strata-JSON-Objekt → Strata; Prometheus mit `llamacpp`-Namen → llama.cpp; sonst Unknown | 1 s | `llama.cpp` / `Strata` / `—` | Nie angenommen — nur positiv erkannt, sonst `—` | `recognizes_strata_objects_only` (`src/strata.rs:427`), `build_server_summaries_derives_phase_age_and_backend` (`src/app.rs:2774`) |
@@ -210,14 +240,17 @@ LLM-Untergrenze ist 250 ms — `src/domain.rs:21`, angewandt in
   (`known_zero_context_occupancy_still_renders_zero_percent`, `src/ui.rs:4074`),
   `0`-Slot-Counter (`explicit_zero_slot_counter_is_a_real_zero`,
   `src/llama.rs:2501`).
-- **Veraltet — begrenzt, nicht ausgeschlossen.** Mehrere Schranken begrenzen
-  veraltete Anzeigen: während `offline_grace` (Default 2500 ms, konfigurierbar
-  bis 60 000 ms — `src/config.rs:21,24`) hält `stabilize_llm_sample`
-  (`src/app.rs:1419`) die **komplette** letzte Probe (inkl. LIVE PP/TG, REQUEST,
-  CTX) und markiert nur LINK/STATE als RECONNECTING — die Werte selbst bleiben
-  sichtbar; nach Ablauf wird die Probe verworfen. Belegt durch
-  `transient_llm_failure_keeps_last_sample_and_marks_reconnecting`
-  (`src/app.rs:1645`); für den **Ablauf** der Frist existiert kein Test.
+- **Veraltet — begrenzt und nun gekennzeichnet.** Während `offline_grace`
+  (Default 2500 ms, konfigurierbar bis 60 000 ms — `src/config.rs:21,24`) hält
+  `stabilize_llm_sample` (`src/app.rs:1419`) die **komplette** letzte Probe
+  (inkl. LIVE PP/TG, REQUEST, CTX); nach Ablauf wird die Probe verworfen
+  (Belegt durch `transient_llm_failure_keeps_last_sample_and_marks_reconnecting`,
+  `src/app.rs:1645`, und für den Ablauf der Frist durch
+  `held_llm_sample_expires_after_the_offline_grace`, `src/app.rs`). Seit
+  **CFA-88** ist die gehaltene Probe zusätzlich sichtbar als nicht frisch
+  markiert (Panel-Titel `STALE (held sample)`, Selector `stale <Alter> ago`,
+  keine LIVE-Hervorhebung), so dass gehaltene Werte nicht als aktuelle
+  Telemetrie erscheinen (F4 behoben).
   Weiter begrenzen die Strata-Decode-Rate (nur bei `state=generating`,
   `src/strata.rs:248`), die 3-s-Haltefrist der Spec-Akzeptanz
   (`src/llama.rs:29,766`), der Basis-Verwurf bei Formatwechsel/Strata-`since`-Reset
@@ -268,9 +301,12 @@ Keine weitere Bearbeitung erforderlich.
 Rein lesende Verifikation. Neu: dieses Dokument. Kein Produktionscode geändert,
 `src/strata.rs` unverändert. Die Aussagen sind ausschließlich durch Code und
 Tests am HEAD belegt; wo keine Live-Evidenz existiert, wird sie nicht behauptet
-(vgl. `docs/LIVE_VS_FIXTURE.md`). Die Befunde F1 und F2 erfordern
-Codekorrekturen und gehören in separate Folgetickets (Vorschläge oben), nicht in
-CFA-33.
+(vgl. `docs/LIVE_VS_FIXTURE.md`). Die Befunde F1–F4 wurden in separaten
+Folgetickets behoben: F1 (CACHE-Quote) durch **CFA-87**, F2 (REQUEST prompt)
+durch **CFA-86**, F3 (STATE ohne Evidenz) und F4 (Stale-Kennzeichnung) durch
+**CFA-88**. Die Status-Absätze der Befunde halten den jeweils behobenen Stand
+fest; die Befundbeschreibungen selbst beziehen sich weiterhin auf den
+Ausgangsstand `2e0d37f`.
 
 ## Querverweise
 

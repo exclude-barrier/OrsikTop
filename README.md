@@ -68,7 +68,8 @@ OrsikTop reads llama.cpp telemetry and displays:
 - cumulative prompt and generation time
 - 60-second prefill and decode history
 - connection state, uptime and smoothed polling latency
-- transient reconnect handling so short polling interruptions do not immediately show the server as offline
+- an activity phase (`IDLE`/`PREFILL`/`GENERATING`/`PROCESSING`/`QUEUED`) shown only when the telemetry supports it: a connected server with no activity evidence at all reads `UNKNOWN` rather than a guessed `IDLE`, while an offline or never-answered server shows no phase (`—`)
+- transient reconnect handling so short polling interruptions do not immediately show the server as offline; while such a last-good sample is held it is marked as not fresh (`STALE (held sample)` in the panel, `stale … ago` in the server selector) and its rates are not highlighted as live
 
 With a `--parallel` server (multiple slots) the panel aggregates across slots: `SLOTS busy/total` counts active slots, and the live prefill / decode throughput lines sum the per-slot deltas of slots with a verified identity — the server's own slot `id`, matched against the previous sample with the same task. Array position is never treated as identity: if any slot lacks a unique `id`, a slot appears or disappears, or the task changes, the per-slot path abstains and OrsikTop falls back to the aggregated `/metrics` counters instead of fabricating throughput (so reordering or replacing slots cannot create activity). The context pair (`used / size`) is always read from a single slot — the most-used busy slot, or the most-used slot overall when no slot is busy — because an idle slot keeps its last task's context, so mixing a maximum `used` with a maximum `n_ctx` across slots could pair values from two different slots.
 

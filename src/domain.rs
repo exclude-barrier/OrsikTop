@@ -789,13 +789,20 @@ pub struct FastSnapshot {
 }
 
 /// Coarse activity phase of a monitored server, derived from that server's own
-/// telemetry. Used only for presentation in the multi-server overview; a server
-/// with no reliable evidence has no phase (`None`), which renders `—` — it is
-/// never guessed into `IDLE`.
+/// telemetry. A server that is offline or has never answered has no phase
+/// (`None`, rendered `—` next to its `offline` state); a connected server
+/// without evidence either way is [`ActivityPhase::Unknown`] — neither case is
+/// ever guessed into `IDLE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityPhase {
-    /// Connected and no request activity reported.
+    /// Connected, and the telemetry positively reports no request activity
+    /// (a valid `/slots` array with no busy slot, an `active requests` gauge
+    /// of `0`, or Strata's `live.state = idle`).
     Idle,
+    /// Connected, but the telemetry carries no activity evidence at all (no
+    /// `/slots`, no request gauge, no server-reported phase): the server may
+    /// be idle or busy, so the phase is not guessed.
+    Unknown,
     /// Reading the prompt (prefill).
     Prefill,
     /// Producing tokens (decode).
@@ -813,6 +820,7 @@ impl ActivityPhase {
     pub fn label(self) -> &'static str {
         match self {
             ActivityPhase::Idle => "IDLE",
+            ActivityPhase::Unknown => "UNKNOWN",
             ActivityPhase::Prefill => "PREFILL",
             ActivityPhase::Generating => "GENERATING",
             ActivityPhase::Processing => "PROCESSING",
@@ -862,9 +870,9 @@ pub struct ServerSummary {
     pub label: String,
     pub connected: bool,
     pub reconnecting: bool,
-    /// A server-reported activity phase, or `None` when there is no reliable
-    /// evidence (a server that has never answered, or is offline). Never a
-    /// guessed `IDLE`.
+    /// A server-reported activity phase, or `None` when the server has never
+    /// answered or is offline. A connected server without activity evidence
+    /// carries [`ActivityPhase::Unknown`]; neither is ever a guessed `IDLE`.
     pub phase: Option<ActivityPhase>,
     /// Milliseconds since this server's last successful measurement. `None`
     /// when it has never answered, rendering `—` rather than a fabricated `0`.
