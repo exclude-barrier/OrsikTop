@@ -13,6 +13,7 @@ mod gpu_map;
 mod llama;
 mod providers;
 mod redact;
+mod server_editor;
 mod strata;
 mod system;
 mod ui;
