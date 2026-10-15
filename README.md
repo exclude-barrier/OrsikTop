@@ -67,7 +67,7 @@ OrsikTop reads llama.cpp telemetry and displays:
 - speculative decoding / MTP state and acceptance data when available
 - cumulative prompt and generation time
 - 60-second prefill and decode history
-- connection state, uptime and smoothed polling latency
+- connection state, uptime and the smoothed sample interval (`SAMPLE`)
 - an activity phase (`IDLE`/`PREFILL`/`GENERATING`/`PROCESSING`/`QUEUED`) shown only when the telemetry supports it: a connected server with no activity evidence at all reads `UNKNOWN` rather than a guessed `IDLE`, while an offline or never-answered server shows no phase (`—`)
 - transient reconnect handling so short polling interruptions do not immediately show the server as offline; while such a last-good sample is held it is marked as not fresh (`STALE (held sample)` in the panel, `stale … ago` in the server selector) and its rates are not highlighted as live
 
@@ -379,6 +379,12 @@ For a locally running server, the LLM panel shows the GPU it uses (`GPU <id>`) �
 | Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` |
 
 The main telemetry refresh interval can be changed live from **100 ms to 10,000 ms**.
+
+The `h` help popup also carries a short legend for the LLM panel and selector
+fields — what `CTX` and `REQUEST` mean (current context occupancy vs. the
+in-flight request's tokens), the `PP`/`TG` rate columns, the `STATE` phases,
+the `SAMPLE` freshness field and the rule that an unknown value is shown as
+`—`, never as a fabricated zero.
 
 ## Settings
 

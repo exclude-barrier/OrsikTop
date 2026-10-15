@@ -46,19 +46,31 @@ pub(super) fn draw_llm(
 
     if !llm.connected {
         let metrics_off = llm_metrics_disabled(&llm.error);
-        let (status, color, message) = if metrics_off {
-            ("METRICS OFF", YELLOW, "restart server with --metrics")
+        let (status, color) = if metrics_off {
+            ("METRICS OFF", YELLOW)
         } else if llm.reconnecting {
-            ("RECONNECTING", YELLOW, "connection lost · retrying")
+            ("RECONNECTING", YELLOW)
         } else {
-            ("SERVER OFFLINE", RED, "connection lost")
+            ("SERVER OFFLINE", RED)
+        };
+        // Prefer the concrete, already-sanitized backend text over a generic
+        // "connection lost" so the reason names the actual failure; fall back
+        // to an actionable hint only when the sample carries no error at all.
+        let reason = if metrics_off {
+            "restart server with --metrics".to_string()
+        } else if llm.reconnecting {
+            "connection lost · retrying (held sample)".to_string()
+        } else if llm.error.trim().is_empty() {
+            "no response from the server — check host and port".to_string()
+        } else {
+            llm.error.clone()
         };
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![label_span(" STATUS      "), value_span(status, color)]),
                 Line::from(vec![
-                    label_span(" LLAMA       "),
-                    Span::styled(message, Style::default().fg(MUTED)),
+                    label_span(" REASON      "),
+                    Span::styled(reason, Style::default().fg(MUTED)),
                 ]),
                 Line::from(vec![
                     label_span(" LAST SAMPLE "),
@@ -276,7 +288,7 @@ pub(super) fn draw_llm(
             label_span("UPTIME "),
             value_span(&llm_uptime_text(state), MUTED),
             llm_sep(),
-            label_span("POLL "),
+            label_span("SAMPLE "),
             value_span(&llm_last_sample_text(state, llm), MUTED),
         ]),
         Line::from(state_line),
@@ -541,7 +553,7 @@ pub(super) fn draw_llm_metrics_unavailable(
             label_span("UPTIME "),
             value_span(&llm_uptime_text(state), MUTED),
             llm_sep(),
-            label_span("POLL "),
+            label_span("SAMPLE "),
             value_span(&llm_last_sample_text(state, llm), MUTED),
         ]),
         Line::from(vec![

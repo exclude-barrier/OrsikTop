@@ -223,7 +223,7 @@ LLM-Untergrenze ist 250 ms — `src/domain.rs:21`, angewandt in
 | **SLOTS busy/total** | `/slots` `is_processing` / Array-Länge (`src/llama/slots.rs:26,61`) | Busy-Zähler / Slot-Anzahl | 1 s | Belegte Slots von Gesamt | `/slots` nicht verfügbar → `—/props_slots` oder `—`; nie `0/0` (Gate `slots_available`) | `idle_slots_fixture_reports_no_busy_slots` (`src/llama.rs:1842`), `server_selector_renders_unavailable_slots_without_a_fake_zero` (`src/ui.rs:2406`), `build_server_summaries_distinguishes_unavailable_slots_from_real_zero` (`src/app.rs:2688`) |
 | **Slot-Übersicht (`S<n>`)** | `/slots` je Slot `id`,`n_prompt_tokens`,`n_ctx` (`src/llama/slots.rs:134`) | Aufsteigend nach `id`, Wert/Kapazität | 1 s | Belegung je Slot bei Multi-Slot | Slot ohne `id` wird ausgelassen; fehlende Werte `—` | `slot_overview_reports_each_slot_with_own_id_state_and_usage` (`src/llama.rs:2061`), `slot_overview_keeps_missing_values_unknown_and_drops_unidentified_slots` (`:2147`), `slot_overview_entries_never_print_a_fake_zero_for_missing_usage` (`src/ui.rs:4324`) |
 | **Backend** | Klassifikation des geparsten `/metrics`-Bodys (`src/llama.rs:181`) | Strata-JSON-Objekt → Strata; Prometheus mit `llamacpp`-Namen → llama.cpp; sonst Unknown | 1 s | `llama.cpp` / `Strata` / `—` | Nie angenommen — nur positiv erkannt, sonst `—` | `recognizes_strata_objects_only` (`src/strata.rs:427`), `build_server_summaries_derives_phase_age_and_backend` (`src/app.rs:2774`) |
-| **Messalter / Poll-Intervall** | Zeit seit letzter gültiger Probe; EMA des Intervalls (`src/domain.rs:869-879`) | `now - last_fresh`; EMA | 1 s | Aktualität der Anzeige | Nie gemessen → `—` (nicht `0`); online mit bekanntem Intervall → `~N ms avg` | `server_selector_shows_measurement_age_and_interval` (`src/ui.rs:2710`), `build_server_summaries_derives_phase_age_and_backend` (`src/app.rs:2774`) |
+| **Messalter / Sample-Intervall** | Zeit seit letzter gültiger Probe; EMA des Intervalls (`src/domain.rs:869-879`) | `now - last_fresh`; EMA | 1 s | Aktualität der Anzeige (Panel-Feld `SAMPLE`, zuvor `POLL`) | Nie gemessen → `—` (nicht `0`); online mit bekanntem Intervall → `~N ms avg`; gehaltene (reconnecting) Probe → `stale … ago` im Selektor bzw. Titel `STALE (held sample)` im Panel (CFA-88/CFA-91) | `server_selector_shows_measurement_age_and_interval` (`src/ui.rs:2710`), `build_server_summaries_derives_phase_age_and_backend` (`src/app.rs:2774`), `panel_labels_freshness_as_sample_not_poll` (`src/ui.rs`, TestBackend) |
 
 ## Fehlende vs. reale Nullwerte vs. veraltete Werte
 
@@ -304,9 +304,13 @@ Tests am HEAD belegt; wo keine Live-Evidenz existiert, wird sie nicht behauptet
 (vgl. `docs/LIVE_VS_FIXTURE.md`). Die Befunde F1–F4 wurden in separaten
 Folgetickets behoben: F1 (CACHE-Quote) durch **CFA-87**, F2 (REQUEST prompt)
 durch **CFA-86**, F3 (STATE ohne Evidenz) und F4 (Stale-Kennzeichnung) durch
-**CFA-88**. Die Status-Absätze der Befunde halten den jeweils behobenen Stand
-fest; die Befundbeschreibungen selbst beziehen sich weiterhin auf den
-Ausgangsstand `2e0d37f`.
+**CFA-88**. **CFA-91** (UX-03) ergänzt im Hilfe-Popup eine Feldlegende
+(insbesondere CTX vs. REQUEST), benennt das Freshness-Feld klarer (`SAMPLE`)
+und meldet den konkreten Backend-Fehler statt eines generischen
+„connection lost"; die `—`-Regel für unbekannte Werte bleibt unverändert. Die
+Status-Absätze der Befunde halten den jeweils behobenen Stand fest; die
+Befundbeschreibungen selbst beziehen sich weiterhin auf den Ausgangsstand
+`2e0d37f`.
 
 ## Querverweise
 

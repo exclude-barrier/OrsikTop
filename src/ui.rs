@@ -2990,6 +2990,149 @@ mod tests {
     }
 
     #[test]
+    fn help_popup_legend_explains_context_and_request_at_72x22() {
+        // CFA-91: the dense panel/selector cells cannot explain themselves, so
+        // the full help popup carries a field legend, above all the CTX vs.
+        // REQUEST distinction. 72x22 is the full-layout floor.
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        let text = render_dashboard(72, 22, 1000, &llm, &mut state);
+        assert!(
+            text.contains("READING THE PANEL"),
+            "legend missing:\n{text}"
+        );
+        assert!(text.contains("CTX"), "CTX row missing:\n{text}");
+        assert!(
+            text.contains("context occupancy"),
+            "CTX explanation missing:\n{text}"
+        );
+        assert!(text.contains("REQUEST"), "REQUEST row missing:\n{text}");
+        assert!(
+            text.contains("in-flight request"),
+            "REQUEST explanation missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn help_popup_legend_stays_readable_on_a_large_terminal() {
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        let text = render_dashboard(120, 40, 1000, &llm, &mut state);
+        assert!(text.contains("READING THE PANEL"), "{text}");
+        assert!(
+            text.contains("STALE"),
+            "the freshness rule must be explained:\n{text}"
+        );
+        assert!(
+            text.contains("unknown or unavailable"),
+            "the unknown-value rule must be explained:\n{text}"
+        );
+    }
+
+    #[test]
+    fn compact_help_names_context_and_request_at_the_hard_floor() {
+        // The compact help (54x16) still has to distinguish the two central
+        // fields, even though the full legend does not fit there.
+        let llm = LlmStats {
+            connected: true,
+            ..Default::default()
+        };
+        let mut state = UiState::default();
+        state.toggle_help();
+        let text = render_dashboard(54, 16, 1000, &llm, &mut state);
+        assert!(
+            text.contains("CTX") && text.contains("REQUEST"),
+            "compact help must name CTX and REQUEST:\n{text}"
+        );
+    }
+
+    #[test]
+    fn panel_labels_freshness_as_sample_not_poll() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 12);
+        assert!(
+            text.contains("SAMPLE"),
+            "freshness field must be labelled SAMPLE:\n{text}"
+        );
+        assert!(
+            !text.contains("POLL"),
+            "the ambiguous POLL label is gone:\n{text}"
+        );
+    }
+
+    #[test]
+    fn offline_panel_states_the_concrete_backend_failure() {
+        // CFA-91: name the actual failure from the sanitized sample instead of
+        // a generic "connection lost".
+        let llm = LlmStats {
+            connected: false,
+            error: "cannot reach llama.cpp: connection refused".to_string(),
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 8);
+        assert!(text.contains("SERVER OFFLINE"), "{text}");
+        assert!(
+            text.contains("connection refused"),
+            "reason must name the failure:\n{text}"
+        );
+    }
+
+    #[test]
+    fn offline_panel_without_an_error_suggests_checking_the_endpoint() {
+        let llm = LlmStats {
+            connected: false,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 90, 8);
+        assert!(
+            text.contains("check host and port"),
+            "an empty sample must give an actionable hint:\n{text}"
+        );
+        assert!(!text.contains("connection lost"), "{text}");
+    }
+
+    #[test]
+    fn unknown_metrics_and_slots_stay_dash_at_all_target_layouts() {
+        // A reachable server with neither /metrics nor /slots has unknown
+        // values: they must render `—`, never a fabricated 0, at every target
+        // size (54x16, 72x22, large).
+        for (width, height) in [(54u16, 16u16), (72, 22), (120, 40)] {
+            let llm = LlmStats {
+                connected: true,
+                metrics_available: false,
+                model: "m".to_string(),
+                ..Default::default()
+            };
+            let text = render_llm_panel(&llm, width, height);
+            assert!(
+                text.contains("UNAVAILABLE"),
+                "metrics-unavailable panel missing at {width}x{height}:\n{text}"
+            );
+            assert!(
+                !text.contains("0/0"),
+                "no fabricated slot counts at {width}x{height}:\n{text}"
+            );
+            assert!(
+                text.contains('—'),
+                "unknown placeholder missing at {width}x{height}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_layout_shows_an_open_process_search() {
         // The compact layout has no process table or footer, so an open search
         // must still be visible; otherwise typing vanishes into a hidden mode.

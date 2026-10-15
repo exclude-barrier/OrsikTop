@@ -44,41 +44,71 @@ pub(super) fn draw_help_popup(frame: &mut Frame, area: Rect) {
 
     let key = |text: &'static str| {
         Span::styled(
-            format!(" {text:<15}"),
+            format!(" {text:<9}"),
             Style::default().fg(ORK_GREEN).add_modifier(Modifier::BOLD),
         )
     };
     let desc = |text: &'static str| Span::styled(text, Style::default().fg(WHITE));
+    let heading = |text: &'static str| {
+        Span::styled(text, Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
+    };
 
+    // Concise enough to fit the smallest full-help popup (inner height 16 at
+    // 72x22): the field legend first, then the keys. The legend is where the
+    // CTX-vs-REQUEST distinction and the `—`/freshness rules are explained,
+    // because the dense panel and selector cells cannot say it themselves.
     let lines = vec![
-        Line::from(Span::styled(
-            " KEYBOARD",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![key("Esc"), desc("Quit")]),
-        Line::from(vec![key("h"), desc("Toggle this help")]),
-        Line::from(vec![key("q"), desc("Open settings")]),
-        Line::from(vec![key("s"), desc("Server selector (multi-server)")]),
-        Line::from(vec![key("/"), desc("Search / filter processes")]),
+        Line::from(heading(" READING THE PANEL")),
         Line::from(vec![
-            key("- / +"),
-            desc("Decrease / increase refresh interval"),
+            key("CTX"),
+            desc("current context occupancy of the shown slot"),
         ]),
-        Line::from(vec![key("↑ / k"), desc("Select previous visible row")]),
-        Line::from(vec![key("↓ / j"), desc("Select next visible row")]),
-        Line::from(vec![key("PgUp / PgDn"), desc("Jump 10 processes")]),
-        Line::from(vec![key("Home / End"), desc("First / last process")]),
-        Line::from(""),
+        Line::from(vec![
+            key("REQUEST"),
+            desc("in-flight request tokens: prompt / generated"),
+        ]),
+        Line::from(vec![
+            key("SLOTS"),
+            desc("busy / total slots (S in the selector)"),
+        ]),
+        Line::from(vec![
+            key("PP/TG"),
+            desc("prefill / decode rate (LIVE · AVG · TOTAL)"),
+        ]),
+        Line::from(vec![
+            key("CACHE"),
+            desc("lifetime cached prompt tokens; no ratio shown"),
+        ]),
+        Line::from(vec![
+            key("STATE"),
+            desc("IDLE/PREFILL/GENERATING/… only with evidence"),
+        ]),
+        Line::from(vec![
+            key("SAMPLE"),
+            desc("sample interval, or age / STALE when not fresh"),
+        ]),
+        Line::from(vec![
+            key("—"),
+            desc("unknown or unavailable — never a zero"),
+        ]),
+        Line::from(heading(" KEYBOARD")),
         Line::from(Span::styled(
-            " MOUSE",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            " Esc quit · h help · q settings · s servers · / search",
+            Style::default().fg(WHITE),
         )),
-        Line::from(vec![key("Left click"), desc("Select process or group")]),
-        Line::from(vec![key("Double click"), desc("Pin process or group")]),
-        Line::from(vec![key("Right click"), desc("Expand / collapse group")]),
-        Line::from(vec![key("Header click"), desc("Sort process table")]),
-        Line::from(vec![key("Mouse wheel"), desc("Scroll process table")]),
-        Line::from(vec![key("[-] / [+]"), desc("Change refresh interval")]),
+        Line::from(Span::styled(
+            " -/+ refresh · ↑/k ↓/j select · PgUp/PgDn jump · Home/End first/last",
+            Style::default().fg(WHITE),
+        )),
+        Line::from(heading(" MOUSE")),
+        Line::from(Span::styled(
+            " click select · double-click pin · right-click expand group",
+            Style::default().fg(WHITE),
+        )),
+        Line::from(Span::styled(
+            " header click sort · wheel scroll · [-]/[+] refresh interval",
+            Style::default().fg(WHITE),
+        )),
     ];
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -109,6 +139,10 @@ fn draw_help_compact(frame: &mut Frame, area: Rect) {
     frame.render_widget(block, popup);
 
     let lines = vec![
+        Line::from(Span::styled(
+            " CTX context · REQUEST in-flight request",
+            Style::default().fg(WHITE),
+        )),
         Line::from(Span::styled(
             " Esc / h  close help",
             Style::default().fg(WHITE),
