@@ -72,6 +72,8 @@ use widgets::{button_span, compact_endpoint, fit_cell, percent};
 #[cfg(test)]
 mod layout_regression_tests;
 #[cfg(test)]
+mod settings_redaction_tests;
+#[cfg(test)]
 mod ux_baseline_tests;
 #[cfg(test)]
 mod width_regression_tests;

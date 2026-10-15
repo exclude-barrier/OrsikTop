@@ -524,9 +524,21 @@ pub(super) fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState
     };
 
     // Preview the endpoint that would actually be saved, so an `https` (or
-    // custom-scheme) URL is not misrepresented as `http`.
+    // custom-scheme) URL is not misrepresented as `http`. The preview is
+    // display-only and goes through the redactor: userinfo, path, query and
+    // fragment must never be painted (the saved value is left untouched). A
+    // scheme-less legacy endpoint is shown in the compact `host:port` form
+    // when it carries nothing confidential, otherwise as the placeholder.
     let preview = state
         .settings_endpoint()
+        .map(|endpoint| {
+            let safe = crate::redact::safe_endpoint(&endpoint);
+            if safe == crate::redact::UNPARSEABLE_ENDPOINT {
+                compact_endpoint(&endpoint)
+            } else {
+                safe
+            }
+        })
         .unwrap_or_else(|_| "…".to_string());
     let auto = if state.settings_auto_discovery {
         "ON"
@@ -638,6 +650,14 @@ pub(super) fn endpoint_parts(server: &str) -> (String, u16) {
             return (host.to_string(), url.port().unwrap_or(8080));
         }
     }
+
+    // The field is editable, so mask at the source: what the URL parser
+    // could not handle must still never put userinfo, a path, a query or
+    // a fragment into the host field.
+    let compact = compact.rsplit_once('@').map_or(compact, |(_, host)| host);
+    let compact = compact
+        .find(['/', '?', '#'])
+        .map_or(compact, |end| &compact[..end]);
 
     if let Some(rest) = compact.strip_prefix('[') {
         if let Some((host, after)) = rest.split_once(']') {
