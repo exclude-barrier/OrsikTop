@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use super::widgets::{compact_memory, fit_cell, gpu_cell, thread_cell};
+use super::widgets::{compact_memory, fit_cell, gpu_cell, pad_cell, thread_cell};
 use super::{
     ProcessDisplayRow, ProcessGroup, ProcessHeaderHit, ProcessRowTarget, ProcessRowsHit,
     ProcessSortKey, UiState, BRIGHT_GREEN, CYAN, DIM_GREEN, INNER_GREEN, MUTED, ORANGE, ORK_GREEN,
@@ -639,7 +639,7 @@ pub(super) fn process_group_line_compact(
             process_cell_style(CYAN, selected, false),
         ),
         Span::styled(
-            format!("{program:<program_width$}"),
+            pad_cell(&program, program_width),
             process_cell_style(ORK_GREEN, selected, true),
         ),
         Span::styled(
@@ -682,7 +682,7 @@ pub(super) fn process_line_compact(
             process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
-            format!("{program:<program_width$}"),
+            pad_cell(&program, program_width),
             process_cell_style(
                 if program_bold { ORK_GREEN } else { DIM_GREEN },
                 selected,
@@ -732,11 +732,11 @@ pub(super) fn process_group_line_wide(
             process_cell_style(CYAN, selected, false),
         ),
         Span::styled(
-            format!("{program:<16}"),
+            pad_cell(&program, 16),
             process_cell_style(ORK_GREEN, selected, true),
         ),
         Span::styled(
-            format!("{command:<command_width$}"),
+            pad_cell(&command, command_width),
             process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
@@ -785,7 +785,7 @@ pub(super) fn process_line_wide(
             process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
-            format!("{program:<16}"),
+            pad_cell(&program, 16),
             process_cell_style(
                 if program_bold { ORK_GREEN } else { DIM_GREEN },
                 selected,
@@ -793,7 +793,7 @@ pub(super) fn process_line_wide(
             ),
         ),
         Span::styled(
-            format!("{command:<command_width$}"),
+            pad_cell(&command, command_width),
             process_cell_style(MUTED, selected, false),
         ),
         Span::styled(

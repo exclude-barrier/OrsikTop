@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use super::widgets::{compact_endpoint, fit_cell, format_sample_age};
+use super::widgets::{compact_endpoint, fit_cell, format_sample_age, pad_cell};
 use super::{
     SettingsField, UiState, BRIGHT_GREEN, CYAN, DIM_GREEN, MUTED, ORK_GREEN, PROCESS_SELECTED_BG,
     RED, WHITE, YELLOW,
@@ -317,7 +317,10 @@ pub(super) fn draw_server_selector(
                 format!("{marker}{star} "),
                 Style::default().fg(if index == highlight { CYAN } else { MUTED }),
             ),
-            Span::styled(format!("{label:<16} "), Style::default().fg(WHITE)),
+            Span::styled(
+                format!("{} ", pad_cell(&label, 16)),
+                Style::default().fg(WHITE),
+            ),
             Span::styled(format!("{state:<12} "), Style::default().fg(state_color)),
             Span::styled(
                 format!("{phase:<12} "),
@@ -516,7 +519,7 @@ pub(super) fn draw_settings_popup(frame: &mut Frame, area: Rect, state: &UiState
                 format!(" {label:<18}"),
                 Style::default().fg(if selected { CYAN } else { MUTED }),
             ),
-            Span::styled(format!(" {value:<42}"), value_style),
+            Span::styled(format!(" {}", pad_cell(&value, 42)), value_style),
         ])
     };
 

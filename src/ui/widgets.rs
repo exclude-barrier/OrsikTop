@@ -138,31 +138,72 @@ pub(super) fn compact_cpu_model(topology: &CpuTopology) -> String {
         .join(" ")
 }
 
-pub(super) fn truncate_title(title: &str, max_len: usize) -> String {
-    if title.chars().count() <= max_len {
-        return title.to_string();
-    }
-    let mut result = title
-        .chars()
-        .take(max_len.saturating_sub(1))
-        .collect::<String>();
-    result.push('…');
-    result
+/// Display width of `text` in terminal columns. Uses ratatui's own
+/// Unicode-aware measurement (wide/CJK characters count 2, combining marks 0),
+/// so truncation and padding agree with how the backend actually advances the
+/// cursor. No extra dependency: `Span::width` is the helper ratatui already
+/// ships (unicode-width is only a transitive dependency here).
+pub(super) fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
 }
 
+/// Display width of a single `char` in terminal columns: 0 for combining marks
+/// and zero-width joiners, 2 for wide/fullwidth characters, 1 otherwise.
+fn char_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    let encoded: &str = ch.encode_utf8(&mut buf);
+    Span::raw(encoded).width()
+}
+
+pub(super) fn truncate_title(title: &str, max_len: usize) -> String {
+    if display_width(title) <= max_len {
+        return title.to_string();
+    }
+    fit_cell(title, max_len)
+}
+
+/// Truncate `text` to at most `width` display columns, appending a single `…`
+/// when characters had to be dropped. Never splits a wide character, so the
+/// result always fits `width` columns and fixed table cells stay aligned.
 pub(super) fn fit_cell(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let count = text.chars().count();
-    if count <= width {
+    if display_width(text) <= width {
         return text.to_string();
     }
     if width == 1 {
         return "…".to_string();
     }
-    let mut out = text.chars().take(width - 1).collect::<String>();
+    // Reserve one column for the ellipsis, then add whole characters until the
+    // budget would be exceeded. A wide character that would straddle the edge
+    // is dropped rather than halved.
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
     out.push('…');
+    out
+}
+
+/// Right-pad `text` with spaces so its display width is exactly `width`
+/// columns, truncating first when it is wider. Replaces `format!("{:<width$}")`
+/// for cells that may contain wide or combining characters, because Rust's
+/// format width counts characters, not terminal columns, and would shift the
+/// following cells.
+pub(super) fn pad_cell(text: &str, width: usize) -> String {
+    let mut out = fit_cell(text, width);
+    let used = display_width(&out);
+    for _ in used..width {
+        out.push(' ');
+    }
     out
 }
 
