@@ -35,7 +35,7 @@ mod system;
 mod widgets;
 use dialogs::{
     build_endpoint, default_port_for_scheme, draw_help_popup, draw_server_selector,
-    draw_settings_popup, endpoint_parts, parse_setting_u64,
+    draw_settings_popup, endpoint_parts, parse_endpoint_base, parse_setting_u64,
 };
 use gpu_panel::{draw_gpu, enc_dec_idle};
 #[cfg(test)]
@@ -71,6 +71,8 @@ use widgets::{button_span, compact_endpoint, fit_cell, percent};
 
 #[cfg(test)]
 mod layout_regression_tests;
+#[cfg(test)]
+mod settings_redaction_tests;
 #[cfg(test)]
 mod ux_baseline_tests;
 #[cfg(test)]
@@ -720,8 +722,10 @@ impl UiState {
         // Keep the exact original and, when parseable, a structured base so
         // saving can preserve everything the dialog does not edit (scheme,
         // path, userinfo, …) instead of rebuilding a bare `http://host:port`.
+        // A scheme-less legacy endpoint is parsed as `http://…` so host and
+        // port stay editable while userinfo and path survive.
         self.settings_server_original = editable_server.to_string();
-        self.settings_server_base = reqwest::Url::parse(editable_server.trim()).ok();
+        self.settings_server_base = parse_endpoint_base(editable_server);
         self.settings_gpu = settings.gpu_selector.as_string();
         self.settings_refresh_ms = settings.refresh_ms.to_string();
         self.settings_process_refresh_ms = settings.process_refresh_ms.to_string();
@@ -874,7 +878,10 @@ impl UiState {
     /// host and port are unchanged the exact original string is returned, so
     /// opening the dialog and saving without edits round-trips byte for byte
     /// (no silent `https` → `http` downgrade). Legacy endpoints without a
-    /// scheme fall back to the historical `http://host:port` builder.
+    /// scheme are parsed as `http://…`: unchanged they round-trip byte for
+    /// byte, and when host/port are edited the `http` scheme is added while
+    /// userinfo and path are kept. Only an endpoint with no recoverable host
+    /// falls back to the historical `http://host:port` builder.
     fn settings_endpoint(&self) -> Result<String, String> {
         // `host_str` keeps the brackets of an IPv6 literal; compare and set
         // hosts in their bare form and re-add the brackets for the URL parser.
@@ -901,12 +908,11 @@ impl UiState {
             return build_endpoint(&self.settings_host, &self.settings_port);
         };
 
-        let base_host = base
-            .host_str()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let base_port = base.port_or_known_default().unwrap_or(0);
+        // Compare against the values the fields were initialised with, so a
+        // scheme-less endpoint without a port (legacy default 8080, while its
+        // `http://…` base would report 80) still counts as unchanged.
+        let (base_host, base_port) = endpoint_parts(&self.settings_server_original);
+        let base_host = base_host.trim_start_matches('[').trim_end_matches(']');
         if host.eq_ignore_ascii_case(base_host) && port == base_port {
             return Ok(self.settings_server_original.clone());
         }
@@ -3141,6 +3147,82 @@ mod tests {
                 "endpoint {server} changed"
             );
         }
+    }
+
+    #[test]
+    fn scheme_less_endpoint_round_trips_unchanged() {
+        // Regression: a legacy `host:port` endpoint used to fail to save
+        // because it parsed as a cannot-be-a-base URL, leaving `set_host` with
+        // an empty base host.
+        let server = "localhost:8080";
+        let settings = settings_for(server);
+        let mut state = UiState::default();
+        state.open_settings(server, &settings);
+        assert_eq!(state.settings_host, "localhost");
+        assert_eq!(state.settings_port, "8080");
+        assert_eq!(
+            state.settings_config().unwrap().server.as_deref(),
+            Some(server)
+        );
+    }
+
+    #[test]
+    fn scheme_less_endpoint_without_port_round_trips_unchanged() {
+        // The field shows the legacy default port 8080 while the parsed
+        // `http://…` base would report 80; that must not count as an edit.
+        let server = "localhost";
+        let settings = settings_for(server);
+        let mut state = UiState::default();
+        state.open_settings(server, &settings);
+        assert_eq!(state.settings_port, "8080");
+        assert_eq!(
+            state.settings_config().unwrap().server.as_deref(),
+            Some(server)
+        );
+        state.settings_host = "other.local".to_string();
+        assert_eq!(
+            state.settings_config().unwrap().server.as_deref(),
+            Some("http://other.local:8080/")
+        );
+    }
+
+    #[test]
+    fn changing_only_refresh_saves_a_scheme_less_endpoint() {
+        let server = "10.0.0.7:9090";
+        let settings = settings_for(server);
+        let mut state = UiState::default();
+        state.open_settings(server, &settings);
+        state.settings_field = SettingsField::Refresh;
+        state.settings_refresh_ms = "500".to_string();
+        let saved = state.settings_config().unwrap();
+        assert_eq!(saved.refresh_ms, 500);
+        assert_eq!(saved.server.as_deref(), Some(server));
+    }
+
+    #[test]
+    fn editing_a_scheme_less_endpoint_adds_http_and_keeps_credentials() {
+        let server = "demo-user:demo-password@localhost:8080";
+        let settings = settings_for(server);
+        let mut state = UiState::default();
+        state.open_settings(server, &settings);
+        // The host field must hold the bare host, not the userinfo prefix.
+        assert_eq!(state.settings_host, "localhost");
+        assert_eq!(state.settings_port, "8080");
+        // Unchanged, the endpoint (including its credentials) round-trips.
+        assert_eq!(
+            state.settings_config().unwrap().server.as_deref(),
+            Some(server)
+        );
+        // Editing the host adds the http scheme and keeps host, port and
+        // userinfo instead of dropping the credentials.
+        state.settings_host = "other.local".to_string();
+        let endpoint = state.settings_config().unwrap().server.unwrap();
+        let url = reqwest::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("other.local"));
+        assert_eq!(url.port(), Some(8080));
+        assert_eq!(url.username(), "demo-user");
+        assert_eq!(url.password(), Some("demo-password"));
     }
 
     #[test]
