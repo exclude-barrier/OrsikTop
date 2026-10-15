@@ -51,9 +51,10 @@ Rein lesende Verifikation. Ergebnis differenziert:
   und gehören in Folgetickets, nicht in CFA-33:
   - **F1 — CACHE-Quote** wird auf 100 % geklemmt und als „% of PP“ ausgegeben,
     obwohl der Zähler keine Teilmenge belegen muss (`src/ui/llm.rs:165-170,324`).
-  - **F2 — REQUEST prompt** zeigt im Fallback ohne `n_prompt_tokens_processed`
+  - **F2 — REQUEST prompt** zeigte im Fallback ohne `n_prompt_tokens_processed`
     die **KV-Belegung** des Slots, nicht den Prompt-Fortschritt
     (`src/llama/slots.rs:75-78`; belegt durch `slots_strata_new.json`).
+    **Behoben in CFA-86** (siehe F2 unten).
 - **CTX-Kernverhalten korrekt.** Die CTX-Zeile zeigt ausschließlich die aktuelle
   Slot-Occupancy; der High-Water-Mark wird **nirgends** als aktuelle Belegung
   substituiert und erscheint nur explizit als `watermark` in `orsiktop diag`.
@@ -95,7 +96,16 @@ Rein lesende Verifikation. Ergebnis differenziert:
   Regressionstest mit `metrics_current.prom`. AC: kein geklemmter 100-%-Anteil;
   Quote nur bei belegbarer Teilmengen-Semantik oder `—`.
 
-### F2 — REQUEST prompt fällt auf die KV-Belegung zurück (MUST)
+### F2 — REQUEST prompt fällt auf die KV-Belegung zurück (MUST) — behoben (CFA-86)
+
+- **Status:** Behoben durch CFA-86. Der Fallback `.or(prompt_tokens)` ist
+  entfernt; REQUEST prompt stammt nur noch aus `n_prompt_tokens_processed`
+  bzw. (Strata) aus `live.prompt_tokens`, sonst `—`. Auch die
+  Slot-Prefill-Delta-Rate nutzt `n_prompt_tokens` nicht mehr. Regressionstests:
+  `strata_new_slots_report_direct_occupancy`,
+  `llama_slot_without_processed_counter_keeps_request_prompt_unknown`,
+  `sample_uses_strata_live_prompt_not_new_slots_occupancy_for_request`.
+  Die folgenden Punkte beschreiben den Befund am Stand `2e0d37f`.
 
 - **Ort:** `src/llama/slots.rs:75-78`
   (`n_prompt_tokens_processed` `.or(prompt_tokens)`); der Strata-Lückenfüller
@@ -155,7 +165,7 @@ LLM-Untergrenze ist 250 ms — `src/domain.rs:21`, angewandt in
 | **CTX capacity** | `/props` `default_generation_settings.n_ctx` (`src/llama.rs:671`); Fallback `/slots` `n_ctx` (`src/llama/slots.rs:52,167`); Strata `engine.max_context` (`src/strata.rs:218`) | Erster nicht-null-Wert gewinnt; Slot-`n_ctx` verfeinert | 30 s (/props) bzw. 1 s (/slots/Strata) | Nenner der CTX-Anzeige | Kein Wert → `0` → CTX-Meter unavailable (nicht `0 %`) | `props_fixture_exposes_context_slots_and_model` (`src/llama.rs:1859`), `slot_missing_n_ctx_keeps_props_context_size` (`:2048`), `context_without_capacity_renders_the_meter_unavailable` (`src/ui.rs:4091`) |
 | **CTX high-water (watermark)** | `/metrics` `llamacpp:n_tokens_max` (`src/llama.rs:527`) | Wert verbatim (Lebenszeit-Peak), `None` bei absent | 1 s | Historischer Spitzenwert — **nie** aktuelle Belegung | Absent oder /metrics aus → `None`; erscheint nur in `diag` als `watermark —`, nie als CTX | `watermark_is_not_shown_as_current_context_occupancy` (`src/ui.rs:4110`), `missing_high_water_mark_is_not_rendered_as_zero` (`src/diagnostics.rs:885`); High-Water-Fix `c83230f` |
 | **CTX slot tag (`Sn`)** | `/slots` Slot `id` (`src/llama/slots.rs:55,163`) | `context_slot_id` des gewählten Slots | 1 s | Kennzeichnet den Slot der CTX-Zeile | Multi-Slot ohne `id` → kein Tag; Single-Slot → weggelassen | `context_slot_id_is_the_slot_api_id_not_the_array_position` (`src/llama.rs:1976`), `missing_slot_id_leaves_context_slot_id_unknown` (`:1991`), `llm_panel_without_slot_id_never_prints_a_fake_slot` (`src/ui.rs:3971`) |
-| **REQUEST prompt** | `/slots` busy Slots `n_prompt_tokens_processed`, **Fallback** `n_prompt_tokens` (`src/llama/slots.rs:75-78`); Strata `live.prompt_tokens` nur bei fehlendem Slot-Wert (`src/llama.rs:607-609`) | Summe über busy Slots, nur wenn **jeder** busy Slot den Wert liefert | 1 s | Prompt-Fortschritt der laufenden Anfrage(n) | Ein busy Slot ohne Wert → Summe `None` → `— tok`; kein busy → `—`. **Siehe F2:** ohne `n_prompt_tokens_processed` (neueres Strata; llama.cpp ohne diesen Namen) ist der gezeigte Wert die **KV-Belegung**, nicht der Prompt-Fortschritt | `request_totals_require_all_busy_slots_to_report` (`src/llama.rs:2560`), `request_totals_sum_complete_busy_slots_and_ignore_idle_gaps` (`:2590`), `strata_new_slots_report_direct_occupancy` (`:2228`, belegt den Fallback), `incomplete_request_totals_render_unavailable_not_zero` (`src/ui.rs:4160`) |
+| **REQUEST prompt** | `/slots` busy Slots `n_prompt_tokens_processed` (**kein** Fallback auf `n_prompt_tokens`, CFA-86); Strata `live.prompt_tokens` nur bei fehlendem Slot-Wert (`src/llama.rs:607-609`) | Summe über busy Slots, nur wenn **jeder** busy Slot den Wert liefert | 1 s | Prompt-Fortschritt bzw. (Strata) Promptlänge der laufenden Anfrage(n) | Ein busy Slot ohne Wert → Summe `None` → `— tok`; kein busy → `—`. Die KV-Belegung (`n_prompt_tokens`, CTX) wird nie als REQUEST-Wert gezeigt (F2 behoben) | `request_totals_require_all_busy_slots_to_report`, `request_totals_sum_complete_busy_slots_and_ignore_idle_gaps`, `strata_new_slots_report_direct_occupancy`, `llama_slot_without_processed_counter_keeps_request_prompt_unknown`, `sample_uses_strata_live_prompt_not_new_slots_occupancy_for_request`, `incomplete_request_totals_render_unavailable_not_zero` (`src/ui.rs`) |
 | **REQUEST generated** | `/slots` busy Slots `next_token[0].n_decoded` (`src/llama/slots.rs:79,314`); Strata `live.generated` (`src/strata.rs:261`) | Summe über busy Slots, nur vollständig | 1 s | Generierte Tokens der laufenden Anfrage(n) | Wie REQUEST prompt; Strata liefert nur bei `state` reading/generating | `request_totals_*` (oben), `sample_keeps_strata_context_occupancy_unknown_but_tracks_progress` (`src/llama.rs:1592`) |
 | **REQ active/deferred** | `/metrics` `requests_processing` / `requests_deferred` (`src/llama.rs:511,519`); Strata `live.queued` → `requests_deferred`, **kein** Active-Gauge (`src/strata.rs:121`) | Anzeige `active/deferred` | 1 s | Aktive bzw. wartende Anfragen | Nur wenn **beide** vorhanden → sonst `—`; bei Strata daher **immer** `—` (`src/ui/llm.rs:177-180`) | `absent_metrics_render_as_unavailable_not_zero` (`src/ui.rs:4137`) |
 | **LIVE PP** | Slot-Counter-Delta (`src/llama/slots.rs:190`) sonst `/metrics` `prompt_total`-Delta über Sekunden (`src/llama.rs:729`); Strata: **kein** Instantwert | Δprompt / Δt; Slot-Delta bevorzugt (`choose_live_throughput`, `src/llama/slots.rs:294`) | 1 s | Momentane Prefill-Rate tok/s | Kein verwertbares Delta (erste Probe, Reset, Lücke, Counter fehlt) → `None` → `— tok/s`; Strata erzwingt `None` (kein Instant-Prefill) | `derives_live_throughput_from_matching_slot_task` (`src/llama.rs:1802`), `new_slot_task_does_not_create_false_live_spike` (`:1822`), `slot_delta_tps_counter_decrease_is_unavailable` (`:2426`), `reappearing_prompt_counter_does_not_spike` (`:2482`) |
@@ -212,7 +222,7 @@ LLM-Untergrenze ist 250 ms — `src/domain.rs:21`, angewandt in
 | Wire-Format | Text-Prometheus (`parse_prometheus`, `src/llama.rs:908`) | JSON-Objekt, erkannt über `totals` + Marker (`is_strata_metrics`, `src/strata.rs:162`) |
 | CTX-Belegung | `/slots` `n_prompt_tokens` | Alt (0.1.40): kein `n_prompt_tokens` → `None`/`—`; Neu: direktes `n_prompt_tokens` (`src/llama.rs:2208,2228`) |
 | CTX-Kapazität | `/props` `n_ctx` | Fallback `engine.max_context` (`src/strata.rs:218`) |
-| REQUEST prompt | `n_prompt_tokens_processed`; führt der Server den Namen nicht, **Fallback auf `n_prompt_tokens`** (KV-Belegung — siehe F2, `src/llama/slots.rs:75-78`) | Slot-Wert, sonst `live.prompt_tokens`; **neueres Strata** (nur `n_prompt_tokens`) → REQUEST PP = KV-Belegung (F2) |
+| REQUEST prompt | nur `n_prompt_tokens_processed`; führt der Server den Namen nicht → `—` (kein Fallback auf die KV-Belegung, CFA-86) | Slot-Wert, sonst `live.prompt_tokens` (nur bei `reading`/`generating`); `n_prompt_tokens` bleibt reine CTX-Belegung |
 | LIVE TG | Counter-Delta bzw. Slot-Delta | `live.tok_s` (Fensterrate), nur bei `state=generating`; Counter-Totals sind completion-batched (`src/llama.rs:592`) |
 | LIVE PP | Counter-Delta | nicht verfügbar (kein Instant-Prefill; `prefill_tok_s_mean` ist Mittel) → `—` (`src/llama.rs:599`) |
 | Phase | Heuristik | `live.state` autoritativ (idle/reading/generating), normalisiert (`src/strata.rs:242`) |

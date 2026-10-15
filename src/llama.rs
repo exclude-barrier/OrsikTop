@@ -1938,7 +1938,9 @@ mod tests {
         assert_eq!(stats.busy_slots, 2);
         assert_eq!(stats.context_used, Some(4000));
         assert_eq!(stats.context_size, 150000);
-        assert_eq!(stats.request_prompt_tokens, Some(6000));
+        // Occupancy only (no `n_prompt_tokens_processed`): the busy slots'
+        // request prompt progress is unknown, not the summed CTX figures.
+        assert_eq!(stats.request_prompt_tokens, None);
         assert_eq!(stats.context_slot_id, Some(1));
     }
 
@@ -2235,12 +2237,82 @@ mod tests {
         };
         let slots: Value =
             serde_json::from_str(include_str!("../tests/fixtures/slots_strata_new.json")).unwrap();
-        apply_slots_json(&mut stats, &slots).unwrap();
+        let counters = apply_slots_json(&mut stats, &slots).unwrap();
         assert_eq!(stats.context_used, Some(113274));
         assert_eq!(stats.context_slot_id, Some(0));
         assert_eq!(stats.slot_overview[0].context_used, Some(113274));
-        // The same field (as prompt_processed) feeds the busy REQUEST row.
-        assert_eq!(stats.request_prompt_tokens, Some(113274));
+        // The slot is busy but reports no `n_prompt_tokens_processed`: request
+        // prompt progress is unknown. The CTX occupancy must not be reused as
+        // REQUEST progress (CFA-86), neither for the row nor for the per-slot
+        // prefill delta.
+        assert_eq!(stats.busy_slots, 1);
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(counters[0].prompt_processed, None);
+    }
+
+    #[test]
+    fn llama_slot_without_processed_counter_keeps_request_prompt_unknown() {
+        // A llama.cpp-shaped busy slot that reports occupancy and decode
+        // progress but no `n_prompt_tokens_processed`: CTX stays the direct
+        // occupancy, REQUEST prompt stays unknown, REQUEST generated is real.
+        let mut stats = LlmStats::default();
+        let slots = json!([{
+            "id": 0,
+            "id_task": 7,
+            "n_ctx": 8192,
+            "is_processing": true,
+            "n_prompt_tokens": 3000,
+            "next_token": [{"n_decoded": 40}]
+        }]);
+        let counters = apply_slots_json(&mut stats, &slots).unwrap();
+        assert_eq!(stats.context_used, Some(3000));
+        assert_eq!(stats.request_prompt_tokens, None);
+        assert_eq!(stats.request_generated_tokens, Some(40));
+        assert_eq!(counters[0].prompt_processed, None);
+        assert_eq!(counters[0].decoded, Some(40));
+
+        // A growing occupancy across two samples is not prefill progress: the
+        // slot path abstains for the prompt dimension instead of deriving a
+        // rate from CTX.
+        let mut next = LlmStats::default();
+        let later = json!([{
+            "id": 0,
+            "id_task": 7,
+            "n_ctx": 8192,
+            "is_processing": true,
+            "n_prompt_tokens": 3500,
+            "next_token": [{"n_decoded": 60}]
+        }]);
+        let later_counters = apply_slots_json(&mut next, &later).unwrap();
+        let (prompt_tps, generation_tps) = slot_delta_tps(&counters, &later_counters, 1.0);
+        assert_eq!(prompt_tps, None);
+        assert_eq!(generation_tps, Some(20.0));
+    }
+
+    #[test]
+    fn sample_uses_strata_live_prompt_not_new_slots_occupancy_for_request() {
+        // Newer Strata: /slots carries only the occupancy (`n_prompt_tokens`),
+        // /metrics `live` carries the active request's prompt length. REQUEST
+        // prompt must come from the request field, CTX from the occupancy —
+        // the two must never collapse into the same figure.
+        let backend = spawn_backend(|path, _n| {
+            let body = if path.contains("/props") {
+                r#"{"total_slots":1,"model_alias":"strata-model"}"#.to_string()
+            } else if path.contains("/slots") {
+                include_str!("../tests/fixtures/slots_strata_new.json").to_string()
+            } else if path.contains("/metrics") {
+                r#"{"engine":{"max_context":196608},"live":{"state":"reading","prompt_tokens":2048,"generated":0},"requests_kept":1,"totals":{"since":1.0,"prompt_tokens":5,"output_tokens":5,"prompt_ms":1000.0,"decode_ms":1000.0}}"#.to_string()
+            } else {
+                "{}".to_string()
+            };
+            (200, "application/json", body)
+        });
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        let stats = monitor.sample();
+        assert!(stats.connected && stats.metrics_available);
+        assert_eq!(stats.context_used, Some(113274));
+        assert_eq!(stats.request_prompt_tokens, Some(2048));
+        assert_eq!(stats.request_generated_tokens, Some(0));
     }
 
     #[test]

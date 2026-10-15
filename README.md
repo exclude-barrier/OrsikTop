@@ -98,10 +98,12 @@ reported figure, not an exact physical KV-cache measurement). Strata 0.1.40
 predates that field and reports
 only `id`, `n_ctx` and `is_processing`, so its CTX `used` stays `—` against the
 configured capacity rather than being inferred from prompt or generated counts
-(an upstream API limitation, fixed in newer Strata). On such a version the
-active request's prompt length and generated-token progress appear in the
-REQUEST row instead, taken from the already-fetched `/metrics` `live` fields —
-never presented as KV occupancy.
+(an upstream API limitation, fixed in newer Strata). On every Strata version
+the active request's prompt length and generated-token progress appear in the
+REQUEST row, taken from the already-fetched `/metrics` `live` fields. The
+slot's `n_prompt_tokens` is context occupancy only and is never shown as
+REQUEST progress; without an explicit `n_prompt_tokens_processed` counter (or
+Strata `live` field) REQUEST prompt stays `—`.
 
 ### GPU
 

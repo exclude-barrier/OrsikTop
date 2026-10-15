@@ -15,7 +15,8 @@ use super::{LlmSlotInfo, LlmStats, SlotCounter};
 /// processing progress as if it were KV occupancy. A present `n_prompt_tokens`
 /// is authoritative, **including a real `0`**; an absent one leaves occupancy
 /// unknown (`None`), never a fabricated zero. The progress counters are still
-/// collected for the REQUEST row and live throughput.
+/// collected for the REQUEST row and live throughput; conversely
+/// `n_prompt_tokens` is never used as request progress.
 pub(super) fn apply_slots_json(
     stats: &mut LlmStats,
     value: &Value,
@@ -75,10 +76,16 @@ pub(super) fn apply_slots_json(
         }
 
         let prompt_tokens = slot.get("n_prompt_tokens").and_then(Value::as_u64);
+        // Request prompt progress comes only from the explicit
+        // `n_prompt_tokens_processed` counter. `n_prompt_tokens` is the slot's
+        // context occupancy (CTX) — newer Strata reports only that field and
+        // keeps it after a request ends — so it must never stand in for
+        // progress: the REQUEST row and the per-slot prefill delta would then
+        // repeat the CTX figure. A slot without the counter leaves progress
+        // unknown (`None`, rendered `—`).
         let prompt_processed = slot
             .get("n_prompt_tokens_processed")
-            .and_then(Value::as_u64)
-            .or(prompt_tokens);
+            .and_then(Value::as_u64);
         let decoded = slot_decoded_tokens_opt(slot);
 
         if is_processing {
