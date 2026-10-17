@@ -37,7 +37,7 @@ Live environments (both non-root, kernel `7.2.5-omarchy`):
 
 - **Dev box** — Intel Core Ultra 9 288V (hybrid P+E), Intel Arc iGPU (xe driver,
   `0000:00:02.0`). No NVIDIA/AMD hardware.
-- **cf-desktop** — Intel Core i9-12900K (8P+8E/24T), Intel iGPU (i915,
+- **test-desktop** — Intel Core i9-12900K (8P+8E/24T), Intel iGPU (i915,
   `0000:00:02.0`), NVIDIA GeForce RTX 4090 (`0000:01:00.0`), a local
   `llama serve` (b10909, `--parallel 2`). Captured 2026-09-18 (S24).
 
@@ -51,7 +51,7 @@ The five roadmap priorities in roadmap order; the hardware name is bold.
 | 1 | **AMD Radeon** (amdgpu dGPU) | fixture-tested | **Open** | `src/providers/amd.rs`: `gpu_busy_percent`, `mem_info_vram_total`/`_used`, `product_name`; hwmon temperature, sclk/mclk, power, fan RPM | `samples_amd_dgpu_full_sensor_set` (`src/providers/amd.rs:292`), `degrades_gracefully_when_hwmon_is_absent` (`:322`), `product_name_overrides_card_name_and_missing_vram_is_none` (`:347`), `hwmon_is_matched_by_bdf_component` (`:439`), `malformed_sysfs_values_degrade_to_none_not_fakes` (`:462`) | — (no AMD GPU on either box) | any amdgpu dGPU |
 | 2 | **Intel i915 / Arc dGPU** | fixture-tested | **Open** (only the *xe iGPU* branch is live) | `src/providers/intel.rs`: i915 root-GT `rps_cur_freq_mhz` + `throttle_reason_*` (card dir, then `gt/gt0` fallback); dGfx hwmon `temp1_input` + `power1_max` (PL1) | `samples_i915_from_card_directory` (`src/providers/intel.rs:471`), `i915_reads_clock_and_reasons_from_gt_gt0_fallback` (`:502`), `missing_throttle_source_is_unavailable_not_none` (`:484`), `samples_xe_dgpu_with_hwmon` (`:373`), `pl1_limit_of_zero_is_treated_as_unavailable` (`:564`) | xe iGPU only (dev box, `intel_real_system_smoke`); i915 and Arc dGfx **not** live | an i915 kernel (pre-Xe host) or an Intel Arc dGPU |
 | 3 | **AMD Ryzen/EPYC CPU sensors** | fixture-tested | **Open** | `src/cpu.rs` vendor-neutral identity; `src/cpu_sensors.rs` hwmon walker accepts the AMD driver names `k10temp` and `zenpower` (out-of-tree) plus the generic `x86_pkg` package-temp name (`is_cpu_thermal_driver`, `src/cpu_sensors.rs:315`) and the `Tctl` package label (`is_package_label`, `:325`); no hybrid-PMU files → `cpu_capacity` fallback | `temperature_reads_an_amd_k10temp_tctl_sensor` (`src/cpu_sensors.rs:470`), `temperature_reads_a_zenpower_package_sensor` (`src/cpu_sensors.rs:494`), `parses_amd_identity` (`src/cpu.rs:516`) | — (both boxes are Intel) | an AMD Ryzen or EPYC host |
-| 4 | **NVIDIA Multi-GPU** | partially live | **Partially confirmed** | `src/discovery.rs` enumerates every display-class PCI GPU, sorted by BDF; `src/gpu.rs` `resolve_discovered` / `GpuSelector::Index(n)`; `src/gpu_map.rs` `Multi` mapping state | `discovers_intel_xe_igpu_and_amd_dgpu_sorted_by_bdf` (`src/discovery.rs:299`), `index_selects_the_nth_nvidia_on_igpu_dgpu_machines` (`src/gpu.rs:285`), `multi_gpu_when_process_opens_two_render_nodes` (`src/gpu_map.rs:460`) | cf-desktop **iGPU + one NVIDIA** (both enumerated, BDF-sorted, `Auto`→NVIDIA) | a second NVIDIA GPU (2× NVIDIA index selection) |
+| 4 | **NVIDIA Multi-GPU** | partially live | **Partially confirmed** | `src/discovery.rs` enumerates every display-class PCI GPU, sorted by BDF; `src/gpu.rs` `resolve_discovered` / `GpuSelector::Index(n)`; `src/gpu_map.rs` `Multi` mapping state | `discovers_intel_xe_igpu_and_amd_dgpu_sorted_by_bdf` (`src/discovery.rs:299`), `index_selects_the_nth_nvidia_on_igpu_dgpu_machines` (`src/gpu.rs:285`), `multi_gpu_when_process_opens_two_render_nodes` (`src/gpu_map.rs:460`) | test-desktop **iGPU + one NVIDIA** (both enumerated, BDF-sorted, `Auto`→NVIDIA) | a second NVIDIA GPU (2× NVIDIA index selection) |
 | 5 | **NVIDIA MIG** | fixture-tested | **Open** | `src/providers/nvidia.rs` MIG topology at construction; `src/domain.rs` `MIG-…` identity; `src/gpu_map.rs` `gpu_instance_id`/`compute_instance_id` attribution; `src/ui.rs` parent↔child chip | `mig_child_key_prefers_driver_uuid` (`src/providers/nvidia.rs:653`) ff.; `mig_uuid_detection` (`src/domain.rs:672`); `attribute_mig_child_when_instance_evidence_matches` (`src/gpu_map.rs:617`); `gpu_in_mapping_matches_mig_parent_and_child` (`src/ui.rs:3753`) | — (no MIG-capable A100/H100) | an A100/H100-class MIG host |
 
 ## Evidence required per category (the open rows)
@@ -79,7 +79,7 @@ hardware, following the §4 procedure for that row and recorded as §5 requires.
 
 Two notes that keep the open rows honest:
 
-- **Intel iGPU on cf-desktop.** cf-desktop's iGPU *is* enumerated live (row 4
+- **Intel iGPU on test-desktop.** the test desktop's iGPU *is* enumerated live (row 4
   above, `discovery_real_system_smoke`), but the Intel *provider* sample is not:
   the operator helper's fixed allow-list exposes the CI gate list only and does
   **not** include the `#[ignore]`d `intel_real_system_smoke`, so no live provider
@@ -95,7 +95,7 @@ Two notes that keep the open rows honest:
 Every command below is a real OrsikTop entry point. The **CI/fixture** suite
 runs anywhere Rust builds; the **live smokes** are `#[ignore]`d and must be
 run explicitly on the target hardware. Per the project rules, CPU-intensive
-builds/tests run through the operator-managed cf-desktop helper
+builds/tests run through the operator-managed test-desktop helper
 (`pc-project cargo ...`), never as a local laptop workaround. That helper's
 allow-list covers the **CI/fixture** gates only; the `#[ignore]`d live smokes
 are *not* part of it, so the operator runs them directly on the target host.
@@ -244,12 +244,12 @@ stays `implemented`/`fixture-tested`.
 
 ### Confirmed support (live-verified)
 
-- **NVIDIA discrete GPU** — RTX 4090 on cf-desktop under active inference
+- **NVIDIA discrete GPU** — RTX 4090 on test-desktop under active inference
   (util, VRAM, power, temperature, fan, PCIe link), cross-checked against a
   same-moment `nvidia-smi`.
 - **Intel integrated GPU (xe, iGPU/APU)** — xe iGPU on the dev box (discovery,
   live clock, throttle reason; temp/power `None` by design).
-- **NVIDIA Multi-GPU discovery** — cf-desktop i915 iGPU + one NVIDIA 4090: both
+- **NVIDIA Multi-GPU discovery** — test-desktop i915 iGPU + one NVIDIA 4090: both
   enumerated and BDF-sorted; `Auto` resolves to the NVIDIA. *(Index selection
   across 2+ NVIDIA remains open — see below.)*
 - **DRM/sysfs discovery and per-process fdinfo** — dev box.

@@ -2,7 +2,7 @@
 
 **Ticket:** CFA-33 (EPIC 2.1, CFA-27)
 **Verifizierter Stand:** Branch `feature/cfa27-integration`, HEAD `2e0d37f`
-**Testnachweis:** `pc-project cargo test --all-targets --locked` auf `cf-desktop`,
+**Testnachweis:** `pc-project cargo test --all-targets --locked` auf `test-desktop`,
 `468 passed / 0 failed / 3 ignored`, Exitcode 0, `source_unchanged: true`.
 Belegt durch zwei Läufe am gleichen Quellstand:
 

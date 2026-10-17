@@ -10,7 +10,7 @@ All notable changes to OrsikTop will be documented here.
   limits. Moved installation, usage/telemetry and development references into
   dedicated guides under `docs/`, replaced outdated version-output examples,
   and refreshed dashboard/server-selector screenshots from live Qwen3.8-27B
-  inference on cf-desktop's RTX 4090. No runtime behavior changed.
+  inference on the test desktop's RTX 4090. No runtime behavior changed.
 - Use a fixed Apache-2.0 README badge linked to `LICENSE` rather than a
   dynamic GitHub-license lookup, avoiding transient lookup errors in the badge.
 - Redact the internal tailnet address, user home paths and operator artifact
@@ -580,7 +580,7 @@ All notable changes to OrsikTop will be documented here.
   <identity>` entry naming the mapped device by PCI BDF or vendor UUID.
   A GPU without a stable identity, or an unresolved mapping, never shows
   the marker — no fake attribution; on a multi-GPU mapping the LLM panel
-  names the first mapped device. Verified live on cf-desktop (RTX 4090,
+  names the first mapped device. Verified live on test-desktop (RTX 4090,
   S24): the marker and the identity line agree with `orsiktop diag`.
 
 - NVIDIA MIG awareness (S17). MIG-capable systems are now understood end to

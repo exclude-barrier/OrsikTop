@@ -115,7 +115,7 @@ dadurch nicht flaken. Die Zahlen sind eine maschinenspezifische Referenz.
 
 | Feld | Wert | Quelle |
 | --- | --- | --- |
-| Host | `cf-desktop` | `result.json` / `worker-info` |
+| Host | `test-desktop` | `result.json` / `worker-info` |
 | CPU | 12th Gen Intel(R) Core(TM) i9-12900K, 24 logische CPUs | `ORSKTOP_BENCH\|host_cpu_model`, `host_logical_cpus` |
 | RAM | 65 555 880 kB (≈ 62,5 GiB) | `ORSKTOP_BENCH\|host_mem_total_kb` |
 | Kernel | `7.2.5-3-omarchy` | `ORSKTOP_BENCH\|host_kernel` |
@@ -331,7 +331,7 @@ Alle Zeit- und CPU-Werte sind **Debug-Profil-Werte** (`test`, unoptimized +
 debuginfo), **nicht** die Release-Binary (siehe Testbedingungen). Angegeben ist
 die über **vier** Läufe beobachtete Spanne.
 
-| Metrik | Baseline (cf-desktop, Debug-Profil) | Art |
+| Metrik | Baseline (test-desktop, Debug-Profil) | Art |
 | --- | --- | --- |
 | Idle-Redraws | 4 /s | **Modell** |
 | Redraws bei 100 ms | 10 /s | **Modell** |
@@ -381,7 +381,7 @@ Abnahmekriterien pauschal als erfüllt zu melden (F4):
   idle-CPU-Prozentsätze sind daher nur für das Debug-Profil gültig und **nicht**
   auf die Release-Binary übertragbar. Eine Release-Messung benötigt den
   operator-freigegebenen Runner (s. o.).
-- Nur **eine** Hardware (cf-desktop, i9-12900K); die Zahlen sind
+- Nur **eine** Hardware (test-desktop, i9-12900K); die Zahlen sind
   maschinenspezifisch.
 - Transport ist **localhost-Mock**, nicht ein realer Netzwerk-Server.
 - `BENCH_CLK_TCK = 100` wird angenommen (Linux-Standard), nicht geprobt.
@@ -393,7 +393,7 @@ Abnahmekriterien pauschal als erfüllt zu melden (F4):
 Geändert wurde ausschließlich Testcode in `src/app.rs` (zwei Benchmark-Tests +
 Helfer, nur `mod tests`) sowie diese neue Dokumentation. Keine Produktionslogik,
 keine Konfiguration, `src/strata.rs` unverändert. Die Messungen liefen
-ausschließlich über das freigegebene cf-desktop-Gate (`pc-project cargo test`),
+ausschließlich über das freigegebene test-desktop-Gate (`pc-project cargo test`),
 mit Host, Toolchain, Snapshot-Hash, Exitcode und Rohlog belegt.
 
 ## CFA-36 — Prozesskollektor: DRM-fd-Scan optimiert (Vorher/Nachher)
@@ -401,7 +401,7 @@ mit Host, Toolchain, Snapshot-Hash, Exitcode und Rohlog belegt.
 Dieser Abschnitt gehört zu **CFA-36** (EPIC 3.2 „Nur bestätigte Engpässe
 optimieren“). Er baut auf dem `#[ignore]`-Benchmark aus CFA-35 auf, der seit der
 operator-freigegebenen Runner-Verdrahtung im Gate ausführbar ist. **Alle Werte
-sind Debug-Testprofil-Werte** (`test`, unoptimized + debuginfo) auf `cf-desktop`,
+sind Debug-Testprofil-Werte** (`test`, unoptimized + debuginfo) auf `test-desktop`,
 gemessen über das Gate
 `pc-project cargo test --all-targets --locked -- --ignored --test-threads=1 perf_baseline_soak_and_process_collection_benchmark`.
 
@@ -480,7 +480,7 @@ Ergebnis: ein **reproduzierbarer Gewinn von ~10 %** auf dem dominierenden
 Bauteil (`process_collect_mean_us` und `process_drm_scan_total_us`) bei
 **unveränderter Telemetrie** und ohne zusätzliche Syscalls.
 
-Rohbelege der sechs Läufe (cf-desktop-Gate, je `source_unchanged: true`,
+Rohbelege der sechs Läufe (test-desktop-Gate, je `source_unchanged: true`,
 `exit 0`), Vorher → Nachher je Paar:
 `0066affd853547a1a92f35c368716149` → `6b43566779524dfc83a30795e3009d25`,
 `2244e523898d442985c4def8909ec28f` → `0910bec9e2514b22887f35b0d966e7ef`,
@@ -594,10 +594,10 @@ cargo test --release --all-targets --locked -- --ignored --test-threads=1 \
 
 | Feld | Wert | Quelle |
 | --- | --- | --- |
-| Host | `cf-laptop` | `hostname` (Runner) |
+| Host | `test-laptop` | `hostname` (Runner) |
 | CPU | Intel(R) Core(TM) Ultra 9 288V, **8 logische CPUs** (kein SMT) | `/proc/cpuinfo`, `lscpu` |
 | RAM | 32 319 768 kB (≈ 30,8 GiB) | `host_mem_total_kb` |
-| Kernel | `7.2.5-3-omarchy` (`Linux cf-laptop … x86_64 GNU/Linux`) | `uname -a` |
+| Kernel | `7.2.5-3-omarchy` (`Linux test-laptop … x86_64 GNU/Linux`) | `uname -a` |
 | Toolchain | `rustc 1.100.0-nightly (feaadeeac 2026-09-19)`, `cargo 1.100.0-nightly` | `rustc -V` / `cargo -V` |
 | CPU-Frequenz-Governor | `powersave`; EPP `performance`; Netzbetrieb (`ac_online=1`) | Runner |
 | Quellstand | HEAD `536e424`, `git_dirty=false` | Runner |
@@ -792,7 +792,7 @@ ORSKTOP_RELEASE_BENCH|idle_no_mock#0|shutdown_ms=220.154
 - **GPU-Rechnerkosten** (NVML/DRM) sind Teil des Fast-Workers, aber nicht
   getrennt von der `refresh_ms`-Kadenz isoliert.
 - **Ruhe-Baseline ohne Fremdlast** fehlt (dieser Lauf war lastbehaftet).
-- Nur **eine** Maschine (cf-laptop, Core Ultra 9 288V); die Werte sind
+- Nur **eine** Maschine (test-laptop, Core Ultra 9 288V); die Werte sind
   maschinenspezifisch. Transport ist **Loopback**, kein reales Netz.
 
 ## CFA-93 — Messbasierte Optimierung: Entscheid (mit Zahlen)
