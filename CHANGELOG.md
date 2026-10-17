@@ -21,8 +21,10 @@ All notable changes to OrsikTop will be documented here.
   the redundant `homepage` manifest key that produced a Cargo warning.
 - Harden release automation: default token permissions are read-only, write
   access is scoped to tag/release jobs, and the cargo-dist installer no longer
-  receives `GH_TOKEN`. Repository settings require SHA-pinned actions and
-  protect `v*` tags from deletion or force-updates.
+  receives `GH_TOKEN`. The automatic `Release v…` path on `main` was removed;
+  releases now require an explicitly pushed `v*` tag. Repository settings
+  require SHA-pinned actions and protect `v*` tags from deletion or
+  force-updates.
 
 ## [0.4.0] - 2026-10-13
 

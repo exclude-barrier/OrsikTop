@@ -15,13 +15,12 @@ on:
     branches:
       - main
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      # Releases are published only from manually pushed version tags.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   prepare:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       tag-flag: ${{ steps.release.outputs.tag-flag }}
@@ -39,7 +38,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           echo "tag=" >> "$GITHUB_OUTPUT"
           echo "tag-flag=" >> "$GITHUB_OUTPUT"
@@ -56,41 +54,9 @@ jobs:
             exit 0
           fi
 
-          if [[ "$REF_NAME" != "main" || "$COMMIT_MESSAGE" != Release\ v* ]]; then
-            exit 0
-          fi
-
-          version=$(awk '
-            /^\[package\]$/ { in_package=1; next }
-            /^\[/ && in_package { exit }
-            in_package && /^version = / {
-              gsub(/version = |"/, "")
-              print
-              exit
-            }
-          ' Cargo.toml)
-
-          if [[ -z "$version" ]]; then
-            echo "Could not determine package version from Cargo.toml" >&2
-            exit 1
-          fi
-
-          tag="v$version"
-          echo "Preparing $tag from $GITHUB_SHA"
-
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists; refusing to recreate it." >&2
-            exit 1
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" "$GITHUB_SHA" -m "OrsikTop $tag"
-          git push origin "$tag"
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "tag-flag=--tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "publishing=true" >> "$GITHUB_OUTPUT"
+          # A push to main never publishes. Releases are created only by
+          # pushing a version tag manually; the tag run above sets publishing.
+          exit 0
 
   plan:
     needs: [prepare]
