@@ -6,8 +6,44 @@ All notable changes to OrsikTop will be documented here.
 
 ## [0.4.1] - 2026-10-17
 
+### Added
+
+- **Additional LLM servers in Settings.** Add, edit and remove extra endpoints
+  in the TUI, with duplicate detection, save/cancel and live adoption without a
+  restart. Up to 16 servers are monitored; extra endpoints are retained and
+  marked *not monitored*. Labels and draft input are redacted.
+- **Multi-server soak harness and runtime-risk analysis.** Opt-in tests cover
+  concurrent polling, server churn and failure modes.
+- **Release-binary benchmark.** Reproducible benchmark and optimization
+  decision records for release builds.
+- **Width regression tests.** Wide/CJK characters, combining marks and narrow
+  layouts are pinned by TestBackend tests.
+
+### Fixed
+
+- **REQUEST prompt no longer falls back to context occupancy.** Only real
+  prompt progress (`n_prompt_tokens_processed`, or Strata `live` fields) is
+  shown; otherwise it stays `—`.
+- **No fabricated CACHE percentage.** The absolute cached-token counter stays;
+  the ratio cell is `—` because no supported backend guarantees that cached
+  tokens are a subset of prompt tokens.
+- **Activity phase is not guessed.** `IDLE` requires positive evidence; a
+  connected server without evidence shows `UNKNOWN`, while offline or
+  never-answered servers show `—`.
+- **Held samples are marked `STALE`** during the offline grace window and their
+  rates are not shown as live.
+- **Settings preview redacts credentials.** Userinfo, path and query values are
+  masked; stored endpoints keep their values unchanged.
+- **Scheme-less endpoints save again.** Changing an endpoint without a port no
+  longer collapses `8080` to `80`.
+- **Table cells use terminal columns.** Wide/CJK characters and combining marks
+  no longer shift or split cells in the process list, system panel, server
+  selector or settings dialog.
+
 ### Changed
 
+- **Security dependency updates:** `rustls` 0.23.46 (RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349) and `serde_json` 1.0.154.
 - Rebuilt the README around quick start, everyday use and explicit compatibility
   limits. Moved installation, usage/telemetry and development references into
   dedicated guides under `docs/`, replaced outdated version-output examples,
