@@ -8,9 +8,11 @@ worker shutdown, panic handling and the thread count under 16 servers.
 - **Analysed at:** commit `ac424d5` (the CFA-94 soak harness commit on
   `test/cfa-94-95-soak-and-runtime-risks`); this ticket's change then adds the
   single F1 test below.
-- **Scope:** analysis and behaviour-pinning tests only. No `app.rs` runtime
-  logic was changed — the harness commit adds a `#[cfg(test)] mod soak;` line
-  and test code only.
+- **Update 2026-10-17:** F1 was fixed in the worker-health change. The analysis
+  below is kept as the original baseline; F1 documents the new behaviour.
+- **Scope:** the original review changed no `app.rs` runtime logic. The
+  worker-health follow-up now implements F1; the rest of this document remains
+  the historical read-only analysis.
 - **Method:** static reading of `src/app.rs`, `src/llama.rs` and `src/domain.rs`
   plus the existing worker tests; line numbers are from the tree above. The one
   dynamic measurement quoted (F5, F6) is the raw output of the CFA-94 long soak
@@ -29,30 +31,26 @@ Severities: **high** = wrong/no data with no user signal and no recovery;
 
 ---
 
-## F1 — Worker panics are swallowed: no hook, no restart, no indication (medium–high)
+## F1 — Worker panics are surfaced on disconnect and at shutdown (resolved)
 
 **Evidence**
-- `src/app.rs:544-563` — `join_bounded` waits for a worker to end and calls
-  `let _ = handle.join();` (`:547`). The `Result` (the panic payload) is
-  discarded, and a worker that misses the 5 s deadline (`:550`) is left
-  detached.
-- No `std::panic::catch_unwind` and no `panic::set_hook` exist anywhere under
-  `src/` (verified by search).
-- The UI loop drains both channels with `while let Ok(next) = …` — fast at
-  `src/app.rs:221`, LLM at `:225`. `Err(Disconnected)` is never handled, and the
-  workers are never checked with `is_finished()`. So when a worker thread dies,
-  the receiver simply stops yielding and the loop keeps rendering the last
-  values.
+- `drain_try_recv` distinguishes `TryRecvError::Empty` from `Disconnected`.
+  `app::run` returns an error naming the stopped fast or LLM worker instead of
+  continuing with stale data.
+- `join_bounded(handle, name, timeout)` preserves clean exit, panic, shutdown
+  timeout and watcher-disconnect outcomes; `app::run` joins both workers and
+  returns the first error.
+- Tests: `drain_try_recv_distinguishes_empty_from_disconnected`,
+  `join_bounded_reports_clean_exit`, `join_bounded_reports_panicked_worker`,
+  `join_bounded_reports_timeout`.
 
-**Effect:** if the fast or LLM worker panics, it dies silently. The dashboard
-keeps showing stale data indefinitely, with no error surfaced and no restart. A
-dead worker is indistinguishable from a healthy one that has nothing to update.
+**Effect:** a worker that panics or exits unexpectedly terminates the dashboard
+with a concrete error instead of leaving stale telemetry on screen. A wedged
+worker still times out after 5 s; shutdown does not wait indefinitely.
 
-**Recommended follow-up:** install a `panic::set_hook` (or wrap the worker body
-in `catch_unwind`) that marks the worker as failed and surfaces it; have the UI
-loop check `JoinHandle::is_finished()` and either restart the worker or show a
-persistent "monitor worker stopped" state. Do **not** treat "no samples" as
-health.
+**Remaining limit:** there is no automatic restart or persistent in-TUI health
+banner. `run` returns the error to the caller. That is the next reliability step
+if automatic recovery is desired.
 
 ## F2 — LLM samples are silently dropped when the channel is full (low–medium)
 
@@ -187,7 +185,7 @@ would make the bound explicit if that ever changes.
 
 | Finding | Test (current line) |
 | --- | --- |
-| F1 (panic invisible to the join) | `runtime_risk_worker_panic_is_not_distinguishable_from_a_clean_exit` (`src/app.rs:4803`) — **added by this ticket** |
+| F1 (worker panic/disconnect) | `drain_try_recv_distinguishes_empty_from_disconnected`, `join_bounded_reports_clean_exit`, `join_bounded_reports_panicked_worker`, `join_bounded_reports_timeout` |
 | F2 (full channel drops) | `soak_smoke_16_servers_shutdown_with_undrained_channel` (`src/app/tests/soak.rs`) |
 | F4 (slow server, independent delivery) | `a_slow_server_does_not_delay_a_healthy_servers_delivery` (`src/app.rs:3046`), `an_unreachable_server_does_not_block_a_healthy_one` (`:2923`) |
 | F5 (thread ceiling, churn) | `soak_long_16_servers` (`src/app/tests/soak.rs`, `#[ignore]`), `soak_many_set_servers_rounds_bound_resources_single_threaded` (`src/app.rs:4717`, `#[ignore]`) |
@@ -198,8 +196,8 @@ would make the bound explicit if that ever changes.
 
 ## Gaps left deliberately open (no runtime fix in this ticket)
 
-- **F1 in the real worker:** only the join helper is pinned; forcing the live
-  worker to panic needs an injectable failure point (a runtime change).
+- **F1 recovery:** failures are visible, but there is no automatic worker
+  restart or persistent in-TUI banner; `app::run` returns the error.
 - **F5 ceiling on a real host:** the thread peak is measured under the soak's
   loopback mocks, not under NVML/driver threads; a production measurement is a
   test-desktop load run, outside REL-02.

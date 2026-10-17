@@ -4,6 +4,13 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worker failures are visible.** The dashboard now distinguishes an empty
+  queue from a disconnected fast or LLM worker and returns a concrete error
+  instead of continuing with stale telemetry. Bounded shutdown preserves panic,
+  timeout and watcher-disconnect outcomes.
+
 ## [0.4.1] - 2026-10-17
 
 ### Added
