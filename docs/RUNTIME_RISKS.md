@@ -202,7 +202,7 @@ would make the bound explicit if that ever changes.
   worker to panic needs an injectable failure point (a runtime change).
 - **F5 ceiling on a real host:** the thread peak is measured under the soak's
   loopback mocks, not under NVML/driver threads; a production measurement is a
-  cf-desktop load run, outside REL-02.
+  test-desktop load run, outside REL-02.
 - **F6 hard-kill:** there is no way to force a worker to overrun the 5 s
   deadline without injecting a wedged call.
 

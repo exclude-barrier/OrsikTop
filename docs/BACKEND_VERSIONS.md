@@ -299,7 +299,7 @@ In-Process-Fake-Server: `sample_reads_strata_json_metrics_end_to_end`
 **Live-Evidenz:**
 
 - llama.cpp `--parallel 2`, Build **b10909**: remote über Tailscale und lokal
-  auf cf-desktop (S24) — SLOTS 1/2, CTX/MTP(`MTP3`)/Spec-Counter, Live-TPS
+  auf test-desktop (S24) — SLOTS 1/2, CTX/MTP(`MTP3`)/Spec-Counter, Live-TPS
   (`docs/HARDWARE_SUPPORT.md`, Multi-Slot-Zeile; `docs/LIVE_VS_FIXTURE.md`).
 - Strata Build **`0.1.40`**: `/metrics` live (Box **nicht** benannt,
   Commit-Text `0629648`) — Totals completion-batched, `live.tok_s` als

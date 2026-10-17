@@ -3696,7 +3696,7 @@ mod tests {
         }
 
         // Host / test conditions, read from inside the run: the sanctioned
-        // cf-desktop helper only reports host name, toolchain and GPU state, so
+        // test-desktop helper only reports host name, toolchain and GPU state, so
         // the CPU model, memory, kernel and CPU count are captured here.
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
             if let Some(model) = cpuinfo

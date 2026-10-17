@@ -9,7 +9,7 @@
 //! CTX-Regressionstests (`layout_regression_tests.rs`) wird nur
 //! angeschlossen (langer CJK-Modellname), nicht dupliziert.
 //!
-//! Eichung der Messbasis (cf-desktop, rustc 1.100.0-nightly feaadeeac
+//! Eichung der Messbasis (test-desktop, rustc 1.100.0-nightly feaadeeac
 //! 2026-09-19, ratatui 0.30.2 → ratatui-core 0.1.2 `Span::raw().width()` →
 //! `UnicodeWidthStr::width`, unicode-width 0.2.0), gemessen per
 //! eichendem Testlauf (Snapshot 4c7a72f5d4844e6eca269009b93655a71a74c3f6a56b92e43b34c6391aa6ac02):

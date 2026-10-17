@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn local_mtp_is_shown_when_the_server_only_reports_types_none() {
-        // Live shape on cf-desktop: /props carries only
+        // Live shape on test-desktop: /props carries only
         // `speculative.types: "none"`, the CLI is launched with draft-mtp/8.
         // The server did not name a type, so the CLI fills it in.
         let mut monitor = LlamaMonitor::new("http://127.0.0.1:8081").unwrap();

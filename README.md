@@ -10,7 +10,7 @@ OrsikTop brings **LLM inference, GPU telemetry, Linux system load and processes*
 
 ![OrsikTop dashboard during live Qwen3.8-27B inference on an NVIDIA GeForce RTX 4090](assets/orsiktop.png)
 
-*Live llama.cpp inference on `cf-desktop`: Qwen3.8-27B, RTX 4090 and local CPU/GPU telemetry. Sensor fields marked `—` are unavailable, not measured zeroes.*
+*Live llama.cpp inference on `test-desktop`: Qwen3.8-27B, RTX 4090 and local CPU/GPU telemetry. Sensor fields marked `—` are unavailable, not measured zeroes.*
 
 [Quick start](#quick-start) · [Everyday use](#everyday-use) · [Compatibility](#compatibility-and-limits) · [Documentation](#documentation)
 

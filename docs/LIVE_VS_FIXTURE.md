@@ -31,12 +31,12 @@ Environments (both non-root, kernel `7.2.5-omarchy`; see
 
 - **Dev box** — Intel Core Ultra 9 288V (hybrid P+E), Intel Arc iGPU
   (xe driver, PCI `0000:00:02.0`). No NVIDIA/AMD hardware.
-- **cf-desktop** — Intel Core i9-12900K (8P+8E), Intel iGPU (i915,
+- **test-desktop** — Intel Core i9-12900K (8P+8E), Intel iGPU (i915,
   `0000:00:02.0`), NVIDIA GeForce RTX 4090 (`0000:01:00.0`), a local
   `llama serve` (b10909, `--parallel 2`). Captured 2026-09-18 (S24).
 - One live backend run (Strata) names no box (commit text only).
 
-Baseline `main @ c06bded`, 467 tests green on cf-desktop; the one regression
+Baseline `main @ c06bded`, 467 tests green on test-desktop; the one regression
 test added by this document brings the suite to 468. Ignored-by-default
 live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 `intel_real_system_smoke` (`src/providers/intel.rs:581`),
@@ -46,9 +46,9 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 
 | Functional area | Live (real hardware / backend) | Fixture only | Unknown (neither) | Key evidence |
 | --- | --- | --- | --- | --- |
-| LLM telemetry — llama.cpp | Single-slot: a **remote** single-slot server observed from the dev box (`0 busy / 1 total`); multi-slot `--parallel 2`: remote b10909 over Tailscale + local cf-desktop (S24) | Prometheus/slots/props parsing, slot pairing, spec/MTP, counter reset; candidate ordering across **>1** server (tested, never observed live) | — | `tests/fixtures/*.prom`, `slots_*.json`, `props.json`; `src/llama.rs` tests |
+| LLM telemetry — llama.cpp | Single-slot: a **remote** single-slot server observed from the dev box (`0 busy / 1 total`); multi-slot `--parallel 2`: remote b10909 over Tailscale + local test-desktop (S24) | Prometheus/slots/props parsing, slot pairing, spec/MTP, counter reset; candidate ordering across **>1** server (tested, never observed live) | — | `tests/fixtures/*.prom`, `slots_*.json`, `props.json`; `src/llama.rs` tests |
 | LLM telemetry — Strata backend | `/metrics` against a real Strata build `0.1.40` (box not named) — totals completion-batched, `live.tok_s` windowed | Wire-format dispatch, phase normalization, old/new `/slots` schema (incl. the newer `n_prompt_tokens` shape: captured, not live-re-verified) | — | `src/strata.rs` tests; `tests/fixtures/slots_strata_{old,new}.json` |
-| GPU — NVIDIA discrete | RTX 4090 on cf-desktop, under active inference | Parsers, sanitizers, MIG topology; multi-NVIDIA index selection (`index_selects_the_nth_nvidia_on_igpu_dgpu_machines`, `src/gpu.rs:285`); UUID half of identity | — | `src/providers/nvidia.rs` tests |
+| GPU — NVIDIA discrete | RTX 4090 on test-desktop, under active inference | Parsers, sanitizers, MIG topology; multi-NVIDIA index selection (`index_selects_the_nth_nvidia_on_igpu_dgpu_machines`, `src/gpu.rs:285`); UUID half of identity | — | `src/providers/nvidia.rs` tests |
 | GPU — AMD (dGPU and APU) | — | Full amdgpu sysfs + hwmon shapes, carveout, malformed values | — | `src/providers/amd.rs` tests |
 | GPU — Intel xe (iGPU/APU) | xe iGPU on dev box (discovery, clock, throttle; temp/power `None`) | xe dGfx-hwmon + APU shapes (`samples_xe_dgpu_with_hwmon`, `xe_apu_without_hwmon_keeps_clock_and_reason`) | — | `intel_real_system_smoke`; `src/providers/intel.rs` tests |
 | GPU — Intel i915 / Arc dGPU | — | i915 root-GT and `gt/gt0` fallback, dGfx hwmon (`temp1_input`, PL1) | — | `src/providers/intel.rs::tests` |
@@ -56,8 +56,8 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 | CPU / sensors | Hybrid P+E topology, cpufreq, hwmon temperature, RAPL `None` under non-root (dev box) | LP-E class; conventional (all-P) Intel; **AMD CPU thermal sensors** (`k10temp`/`Tctl`); capacity fallback | — | `src/cpu.rs`, `src/cpu_sensors.rs` tests |
 | Multi-server | — (only a **single** server was ever auto-discovered; parallel polling/isolation/selector never observed live) | Concurrency, per-server isolation, selector rendering, diagnostics inventory | — | `src/app.rs`, `src/discovery_llm.rs`, `src/ui.rs`, `src/diagnostics.rs` tests |
 | TUI | Observed on both boxes (rendered against live data) | 116 `TestBackend` render/interaction tests | — | `src/ui.rs::tests` |
-| Discovery / DRM / GPU mapping / domain | DRM/sysfs discovery + per-process fdinfo on the dev box; BDF identity on both boxes; NVML compute-app mapping on cf-desktop | Parser/shape branches; multi-render-node attribution; render-fd mapping branch; `Multi` mapping state | — | `discovery_real_system_smoke`, `drm_real_system_smoke`; `src/discovery.rs`, `src/drm.rs`, `src/gpu_map.rs`, `src/domain.rs` tests |
-| Config / diagnostics / redaction | `orsiktop diag` on cf-desktop (`docs/HARDWARE_SUPPORT.md:55`, `:66`) and the dev box (`docs/S18_STAGE_SUMMARY.md:72`) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
+| Discovery / DRM / GPU mapping / domain | DRM/sysfs discovery + per-process fdinfo on the dev box; BDF identity on both boxes; NVML compute-app mapping on test-desktop | Parser/shape branches; multi-render-node attribution; render-fd mapping branch; `Multi` mapping state | — | `discovery_real_system_smoke`, `drm_real_system_smoke`; `src/discovery.rs`, `src/drm.rs`, `src/gpu_map.rs`, `src/domain.rs` tests |
+| Config / diagnostics / redaction | `orsiktop diag` on test-desktop (`docs/HARDWARE_SUPPORT.md:55`, `:66`) and the dev box (`docs/S18_STAGE_SUMMARY.md:72`) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
 
 ## Area detail
 
@@ -66,10 +66,10 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 - **Live.** A **single-slot** remote llama.cpp server was observed from the dev
   box (`docs/V0_2_6_NOTES.md`, "slots 0 busy / 1 total"). Multi-slot
   `--parallel 2` was verified against a remote server (build b10909) over
-  Tailscale and against the local cf-desktop server (S24): SLOTS 1/2, per-slot
+  Tailscale and against the local test-desktop server (S24): SLOTS 1/2, per-slot
   CTX `98,307/115,200`, MTP3, speculative counters (310,316 draft / 187,897
   accepted, 60.6%), aggregate live TPS, spec/MTP acceptance hold. The
-  cf-desktop server is `--parallel 2` (`docs/HARDWARE_SUPPORT.md:31`), so it is
+  test-desktop server is `--parallel 2` (`docs/HARDWARE_SUPPORT.md:31`), so it is
   **not** single-slot evidence. Recorded in `docs/HARDWARE_SUPPORT.md`
   (multi-slot row).
 - **Fixture.** Parsing and aggregation are pinned to checked-in bodies:
@@ -110,7 +110,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 
 ### GPU — NVIDIA discrete
 
-- **Live.** RTX 4090 on cf-desktop under active inference: 97% util,
+- **Live.** RTX 4090 on test-desktop under active inference: 97% util,
   VRAM 23.4/24.0 GiB, 369/450 W, 64 °C, fan 58%, cross-checked against a
   same-moment `nvidia-smi`. `docs/HARDWARE_SUPPORT.md` (NVIDIA row).
 - **Fixture.** `src/providers/nvidia.rs::tests` (`src/providers/nvidia.rs:536`):
@@ -186,7 +186,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 ### Multi-server
 
 - **Live.** **Capability not verified.** Only a **single** local llama.cpp
-  server was ever auto-discovered (cf-desktop S24: `LLM ENDPOINT
+  server was ever auto-discovered (test-desktop S24: `LLM ENDPOINT
   127.0.0.1:8081 ·auto`, `diag` candidate with PID attribution). Parallel
   polling of several servers, per-server isolation, and the multi-server
   selector have no live observation. Single-server discovery is live; that is
@@ -245,7 +245,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 - **Discovery / DRM / GPU mapping / domain.** Live: DRM/sysfs discovery and
   per-process fdinfo on the dev box (`discovery_real_system_smoke`,
   `drm_real_system_smoke`), BDF identity on both boxes, NVML compute-app
-  mapping on cf-desktop. Fixture: `src/discovery.rs::tests`
+  mapping on test-desktop. Fixture: `src/discovery.rs::tests`
   (`discovers_single_nvidia_card` at `:272`,
   `discovers_intel_xe_igpu_and_amd_dgpu_sorted_by_bdf` at `:299`),
   `src/drm.rs` (17 `#[test]`: 16 plus the ignored smoke at `:904`),
@@ -253,7 +253,7 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
   `render_fd_maps_process_to_single_gpu` at `:345`), `src/domain.rs::tests`.
   Multi-render-node attribution, the render-fd mapping branch, and the `Multi`
   mapping state are fixture-only.
-- **Config / diagnostics / redaction.** `orsiktop diag` is live on cf-desktop
+- **Config / diagnostics / redaction.** `orsiktop diag` is live on test-desktop
   (`docs/HARDWARE_SUPPORT.md:55`, `:66`) and the dev box
   (`docs/S18_STAGE_SUMMARY.md:72`). Rendering redaction and parsing are
   fixture-tested (`src/diagnostics.rs::tests` at `:666`,
