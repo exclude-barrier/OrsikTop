@@ -8,13 +8,18 @@ Repository files were read directly; server-side settings (branch protection,
 rulesets, code scanning, workflow token defaults) were read through the GitHub
 REST API with a read-only call. Line numbers refer to the baseline.
 
+> **Update 2026-10-17:** F1–F3 are resolved. Releases now publish only from
+> manually pushed version tags, the tag trigger is narrowed, and token
+> permissions are job-scoped. See [Applied hardening](#applied-hardening-2026-10-17).
+> The findings below describe the audited baseline.
+
 ## Summary
 
 | # | Area | Result | Risk |
 | --- | --- | --- | --- |
-| F1 | Auto-tag on `main` commits named `Release v…` publishes a release | finding | high |
-| F2 | Release tag trigger matches any tag containing `x.y.z` | finding | medium |
-| F3 | `contents: write` granted workflow-wide in `release.yml` | finding | low |
+| F1 | Auto-tag on `main` commits named `Release v…` publishes a release | resolved 2026-10-17 | — |
+| F2 | Release tag trigger matches any tag containing `x.y.z` | resolved 2026-10-17 | — |
+| F3 | `contents: write` granted workflow-wide in `release.yml` | resolved 2026-10-17 | — |
 | F4 | Branch protection on `main` | present, review count 0 | low |
 | F5 | Cargo audit in the required `rust` job | present | — |
 | F6 | CodeQL | present (default setup) | — |
@@ -135,3 +140,24 @@ For `pull_request`, `prepare` exits with `publishing=false` (`release.yml:44-46`
 This setting lets `dist` regenerate or ignore drift in the generated workflow
 files. Hardening applied by hand to `release.yml` (F1–F3) could be lost on the
 next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
+
+## Applied hardening (2026-10-17)
+
+- **F1 resolved.** The auto-tag path on `main` was removed. A push to `main`
+  only resolves `publishing=false`; releases are published only from an
+  explicitly pushed version tag.
+- **F2 resolved.** The tag trigger is narrowed to
+  `v[0-9]+.[0-9]+.[0-9]+*`. A tag ruleset protects `refs/tags/v*` against
+  deletion and non-fast-forward updates, with no bypass actor.
+- **F3 resolved.** The workflow default is `contents: read`. Write access is
+  scoped to `plan` and `host`; `prepare` no longer needs it.
+- The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
+  passed only to the `plan` step that invokes `dist host --steps=create`.
+- GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned
+  `dtolnay/rust-toolchain`, `Swatinem/rust-cache` and
+  `actions-rust-lang/audit`. SHA pinning is required repository-wide.
+- Still open: the cargo-dist installer itself is fetched with `curl | sh`
+  without checksum verification (it no longer receives a token), the
+  `announce` job is empty because no announcement target is configured, and
+  secret-scanning non-provider patterns/validity checks could not be enabled
+  on the current plan.
