@@ -77,10 +77,26 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # The installer runs without GH_TOKEN; the token is scoped to the plan step.
+      # Download the pinned archive, verify its published checksum, and use the
+      # binary directly. No installer script runs in this job.
       - name: Install dist
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-installer.sh | sh"
+        run: |
+          set -euo pipefail
+          version=0.33.0
+          base="https://github.com/axodotdev/cargo-dist/releases/download/v${version}"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          archive="$tmp/cargo-dist-x86_64-unknown-linux-gnu.tar.xz"
+          curl --proto '=https' --tlsv1.2 -LsSf -o "$archive" \
+            "${base}/cargo-dist-x86_64-unknown-linux-gnu.tar.xz"
+          curl --proto '=https' --tlsv1.2 -LsSf -o "${archive}.sha256" \
+            "${base}/cargo-dist-x86_64-unknown-linux-gnu.tar.xz.sha256"
+          (cd "$tmp" && sha256sum -c cargo-dist-x86_64-unknown-linux-gnu.tar.xz.sha256)
+          tar -xJf "$archive" -C "$tmp"
+          mkdir -p "$HOME/.cargo/bin"
+          install -m 755 "$tmp/cargo-dist-x86_64-unknown-linux-gnu/dist" "$HOME/.cargo/bin/dist"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
