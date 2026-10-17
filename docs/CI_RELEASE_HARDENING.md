@@ -131,9 +131,10 @@ has been recorded. The accurate claim is therefore *source-reproducible*
 
 ### F11 — PR runs never publish (positive)
 
-For `pull_request`, `prepare` exits with `publishing=false` (`release.yml:44-46`).
-`dist-workspace.toml` sets `pr-run-mode = "plan"`, so `build-local-artifacts`
-(`:140`) and the publish jobs are skipped.
+Pull requests no longer run `release.yml` at all. They run the separate
+`release-plan.yml`, which declares `contents: read`, passes no `GH_TOKEN` to
+`dist`, and executes only `dist plan`. The tag/main release workflow keeps
+`contents: write` solely on its publishing path (`plan` and `host`).
 
 ### F12 — `allow-dirty = ["ci"]`
 
@@ -155,6 +156,11 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   attestation were verified. Re-check this path after a `dist generate`.
 - **F3 resolved.** The workflow default is `contents: read`. Write access is
   scoped to `plan` and `host`; `prepare` no longer needs it.
+- **F3 follow-up (2026-10-17).** Pull-request release planning moved to
+  `release-plan.yml` with `contents: read` and no token passed to `dist`.
+  `release.yml` now runs only on `main` and tag pushes, so a PR never receives
+  the write scope needed to create a release. Re-check this split after
+  `dist generate`.
 - The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
   passed only to the `plan` step that invokes `dist host --steps=create`.
 - GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned
