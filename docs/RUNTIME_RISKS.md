@@ -8,11 +8,14 @@ worker shutdown, panic handling and the thread count under 16 servers.
 - **Analysed at:** commit `ac424d5` (the CFA-94 soak harness commit on
   `test/cfa-94-95-soak-and-runtime-risks`); this ticket's change then adds the
   single F1 test below.
-- **Update 2026-10-17:** F1 was fixed in the worker-health change. The analysis
-  below is kept as the original baseline; F1 documents the new behaviour.
+- **Update 2026-10-17:** F1 was fixed in the worker-health change; F2/F3 drop
+  counters and the footer warning followed in the snapshot-drop change. The
+  analysis below is kept as the original baseline; F1–F3 document the new
+  behaviour.
 - **Scope:** the original review changed no `app.rs` runtime logic. The
-  worker-health follow-up now implements F1; the rest of this document remains
-  the historical read-only analysis.
+  worker-health follow-up implements F1; the snapshot-drop follow-up implements
+  the F2/F3 counters. The rest of this document remains the historical
+  read-only analysis.
 - **Method:** static reading of `src/app.rs`, `src/llama.rs` and `src/domain.rs`
   plus the existing worker tests; line numbers are from the tree above. The one
   dynamic measurement quoted (F5, F6) is the raw output of the CFA-94 long soak
@@ -52,7 +55,7 @@ worker still times out after 5 s; shutdown does not wait indefinitely.
 banner. `run` returns the error to the caller. That is the next reliability step
 if automatic recovery is desired.
 
-## F2 — LLM samples are silently dropped when the channel is full (low–medium)
+## F2 — LLM samples dropped on a full channel are counted (low–medium, resolved)
 
 **Evidence**
 - `src/app.rs:159` — `sync_channel::<LlmSample>(MAX_MONITORED_SERVERS)`; the
@@ -65,17 +68,21 @@ if automatic recovery is desired.
 
 **Effect:** one poll cycle of 16 servers fills the channel exactly. If the app
 does not drain for a full cycle (e.g. blocked in a repaint or a slow `/proc`
-scan), the following cycle's samples are dropped entirely, silently and without
-a counter. `generation` does not help: a dropped sample leaves no trace.
+scan), the following cycle's samples are dropped entirely. `generation` does
+not help: a dropped sample leaves no gap marker.
 
-**Recommended follow-up:** add a dropped-sample counter (e.g. an `AtomicU64`
-bumped on `Full`) and, if it should never happen, surface it in `diag`/the
-footer; optionally give `LlmSample` a per-server sequence number so the app can
-detect gaps. The CFA-94 test
-`soak_smoke_16_servers_shutdown_with_undrained_channel` already pins the drop
+**Resolution:** both workers now increment an `AtomicU64` on
+`TrySendError::Full` through `try_send_snapshot`; the UI publishes the counters
+to `UiState` every loop iteration and the footer shows `DROPS fN lN` only when
+one is nonzero. A disconnect is not counted. This makes drops visible without
+waiting for the next delivered sample.
+
+**Remaining limit:** no per-server sequence number, so the exact missing sample
+is not identified; the counter is aggregate. The CFA-94 test
+`soak_smoke_16_servers_shutdown_with_undrained_channel` still pins the drop
 behaviour.
 
-## F3 — Fast snapshots are dropped when the channel is full (low, by design)
+## F3 — Fast snapshots are dropped when the channel is full (low, by design, counted)
 
 **Evidence**
 - `src/app.rs:156` — `sync_channel::<FastSnapshot>(2)`.
@@ -83,11 +90,11 @@ behaviour.
   worker exits.
 
 **Effect:** intentional "latest wins" for a UI/GPU snapshot; only a problem in
-combination with F2/F4. There is no drop counter here either, but for a
-snapshot that is replaced every refresh this is acceptable.
+combination with F2/F4.
 
-**Recommended follow-up:** none required. If a counter is added for F2 it can
-cover this channel too for consistency.
+**Resolution:** the same `try_send_snapshot` counter covers this channel; the
+footer reports the fast and LLM counters together. The snapshot is still
+replaced by the next refresh, so no history is fabricated.
 
 ## F4 — The poll rate under many servers is bounded by the slowest server, not the count (low)
 
@@ -186,7 +193,7 @@ would make the bound explicit if that ever changes.
 | Finding | Test (current line) |
 | --- | --- |
 | F1 (worker panic/disconnect) | `drain_try_recv_distinguishes_empty_from_disconnected`, `join_bounded_reports_clean_exit`, `join_bounded_reports_panicked_worker`, `join_bounded_reports_timeout` |
-| F2 (full channel drops) | `soak_smoke_16_servers_shutdown_with_undrained_channel` (`src/app/tests/soak.rs`) |
+| F2 (full channel drops) | `soak_smoke_16_servers_shutdown_with_undrained_channel` (`src/app/tests/soak.rs`), `try_send_snapshot_counts_full_channel_and_stops_on_disconnect`, `footer_renders_drop_warning_only_after_a_dropped_snapshot` |
 | F4 (slow server, independent delivery) | `a_slow_server_does_not_delay_a_healthy_servers_delivery` (`src/app.rs:3046`), `an_unreachable_server_does_not_block_a_healthy_one` (`:2923`) |
 | F5 (thread ceiling, churn) | `soak_long_16_servers` (`src/app/tests/soak.rs`, `#[ignore]`), `soak_many_set_servers_rounds_bound_resources_single_threaded` (`src/app.rs:4717`, `#[ignore]`) |
 | F6 (bounded shutdown) | `soak_clean_shutdown_is_bounded_while_a_server_hangs` (`src/app.rs:4275`), `soak_reconnects_after_request_timeout` (`:4319`) |

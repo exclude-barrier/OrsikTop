@@ -243,6 +243,10 @@ pub struct UiState {
     /// Multi-server selector: open state and highlighted row.
     server_selector_open: bool,
     server_selector_index: usize,
+    /// Snapshots dropped because their bounded channel was full. Shown in the
+    /// footer only when nonzero, so healthy runs keep the normal status line.
+    fast_snapshot_drops: u64,
+    llm_snapshot_drops: u64,
 }
 
 impl Default for UiState {
@@ -292,11 +296,31 @@ impl Default for UiState {
             settings_error: None,
             server_selector_open: false,
             server_selector_index: 0,
+            fast_snapshot_drops: 0,
+            llm_snapshot_drops: 0,
         }
     }
 }
 
 impl UiState {
+    /// Publish the worker drop counters for the footer. Called every loop
+    /// iteration, so a busy or stalled UI becomes visible without waiting for
+    /// the next successfully delivered snapshot.
+    pub(crate) fn set_snapshot_drops(&mut self, fast: u64, llm: u64) {
+        self.fast_snapshot_drops = fast;
+        self.llm_snapshot_drops = llm;
+    }
+
+    /// Compact footer warning, absent while no snapshot has been dropped.
+    pub(crate) fn snapshot_drop_text(&self) -> Option<String> {
+        (self.fast_snapshot_drops > 0 || self.llm_snapshot_drops > 0).then(|| {
+            format!(
+                "DROPS f{} l{}",
+                self.fast_snapshot_drops, self.llm_snapshot_drops
+            )
+        })
+    }
+
     pub fn push_sample(&mut self, gpu: &GpuStats, system: &SystemStats) {
         let now = Instant::now();
         let vram = match (gpu.memory_used_mib, gpu.memory_total_mib) {
@@ -1750,9 +1774,13 @@ fn footer_status(llm: &LlmStats, gpu: &GpuStats) -> String {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, state: &UiState) {
-    let status = footer_status(llm, gpu);
+    let drops = state.snapshot_drop_text();
+    let status = match &drops {
+        Some(drops) => format!("{drops} · {}", footer_status(llm, gpu)),
+        None => footer_status(llm, gpu),
+    };
 
-    let status_color = if !llm.error.is_empty() || !gpu.error.is_empty() {
+    let status_color = if !llm.error.is_empty() || !gpu.error.is_empty() || drops.is_some() {
         YELLOW
     } else {
         ORK_GREEN
@@ -5308,6 +5336,73 @@ mod tests {
         let status = footer_status(&llm, &GpuStats::default());
         assert!(status.contains("METRICS UNREACHABLE"), "got: {status}");
         assert!(!status.contains("SERVER OFFLINE"), "got: {status}");
+    }
+
+    #[test]
+    fn footer_renders_drop_warning_only_after_a_dropped_snapshot() {
+        let area = Rect::new(0, 0, 100, 3);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = UiState::default();
+
+        terminal
+            .draw(|frame| {
+                draw_footer(
+                    frame,
+                    area,
+                    &LlmStats::default(),
+                    &GpuStats::default(),
+                    &state,
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !text.contains("DROPS"),
+            "healthy footer must stay clean:\n{text}"
+        );
+
+        state.set_snapshot_drops(2, 1);
+        terminal
+            .draw(|frame| {
+                draw_footer(
+                    frame,
+                    area,
+                    &LlmStats::default(),
+                    &GpuStats::default(),
+                    &state,
+                );
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("DROPS f2 l1"),
+            "drop counters must be visible in the footer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn footer_hides_drop_counts_until_a_snapshot_is_dropped() {
+        let mut state = UiState::default();
+        assert_eq!(state.snapshot_drop_text(), None);
+
+        state.set_snapshot_drops(2, 1);
+        assert_eq!(state.snapshot_drop_text().as_deref(), Some("DROPS f2 l1"));
+
+        state.set_snapshot_drops(0, 0);
+        assert_eq!(state.snapshot_drop_text(), None);
     }
 
     #[test]

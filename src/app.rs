@@ -157,6 +157,8 @@ pub fn run(
     // One sample per server per cycle must fit without being dropped, so the
     // bound matches the server cap rather than the single-server size.
     let (llm_tx, llm_rx) = mpsc::sync_channel::<LlmSample>(MAX_MONITORED_SERVERS);
+    let fast_drops = Arc::new(AtomicU64::new(0));
+    let llm_drops = Arc::new(AtomicU64::new(0));
     // Server-set changes are carried with a monotonically increasing
     // generation so a result produced for a previous set can be rejected
     // instead of being shown under the new one (see `sync_server_set`).
@@ -198,6 +200,7 @@ pub fn run(
         Arc::clone(&refresh_shared),
         Arc::clone(&stop),
         fast_tx,
+        Arc::clone(&fast_drops),
         server_identity_rx,
     );
     let llm_worker = spawn_llm_worker(
@@ -206,6 +209,7 @@ pub fn run(
         Arc::clone(&offline_grace_shared),
         Arc::clone(&stop),
         llm_tx,
+        Arc::clone(&llm_drops),
         server_rx,
     );
 
@@ -248,6 +252,10 @@ pub fn run(
         snapshot.servers =
             build_server_summaries(&order, &endpoints, &registry, &ui_state, Instant::now());
         snapshot.selected_server = selected.clone();
+        ui_state.set_snapshot_drops(
+            fast_drops.load(Ordering::Relaxed),
+            llm_drops.load(Ordering::Relaxed),
+        );
 
         // S16: an auto-discovered server is dynamic — it can restart on the
         // same port (new PID) or exit entirely during a run. Re-resolve on a
@@ -554,6 +562,20 @@ fn drain_try_recv<T>(rx: &Receiver<T>, mut apply: impl FnMut(T)) -> Result<(), (
             Err(TryRecvError::Empty) => return Ok(()),
             Err(TryRecvError::Disconnected) => return Err(()),
         }
+    }
+}
+
+/// Send without blocking. A full channel keeps the newest UI state and counts
+/// the dropped update; `false` means the receiver is gone and the worker must
+/// stop.
+fn try_send_snapshot<T>(tx: &SyncSender<T>, value: T, drops: &AtomicU64) -> bool {
+    match tx.try_send(value) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            drops.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -873,6 +895,7 @@ fn spawn_fast_worker(
     refresh_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<FastSnapshot>,
+    drops: Arc<AtomicU64>,
     server_identity_rx: Receiver<(u64, Option<LocalServerIdentity>)>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -1046,9 +1069,8 @@ fn spawn_fast_worker(
                 mapping_generation: server_generation,
             };
 
-            match tx.try_send(snapshot) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => break,
+            if !try_send_snapshot(&tx, snapshot, &drops) {
+                break;
             }
 
             sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_REFRESH_MS, &stop);
@@ -1348,6 +1370,7 @@ fn spawn_llm_worker(
     offline_grace_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<LlmSample>,
+    drops: Arc<AtomicU64>,
     server_rx: Receiver<LlmCommand>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -1413,12 +1436,9 @@ fn spawn_llm_worker(
                 drop(done_tx);
                 let mut disconnected = false;
                 for sample in done_rx.iter() {
-                    match tx.try_send(sample) {
-                        Ok(()) | Err(TrySendError::Full(_)) => {}
-                        Err(TrySendError::Disconnected(_)) => {
-                            disconnected = true;
-                            break;
-                        }
+                    if !try_send_snapshot(&tx, sample, &drops) {
+                        disconnected = true;
+                        break;
                     }
                 }
                 disconnected
@@ -2617,6 +2637,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -2996,6 +3017,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -3048,6 +3070,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -3171,6 +3194,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -4202,6 +4226,7 @@ mod tests {
             offline,
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
         (stop, sample_rx, cmd_tx, worker)
@@ -4262,6 +4287,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -4342,6 +4368,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -4399,6 +4426,7 @@ mod tests {
             Arc::clone(&offline),
             Arc::clone(&stop),
             sample_tx,
+            Arc::new(AtomicU64::new(0)),
             cmd_rx,
         );
 
@@ -4916,6 +4944,25 @@ mod tests {
             "a disconnected worker must be surfaced"
         );
         assert_eq!(seen, [1, 2], "queued values are applied before the error");
+    }
+
+    #[test]
+    fn try_send_snapshot_counts_full_channel_and_stops_on_disconnect() {
+        let (tx, rx) = mpsc::sync_channel::<u8>(1);
+        let drops = AtomicU64::new(0);
+
+        assert!(try_send_snapshot(&tx, 1, &drops));
+        assert!(try_send_snapshot(&tx, 2, &drops));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap(), 1, "the pending snapshot is kept");
+
+        drop(rx);
+        assert!(!try_send_snapshot(&tx, 3, &drops));
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "a disconnect must not be counted as a dropped snapshot"
+        );
     }
 
     #[test]

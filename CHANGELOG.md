@@ -4,6 +4,13 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Snapshot drop visibility.** The footer shows `DROPS fN lN` when a fast or
+  LLM snapshot was dropped because its bounded channel was full, making
+  backpressure observable instead of silent. The counters stay hidden on
+  healthy runs.
+
 ### Fixed
 
 - **Worker failures are visible.** The dashboard now distinguishes an empty
