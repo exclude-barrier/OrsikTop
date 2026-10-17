@@ -149,10 +149,10 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
 - **F2 resolved.** The tag trigger is narrowed to
   `v[0-9]+.[0-9]+.[0-9]+*`. A tag ruleset protects `refs/tags/v*` against
   deletion and non-fast-forward updates, with no bypass actor.
-- The manual tag-triggered publish has not been exercised since the policy
-  change. On the next release, confirm `prepare`, `plan` and `host` run and the
-  tag/release is created. Do not use a throwaway `v*` tag: tag deletion is now
-  protected and the run would publish a release.
+- The manual tag-triggered publish was verified with `v0.4.1` on 2026-10-17:
+  `prepare`, `plan`, `build-local-artifacts`, `build-global-artifacts` and
+  `host` succeeded, and the release assets, SHA-256 checksum and build
+  attestation were verified. Re-check this path after a `dist generate`.
 - **F3 resolved.** The workflow default is `contents: read`. Write access is
   scoped to `plan` and `host`; `prepare` no longer needs it.
 - The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
