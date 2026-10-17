@@ -830,50 +830,54 @@ Damit wird **kein Performancegewinn behauptet**. CFA-93 ist als
 lohnt nur mit einem **lastfreien** Messfenster (dann ist auch die fd-Allokation
 prüfbar) oder einem Messpunkt für den Client-Poll.
 
-## Current-SHA-Referenz (2026-10-17, c013880, lastbehaftet)
+## Current-SHA-Referenz (2026-10-17, c013880, sauber)
 
-Diese Messung aktualisiert den Release-Binary-Pfad auf den aktuellen `main`-
-Stand. Sie ist **keine** saubere Baseline: Der Host war während des gesamten
-Laufs durch fremde Arbeit belastet. Die Werte sind eine Referenz für denselben
-Messaufbau, kein Vorher/Nachher-Vergleich und keine Schwelle.
+Saubere Release-Binary-Baseline auf `cf-desktop`, ohne Fremdlast. Die Werte
+sind eine Referenz für denselben Messaufbau, kein Vorher/Nachher-Vergleich und
+keine Schwelle. Ein früherer Lauf auf `cf-laptop` war lastbehaftet und wird
+hier **nicht** als Baseline verwendet.
 
-- **Quellstand:** `c013880`, `git_dirty=false`; Release-Binary
-  (`target/release/orsiktop`, `[profile.release]`).
-- **Host:** `cf-laptop`, Intel Core Ultra 9 288V, 8 logische CPUs, 30,8 GiB,
-  Kernel `7.2.5-3-omarchy`, rustc `1.100.0-nightly (feaadeeac 2026-09-19)`.
-- **Bedingungen:** Netzbetrieb **aus** (`BAT0 Discharging`), Governor
-  `powersave`, EPP `balance_power`; Last 1 min `3,16` → `14,87`; parallel
-  liefen ein fremder `llama-server` (~194 % CPU), zwei QEMU-Emulatoren,
-  Chromium/Firefox und weitere Agenten. Deshalb sind CPU- und Latenzwerte
-  **nach oben verzerrt** und nicht mit CFA-92 vergleichbar.
-- **Befehl:** `cargo build --release --locked` gefolgt von
-  `python3 scripts/perf_release_bench.py --out target/perf-bench-c013880`
+- **Quellstand:** `c013880`, `git_dirty=false`; Release-Binary mit SHA-256
+  `d872c5a2b0c5242b4b2520dea88a18d06fd282d823ba9cb19ef7c55c55ab2208`, gebaut
+  mit `rustc 1.100.0-nightly (feaadeeac 2026-09-19)`. `main` `ee2d778` enthält
+  danach nur Docs-/CI-Änderungen.
+- **Host:** `cf-desktop`, 12th Gen Intel Core i9-12900K, 24 logische CPUs,
+  65 555 876 kB (≈ 62,5 GiB), Kernel `7.2.5-3-omarchy`,
+  NVIDIA GeForce RTX 4090 (Treiber `610.57.04`, beim Start `1 %` Auslastung,
+  751 MiB belegt), Governor `powersave`, EPP `performance`. Desktop ohne
+  Akku-/AC-Sensor.
+- **Bedingungen:** Last 1 min `0,23` → `0,44`, 489–491 Host-Prozesse, keine
+  fremden CPU- oder GPU-Lasten.
+- **Befehl:** `cargo build --release --locked` auf `cf-laptop`, Binary per
+  `scp` auf den Desktop, dort
+  `python3 scripts/perf_release_bench.py --out /tmp/orsiktop-bench/out`
   (Standardmatrix: 5 s Warmup, 30 s Messfenster je Szenario; 8 Szenarien).
-- **Rohdaten:** `target/perf-bench-c013880/release-bench-20261017T223553.json`
-  (nicht versioniert).
+- **Rohdaten:** `target/perf-bench-c013880-desktop.json` (Kopie von
+  `/tmp/orsiktop-bench/out/release-bench-20261017T225752.json`, nicht
+  versioniert).
 
 | Szenario | CPU % | Frames/s | Eingabe p95 ms | RSS MiB | Threads max | Shutdown ms |
 | --- | --- | --- | --- | --- | --- | --- |
-| idle_no_mock | 34,41 | 4,93 | 9,01 | 23,11 | 5 | 116 |
-| mock_1 | 35,87 | 4,93 | 6,66 | 22,53 | 8 | 918 |
-| mock_4 | 37,27 | 5,00 | 11,93 | 23,90 | 20 | 667 |
-| mock_16 | 41,60 | 5,33 | 8,76 | 25,92 | 62 | 316 |
-| mock_1_refresh_100 | 42,97 | 8,39 | 18,59 | 22,57 | 8 | 34 |
-| mock_1_refresh_250 | 46,61 | 5,36 | 42,65 | 23,50 | 8 | 677 |
-| mock_1_refresh_5000 | 28,09 | 4,19 | 42,34 | 22,88 | 8 | 66 |
-| large_proc_list_mock_1 | 45,85 | 4,63 | 20,15 | 28,10 | 8 | 472 |
+| idle_no_mock | 2,93 | 5,03 | 1,41 | 35,56 | 5 | 16 |
+| mock_1 | 2,96 | 5,03 | 1,48 | 35,65 | 7 | 114 |
+| mock_4 | 3,53 | 5,03 | 1,73 | 36,70 | 20 | 32 |
+| mock_16 | 5,49 | 5,16 | 1,71 | 39,12 | 67 | 164 |
+| mock_1_refresh_100 | 6,59 | 11,62 | 1,48 | 35,82 | 8 | 64 |
+| mock_1_refresh_250 | 5,29 | 8,02 | 1,74 | 35,72 | 8 | 32 |
+| mock_1_refresh_5000 | 1,43 | 4,23 | 1,44 | 35,61 | 5 | 32 |
+| large_proc_list_mock_1 | 6,23 | 4,89 | 2,71 | 39,38 | 5 | 33 |
 
-**Peak-Threads:** Der Duty-Cycle-Mittelwert bei 16 Servern bleibt mit `20,34`
-auf dem Niveau von CFA-92 (`20,36`); das beobachtete Maximum ist `62` (p95
-`20`). Bei 4 Servern sind es mean/max `8,04`/`20`, bei einem Server `5,0`/`8`.
-Die Spitze ist die transiente Fan-out-Gruppe je Poll-Zyklus, kein dauerhafter
-Anstieg im Messfenster; alle Läufe enden mit `exit_code=0`. Der Host hat
-**keinen NVIDIA-Treiber** (Intel Xe), daher sind NVML-/Treiber-Threads in dieser Zahl
-nicht enthalten; die F5-Lücke „Produktions-Treiber-Threads“ bleibt offen.
+**Peak-Threads:** Bei 16 Servern ist der Mittelwert `20,25`, p95 `20`, das
+beobachtete Maximum `67`; bei 4 Servern mean/max `8,02`/`20`, bei einem Server
+`5,00`/`7`, idle max `5`. Die Spitze ist die transiente Fan-out-Gruppe je
+Poll-Zyklus, kein dauerhafter Anstieg im Messfenster; alle Läufe enden mit
+`exit_code=0`. Der RTX-4090-Treiber war aktiv, daher enthält diese Messung
+NVML-/Treiber-Threads — die frühere F5-Lücke ist damit auf dem Release-Pfad
+geschlossen.
 
-**Einordnung:** Das ist die aktuelle Release-Referenz unter Fremdlast. Für eine
-saubere Baseline muss der Lauf auf einem idle Host mit Netzbetrieb wiederholt
-werden; die Zahlen oben dürfen nicht als sauberer Messwert zitiert werden.
+**Einordnung:** Das ist die saubere aktuelle Release-Referenz. Die Werte sind
+maschinenspezifisch (`cf-desktop`); für andere Hosts ist der Lauf dort zu
+wiederholen.
 
 ## Querverweise
 

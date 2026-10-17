@@ -10,9 +10,11 @@ All notable changes to OrsikTop will be documented here.
   LLM snapshot was dropped because its bounded channel was full, making
   backpressure observable instead of silent. The counters stay hidden on
   healthy runs.
-- **Current-SHA release reference.** The release-binary benchmark is documented
-  for `c013880`, including the observed thread peak. The run was load-affected
-  and is explicitly not presented as a clean baseline.
+- **Clean current-SHA release baseline.** The release binary is measured on an
+  idle `cf-desktop` with an active RTX 4090, including NVML/driver threads:
+  16 servers use 5.49 % of one CPU, 39.12 MiB RSS and peak at 67 threads.
+- **Long soak validation.** The 16-server long soak passes with peak 78
+  threads, flat RSS and 1.2 s shutdown.
 
 ### Changed
 

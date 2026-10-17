@@ -55,6 +55,29 @@ be meaningless under a parallel run. When the binary is not single-threaded
 they are printed (in the `ORSKTOP_SOAK|…` report line) but not asserted. Run it
 on an otherwise idle machine; it binds loopback ports only.
 
+## Current-SHA long run (2026-10-17, ee2d778)
+
+Run on `cf-laptop` with the default 60 s per server count. The host was
+load-affected (foreign `llama-server`/QEMU/agent work), so latency values are
+not a performance baseline; thread, RSS, and shutdown assertions still ran
+single-threaded and passed.
+
+```sh
+ORSIK_SOAK_SECS=60 cargo test --locked -- --ignored --test-threads=1 \
+    --nocapture soak_long_
+```
+
+`3 passed` in 189,37 s.
+
+| Server | Phases | Samples | Accepted | Stale | Requests | Max gap ms | Shutdown ms | Threads peak | RSS first→last kB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 40 | 115 | 112 | 3 | 242 | 1 291 | 1 190 | 12 | 16 232 → 16 332 |
+| 4 | 40 | 377 | 369 | 8 | 763 | 1 422 | 1 195 | 25 | 16 612 → 16 588 |
+| 16 | 40 | 900 | 879 | 21 | 1 781 | 1 386 | 1 203 | 78 | 18 848 → 17 660 |
+
+No leak: RSS does not grow and the thread count returns to 2 after shutdown.
+The 16-server peak (`78`) matches the earlier CFA-94 soak (`79`).
+
 ## Raw output
 
 Each run prints one line:
