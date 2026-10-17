@@ -8,11 +8,11 @@ Belegt durch zwei Läufe am gleichen Quellstand:
 
 - Implementierungslauf: Snapshot-Hash
   `ba432f5ccc0b6e963f4a2a8339a0b19824742c062afae153a544f05a5521b097`,
-  Artifacts `/home/chris/.local/share/paperclip-worker/runs/c03db2693c8d49f4b66b28e713e26afa`
+  Artifacts `<artifact-root>/runs/c03db2693c8d49f4b66b28e713e26afa`
   (vor Fertigstellung dieses Dokuments ausgeführt).
 - Unabhängiger Review-Lauf (Claudio/Opus 5.5): Snapshot-Hash
   `6eb28d2d687c574bc6e0528f5ad86c8584551a425597379c9e551442a5c6fbba`,
-  Artifacts `/home/chris/.local/share/paperclip-worker/runs/2b423a7cef93491b849c17d09144af0d`.
+  Artifacts `<artifact-root>/runs/2b423a7cef93491b849c17d09144af0d`.
 
 ## Zweck und Methode
 

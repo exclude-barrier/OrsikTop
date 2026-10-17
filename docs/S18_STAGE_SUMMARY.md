@@ -76,7 +76,7 @@ four outputs; the Intel provider reports `available: clocks` and an explicit
 (utilization, memory, temperature, power, fan, pcie, enc/dec); CPU sensors show
 a live frequency + temperature with power `— (unavailable)` (root-only
 `energy_uj`); and the llama section found a **configured** endpoint
-(`http://100.99.68.81:8081`) and the bounded probe **connected**, printing real
+(`http://<tailnet-ip>:8081`) and the bounded probe **connected**, printing real
 model / context / slots / rate. `cargo run -- --help` lists `diag`;
 `cargo run -- diag --help` shows the subcommand.
 

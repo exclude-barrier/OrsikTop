@@ -142,7 +142,7 @@ liest (sie ist aber jiffy-quantisiert, s. u.).
 ## Rohdaten — regulärer In-Gate-Lauf (primärer Lauf)
 
 Lauf über `pc-project cargo test --all-targets --locked`, Artifact
-`/home/chris/.local/share/paperclip-app/heavy-checks/157f3e387f3f46108d4196d5b19a5007`,
+`<artifact-root>/heavy-checks/157f3e387f3f46108d4196d5b19a5007`,
 Snapshot `82c55cbd29c9519a68ffd3ffc79c14d0111e8c90bef03e84e346cda4d6f3cc4d`,
 `source_unchanged: true`, `exit 0`.
 
@@ -485,7 +485,7 @@ Rohbelege der sechs Läufe (cf-desktop-Gate, je `source_unchanged: true`,
 `0066affd853547a1a92f35c368716149` → `6b43566779524dfc83a30795e3009d25`,
 `2244e523898d442985c4def8909ec28f` → `0910bec9e2514b22887f35b0d966e7ef`,
 `253590e0eecc4426b77f280505633ba5` → `f418628b3ddd4b55a252f6fad1956ba9`
-(unter `/home/chris/.local/share/paperclip-app/heavy-checks/…`).
+(unter `<artifact-root>/heavy-checks/…`).
 
 Ohne die Paarung wird der Gewinn **überschätzt**: ungepaarte Läufe auf
 wechselnd belastetem Host streuen stark (dieselbe unbeänderte Codebasis ergab
