@@ -4,7 +4,7 @@ use std::{
     io::Stdout,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
         Arc, RwLock,
     },
     thread,
@@ -218,19 +218,20 @@ pub fn run(
         // Each applied fast snapshot can change the overview; repaint on the
         // next iteration rather than waiting for the idle tick. Fast snapshots
         // have no rejection path — only LLM samples are filtered (below).
-        while let Ok(next) = fast_rx.try_recv() {
+        drain_try_recv(&fast_rx, |next| {
             apply_fast_snapshot(&mut snapshot, &mut ui_state, mapping_generation, next);
             scheduler.mark_dirty();
-        }
-        while let Ok(next) = llm_rx.try_recv() {
+        })
+        .map_err(|()| "fast monitoring worker stopped unexpectedly".to_string())?;
+        drain_try_recv(&llm_rx, |next| {
             // Drop results produced for a server set we already replaced, or
             // for a server that is no longer known: they must not appear under
             // a different server's state.
             if !accepts_llm_sample(llm_generation, &next) {
-                continue;
+                return;
             }
             if !endpoints.contains_key(&next.server) {
-                continue;
+                return;
             }
             let is_selected = next.server == selected;
             // Record for every server (background servers keep accumulating),
@@ -242,7 +243,8 @@ pub fn run(
             }
             // An accepted sample changes the overview and/or the active view.
             scheduler.mark_dirty();
-        }
+        })
+        .map_err(|()| "LLM monitoring worker stopped unexpectedly".to_string())?;
         snapshot.servers =
             build_server_summaries(&order, &endpoints, &registry, &ui_state, Instant::now());
         snapshot.selected_server = selected.clone();
@@ -535,26 +537,46 @@ pub fn run(
     // granularity, so a healthy worker exits within a couple of cycles. The
     // join is bounded so a worker wedged in a slow vendor/filesystem call can
     // never hold the process open indefinitely (the OS reclaims it on exit).
-    let join_bounded = |handle: thread::JoinHandle<()>| {
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        thread::spawn(move || {
-            let _ = handle.join();
-            let _ = done_tx.send(());
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if done_rx.try_recv().is_ok() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    };
-    join_bounded(llm_worker);
-    join_bounded(fast_worker);
+    let llm_join = join_bounded(llm_worker, "LLM monitoring", Duration::from_secs(5));
+    let fast_join = join_bounded(fast_worker, "fast monitoring", Duration::from_secs(5));
+    llm_join.and(fast_join)?;
     Ok(())
+}
+
+/// Drain every currently queued value without blocking.
+///
+/// `Ok(())` means the queue is empty. `Err(())` means the sender is gone: the
+/// worker stopped, which must not be mistaken for a temporarily empty queue.
+fn drain_try_recv<T>(rx: &Receiver<T>, mut apply: impl FnMut(T)) -> Result<(), ()> {
+    loop {
+        match rx.try_recv() {
+            Ok(value) => apply(value),
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => return Err(()),
+        }
+    }
+}
+
+/// Wait up to `timeout` for a worker and preserve its actual outcome.
+///
+/// A panicked worker, a shutdown timeout and a broken watcher are distinct
+/// errors. The watcher keeps a wedged worker from blocking the process
+/// indefinitely; on timeout it is left detached.
+fn join_bounded(
+    handle: thread::JoinHandle<()>,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (done_tx, done_rx) = mpsc::channel::<thread::Result<()>>();
+    thread::spawn(move || {
+        let _ = done_tx.send(handle.join());
+    });
+    match done_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(format!("{name} worker panicked")),
+        Err(RecvTimeoutError::Timeout) => Err(format!("{name} worker shutdown timed out")),
+        Err(RecvTimeoutError::Disconnected) => Err(format!("{name} join watcher disconnected")),
+    }
 }
 
 fn change_refresh(refresh_ms: &mut u64, increase: bool, shared: &AtomicU64) {
@@ -4875,18 +4897,48 @@ mod tests {
         );
     }
 
-    /// F1 (docs/RUNTIME_RISKS.md): the shutdown path joins each worker through a
-    /// helper that only waits for the thread to end and drops the panic payload
-    /// (`join_bounded`, `src/app.rs:544-563`; the test helper `join_within`
-    /// mirrors that pattern). A worker that panicked therefore ends exactly like
-    /// a healthy one, and nothing ever reports it. This test pins the current
-    /// behaviour — it does not fix it (CFA-95 is analysis only).
     #[test]
-    fn runtime_risk_worker_panic_is_not_distinguishable_from_a_clean_exit() {
-        let worker = thread::spawn(|| panic!("simulated LLM worker panic"));
+    fn drain_try_recv_distinguishes_empty_from_disconnected() {
+        let (tx, rx) = mpsc::channel::<u8>();
+        let mut seen = Vec::new();
+
         assert!(
-            join_within(worker, Duration::from_secs(2)),
-            "the bounded join reports a panicked worker as finished, with no error surfaced"
+            drain_try_recv(&rx, |value| seen.push(value)).is_ok(),
+            "an empty but connected queue is healthy"
         );
+
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        drop(tx);
+
+        assert!(
+            drain_try_recv(&rx, |value| seen.push(value)).is_err(),
+            "a disconnected worker must be surfaced"
+        );
+        assert_eq!(seen, [1, 2], "queued values are applied before the error");
+    }
+
+    #[test]
+    fn join_bounded_reports_clean_exit() {
+        let worker = thread::spawn(|| {});
+        assert_eq!(join_bounded(worker, "test", Duration::from_secs(2)), Ok(()));
+    }
+
+    #[test]
+    fn join_bounded_reports_panicked_worker() {
+        let worker = thread::spawn(|| panic!("simulated worker panic"));
+        let error = join_bounded(worker, "test", Duration::from_secs(2)).unwrap_err();
+        assert!(error.contains("panicked"), "{error}");
+    }
+
+    #[test]
+    fn join_bounded_reports_timeout() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let error = join_bounded(worker, "test", Duration::from_millis(50)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        release_tx.send(()).unwrap();
     }
 }
