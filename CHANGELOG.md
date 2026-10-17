@@ -10,6 +10,9 @@ All notable changes to OrsikTop will be documented here.
   LLM snapshot was dropped because its bounded channel was full, making
   backpressure observable instead of silent. The counters stay hidden on
   healthy runs.
+- **Current-SHA release reference.** The release-binary benchmark is documented
+  for `c013880`, including the observed thread peak. The run was load-affected
+  and is explicitly not presented as a clean baseline.
 
 ### Fixed
 
