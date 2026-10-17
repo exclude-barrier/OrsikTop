@@ -17,6 +17,8 @@ All notable changes to OrsikTop will be documented here.
   roots from public evidence documents, and ignore common local secret-file
   patterns. No credentials were found in the repository; no runtime behavior
   changed.
+- Refresh the security policy's supported-version table for 0.4.x and remove
+  the redundant `homepage` manifest key that produced a Cargo warning.
 
 ## [0.4.0] - 2026-10-13
 
