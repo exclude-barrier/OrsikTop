@@ -4,6 +4,16 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Rebuilt the README around quick start, everyday use and explicit compatibility
+  limits. Moved installation, usage/telemetry and development references into
+  dedicated guides under `docs/`, replaced outdated version-output examples,
+  and refreshed dashboard/server-selector screenshots from live Qwen3.8-27B
+  inference on cf-desktop's RTX 4090. No runtime behavior changed.
+- Use a fixed Apache-2.0 README badge linked to `LICENSE` rather than a
+  dynamic GitHub-license lookup, avoiding transient lookup errors in the badge.
+
 ## [0.4.0] - 2026-10-13
 
 ### Added
