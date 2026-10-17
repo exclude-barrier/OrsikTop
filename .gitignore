@@ -1,6 +1,15 @@
 /target
 .DS_Store
 *.log
+# secrets and credentials (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
 # graphify knowledge-graph artifacts (rebuilt locally via post-commit hook)
 graphify-out/
 # OMP runtime artifacts (keep .omp/rules/ tracked)

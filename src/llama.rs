@@ -3536,7 +3536,7 @@ mod local_speculative_process_tests {
     #[test]
     fn recognizes_llama_serve_subcommand_and_reads_n_max() {
         let args = vec![
-            "/home/christopherf/.local/bin/llama".to_string(),
+            "/home/user/.local/bin/llama".to_string(),
             "serve".to_string(),
             "-hf".to_string(),
             "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M".to_string(),

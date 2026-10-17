@@ -13,6 +13,10 @@ All notable changes to OrsikTop will be documented here.
   inference on cf-desktop's RTX 4090. No runtime behavior changed.
 - Use a fixed Apache-2.0 README badge linked to `LICENSE` rather than a
   dynamic GitHub-license lookup, avoiding transient lookup errors in the badge.
+- Redact the internal tailnet address, user home paths and operator artifact
+  roots from public evidence documents, and ignore common local secret-file
+  patterns. No credentials were found in the repository; no runtime behavior
+  changed.
 
 ## [0.4.0] - 2026-10-13
 

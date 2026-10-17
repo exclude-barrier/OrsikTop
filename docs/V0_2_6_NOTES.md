@@ -133,7 +133,7 @@ release still v0.2.5. One open CodeQL alert (`rust/cleartext-logging`,
 (2026-09-15) and test-only — not a release blocker.
 
 Live validation on the current box (Intel Core Ultra 9 288V / xe,
-Qwen3.8-27B at 100.99.68.81:8081):
+Qwen3.8-27B at <tailnet-ip>:8081):
 
 - Intel xe LIVE-VERIFIED: discovery (`card0 0000:00:02.0 8086:64a0 xe
   renderD128`), display name (`Intel Arc (Core Ultra 200V iGPU)`),
