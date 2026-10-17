@@ -79,7 +79,7 @@ hardware, following the §4 procedure for that row and recorded as §5 requires.
 
 Two notes that keep the open rows honest:
 
-- **Intel iGPU on test-desktop.** the test desktop's iGPU *is* enumerated live (row 4
+- **Intel iGPU on test-desktop.** Its iGPU *is* enumerated live (row 4
   above, `discovery_real_system_smoke`), but the Intel *provider* sample is not:
   the operator helper's fixed allow-list exposes the CI gate list only and does
   **not** include the `#[ignore]`d `intel_real_system_smoke`, so no live provider
