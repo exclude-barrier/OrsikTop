@@ -5,7 +5,6 @@ edition = "2021"
 description = "Fast terminal monitoring for local LLM Orks"
 license = "Apache-2.0"
 repository = "https://github.com/exclude-barrier/OrsikTop"
-homepage = "https://github.com/exclude-barrier/OrsikTop"
 readme = "README.md"
 keywords = ["llm", "llama-cpp", "tui", "monitoring", "nvidia"]
 categories = ["command-line-utilities"]
