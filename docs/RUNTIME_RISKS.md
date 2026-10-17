@@ -126,10 +126,17 @@ case is one request timeout per cycle, and the UI already keeps the last values.
 - Measured (CFA-94 long soak, 16 servers, 60 s, single-threaded): peak
   `threads_peak: 79`, settling back to `threads_after: 2` after shutdown
   (`threads_before: 2`).
+- Measured (release binary `c013880`, 16 loopback mocks, 30 s, sampled from
+  outside via `/proc/<pid>/status`): mean `20,34`, p95 `20`, observed max `62`;
+  4 servers mean/max `8,04`/`20`, 1 server `5,0`/`8`, idle max `5`. The host
+  was load-affected and has no NVIDIA driver (Intel Xe), so NVML/driver threads
+  are **not** included. See `docs/PERFORMANCE_BASELINE.md`.
 
 **Effect:** no leak — the scoped threads end with each cycle — but a measurable
 creation/teardown cost and a peak that is bounded by the server cap plus the
-fabric runtime, not by design intent alone. Not a correctness risk.
+fabric runtime, not by design intent alone. The release run confirms the mean
+stays at the cap-driven level; the transient peak is higher than the steady
+state but below the CFA-94 soak peak. Not a correctness risk.
 
 **Recommended follow-up:** a small fixed poll pool (16 workers, work stealing or
 per-server assignment) would remove the churn. Optional; only if profiling shows
