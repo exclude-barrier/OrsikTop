@@ -10,17 +10,18 @@ worker shutdown, panic handling and the thread count under 16 servers.
   single F1 test below.
 - **Update 2026-10-17:** F1 was fixed in the worker-health change; F2/F3 drop
   counters and the footer warning followed in the snapshot-drop change. The
-  analysis below is kept as the original baseline; F1–F3 document the new
-  behaviour.
+  clean release run on `cf-desktop` and the long soak close the F5
+  driver-thread gap. The analysis below is kept as the original baseline;
+  F1–F3 and F5 document the new behaviour.
 - **Scope:** the original review changed no `app.rs` runtime logic. The
   worker-health follow-up implements F1; the snapshot-drop follow-up implements
-  the F2/F3 counters. The rest of this document remains the historical
-  read-only analysis.
+  the F2/F3 counters; the clean release run and long soak add F5 evidence. The
+  rest of this document remains the historical read-only analysis.
 - **Method:** static reading of `src/app.rs`, `src/llama.rs` and `src/domain.rs`
-  plus the existing worker tests; line numbers are from the tree above. The one
-  dynamic measurement quoted (F5, F6) is the raw output of the CFA-94 long soak
-  recorded in `docs/SOAK_HARNESS.md`/the CFA-94 report — it is not a claim about
-  a production host.
+  plus the existing worker tests; line numbers are from the tree above. Dynamic
+  evidence includes the CFA-94 soak, the `ee2d778` long soak, and the clean
+  release-binary run on `cf-desktop` with an active RTX 4090. No real inference
+  server was contacted.
 
 Every finding below was **re-verified against the current source**: the earlier
 CFA-95 comment was written at `e9600d6`, so both the file:line evidence and the
@@ -126,17 +127,21 @@ case is one request timeout per cycle, and the UI already keeps the last values.
 - Measured (CFA-94 long soak, 16 servers, 60 s, single-threaded): peak
   `threads_peak: 79`, settling back to `threads_after: 2` after shutdown
   (`threads_before: 2`).
-- Measured (release binary `c013880`, 16 loopback mocks, 30 s, sampled from
-  outside via `/proc/<pid>/status`): mean `20,34`, p95 `20`, observed max `62`;
-  4 servers mean/max `8,04`/`20`, 1 server `5,0`/`8`, idle max `5`. The host
-  was load-affected and has no NVIDIA driver (Intel Xe), so NVML/driver threads
-  are **not** included. See `docs/PERFORMANCE_BASELINE.md`.
+- Measured (release binary `c013880`, `cf-desktop`, RTX 4090 driver active,
+  16 loopback mocks, 30 s, sampled from outside via `/proc/<pid>/status`):
+  mean `20,25`, p95 `20`, observed max `67`; 4 servers mean/max `8,02`/`20`,
+  1 server `5,00`/`7`, idle max `5`. This includes NVML/driver threads; the
+  host was idle (load `0,23`–`0,44`). See `docs/PERFORMANCE_BASELINE.md`.
+- Long soak on `ee2d778` (60 s per server count): 16 servers peak `78`,
+  settling to `2` after shutdown; RSS median `18 848` → `17 660` kB. See
+  `docs/SOAK_HARNESS.md`.
 
 **Effect:** no leak — the scoped threads end with each cycle — but a measurable
 creation/teardown cost and a peak that is bounded by the server cap plus the
 fabric runtime, not by design intent alone. The release run confirms the mean
-stays at the cap-driven level; the transient peak is higher than the steady
-state but below the CFA-94 soak peak. Not a correctness risk.
+stays at the cap-driven level and the driver-thread gap is closed; the
+transient peak is higher than the steady state but below the long-soak peak.
+Not a correctness risk.
 
 **Recommended follow-up:** a small fixed poll pool (16 workers, work stealing or
 per-server assignment) would remove the churn. Optional; only if profiling shows
@@ -212,15 +217,15 @@ would make the bound explicit if that ever changes.
 
 - **F1 recovery:** failures are visible, but there is no automatic worker
   restart or persistent in-TUI banner; `app::run` returns the error.
-- **F5 ceiling on a real host:** the thread peak is measured under the soak's
-  loopback mocks, not under NVML/driver threads; a production measurement is a
-  test-desktop load run, outside REL-02.
+- **F5 real inference:** the release measurement includes NVML/driver threads,
+  but still uses loopback mocks rather than a real llama.cpp workload.
 - **F6 hard-kill:** there is no way to force a worker to overrun the 5 s
   deadline without injecting a wedged call.
 
 ## Limits
 
-Static analysis plus behaviour-pinning tests; the only dynamic evidence is the
-CFA-94 long-soak run recorded with it. No production host, no NVML, no real
-inference server was exercised. All line numbers refer to the analysed tree
-(commit `ac424d5` plus the F1 test added by this change).
+Static analysis plus behaviour-pinning tests. Dynamic evidence now includes the
+CFA-94 soak, the long soak on `ee2d778`, and the clean release-binary run on
+`cf-desktop` with an active RTX 4090 (NVML), but no real inference workload.
+All line numbers refer to the analysed tree (commit `ac424d5` plus the F1 test
+added by this change).
