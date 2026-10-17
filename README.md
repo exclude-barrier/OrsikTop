@@ -4,7 +4,7 @@
 
 [![Latest release](https://img.shields.io/github/v/release/exclude-barrier/OrsikTop)](https://github.com/exclude-barrier/OrsikTop/releases/latest)
 [![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/exclude-barrier/OrsikTop)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
 OrsikTop brings **LLM inference, GPU telemetry, Linux system load and processes** into one terminal dashboard. Monitor llama.cpp or Strata endpoints alongside the machine running OrsikTop, without a browser, daemon, database or account. Monitoring is read-only: OrsikTop does not start, stop or reconfigure your inference servers.
 
