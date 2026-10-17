@@ -160,11 +160,10 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
 - GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned
   `dtolnay/rust-toolchain`, `Swatinem/rust-cache` and
   `actions-rust-lang/audit`. SHA pinning is required repository-wide.
-- The release plan job downloads the pinned cargo-dist Linux archive, verifies
-  its published SHA-256 checksum, and installs that binary directly. No
-  installer script runs there.
-- Still open: the build-matrix install step still uses the generated
-  `matrix.install_dist.run` command (read-only token), the `announce` job is
-  empty because no announcement target is configured, and secret-scanning
-  non-provider patterns/validity checks could not be enabled on the current
-  plan.
+- The release plan and build-matrix jobs download the pinned cargo-dist Linux
+  archive, verify its published SHA-256 checksum, and install that binary
+  directly. No installer script runs in either job. In the build job,
+  `GH_TOKEN` is scoped to the `dist build` step.
+- Still open: the `announce` job is empty because no announcement target is
+  configured, and secret-scanning non-provider patterns/validity checks could
+  not be enabled on the current plan.

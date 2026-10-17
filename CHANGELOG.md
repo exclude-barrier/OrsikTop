@@ -24,8 +24,9 @@ All notable changes to OrsikTop will be documented here.
   receives `GH_TOKEN`. The automatic `Release v…` path on `main` was removed;
   releases now require an explicitly pushed `v*` tag. Repository settings
   require SHA-pinned actions and protect `v*` tags from deletion or
-  force-updates. The release plan job now verifies the pinned cargo-dist
-  archive with its SHA-256 checksum and uses that binary directly.
+  force-updates. The release plan and build-matrix jobs now verify the pinned
+  cargo-dist archive with its SHA-256 checksum and use that binary directly;
+  `GH_TOKEN` in the build job is scoped to the build step.
 
 ## [0.4.0] - 2026-10-13
 
