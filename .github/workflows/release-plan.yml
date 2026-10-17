@@ -1,0 +1,56 @@
+# Manual hardening: pull requests plan the release with a read-only token.
+# The tag-triggered release workflow (`release.yml`) keeps `contents: write`
+# only where it creates the release. Re-apply after `dist generate`.
+
+name: Release plan
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Download the pinned archive, verify its published checksum, and use the
+      # binary directly. No installer script runs in this job.
+      - name: Install dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.33.0
+          base="https://github.com/axodotdev/cargo-dist/releases/download/v${version}"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          archive="$tmp/cargo-dist-x86_64-unknown-linux-gnu.tar.xz"
+          curl --proto '=https' --tlsv1.2 -LsSf -o "$archive" \
+            "${base}/cargo-dist-x86_64-unknown-linux-gnu.tar.xz"
+          curl --proto '=https' --tlsv1.2 -LsSf -o "${archive}.sha256" \
+            "${base}/cargo-dist-x86_64-unknown-linux-gnu.tar.xz.sha256"
+          (cd "$tmp" && sha256sum -c cargo-dist-x86_64-unknown-linux-gnu.tar.xz.sha256)
+          tar -xJf "$archive" -C "$tmp"
+          mkdir -p "$HOME/.cargo/bin"
+          install -m 755 "$tmp/cargo-dist-x86_64-unknown-linux-gnu/dist" "$HOME/.cargo/bin/dist"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Plan release
+        shell: bash
+        run: |
+          dist plan --output-format=json > plan-dist-manifest.json
+          cat plan-dist-manifest.json
+
+      - name: Upload dist plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-plan-dist-manifest
+          path: plan-dist-manifest.json
+          retention-days: 7

@@ -14,6 +14,13 @@ All notable changes to OrsikTop will be documented here.
   for `c013880`, including the observed thread peak. The run was load-affected
   and is explicitly not presented as a clean baseline.
 
+### Changed
+
+- **Read-only release planning on pull requests.** Release planning now runs in
+  `release-plan.yml` with `contents: read`; `release.yml` is limited to `main`
+  and tag pushes, so pull requests never receive the write scope used to create
+  a release.
+
 ### Fixed
 
 - **Worker failures are visible.** The dashboard now distinguishes an empty
