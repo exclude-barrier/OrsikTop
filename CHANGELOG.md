@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-17
+
 ### Changed
 
 - Rebuilt the README around quick start, everyday use and explicit compatibility
