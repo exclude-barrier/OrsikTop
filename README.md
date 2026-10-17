@@ -2,624 +2,134 @@
 
 **Fast terminal monitoring for local LLM Orks.**
 
-[![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/exclude-barrier/OrsikTop)](https://github.com/exclude-barrier/OrsikTop/releases/latest)
-[![License](https://img.shields.io/github/license/exclude-barrier/OrsikTop)](./LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
-[![Linux](https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
-[![llama.cpp](https://img.shields.io/badge/llama.cpp-supported-5C6BC0)](https://github.com/ggml-org/llama.cpp)
+[![CI](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml/badge.svg)](https://github.com/exclude-barrier/OrsikTop/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/exclude-barrier/OrsikTop)](LICENSE)
 
-OrsikTop is a Rust TUI that shows **local LLM inference, GPU telemetry (NVIDIA, AMD, Intel), Linux system load and processes** in one terminal dashboard.
+OrsikTop brings **LLM inference, GPU telemetry, Linux system load and processes** into one terminal dashboard. Monitor llama.cpp or Strata endpoints alongside the machine running OrsikTop, without a browser, daemon, database or account. Monitoring is read-only: OrsikTop does not start, stop or reconfigure your inference servers.
 
-It is designed for people running local models with `llama.cpp` who want the important inference and system metrics visible without a browser, daemon, database or account.
+![OrsikTop dashboard during live Qwen3.8-27B inference on an NVIDIA GeForce RTX 4090](assets/orsiktop.png)
 
-> Orsik = fantasy ork. Local models need tokens. Orks need more power.
+*Live llama.cpp inference on `cf-desktop`: Qwen3.8-27B, RTX 4090 and local CPU/GPU telemetry. Sensor fields marked `—` are unavailable, not measured zeroes.*
 
-<img width="1568" alt="OrsikTop dashboard" src="assets/orsiktop.png" />
+[Quick start](#quick-start) · [Everyday use](#everyday-use) · [Compatibility](#compatibility-and-limits) · [Documentation](#documentation)
+
+## Highlights
+
+- **Inference at a glance:** live prefill and decode rates, lifetime averages, context occupancy, request progress, slots and speculative-decoding metrics when the backend exposes them.
+- **Multiple servers:** monitor up to 16 endpoints concurrently, with separate connection state and throughput history. Switch servers without losing their histories.
+- **Settings in the TUI:** add, edit and remove additional endpoints; change GPU selection and refresh settings without restarting.
+- **GPU and system telemetry:** NVIDIA, AMD and Intel backends, CPU/core activity, RAM, swap, sensors and 60-second histories. Available metrics depend on hardware, drivers and permissions.
+- **Interactive processes:** sort, search, group and pin processes, with per-process GPU telemetry where available.
+- **Explicit uncertainty:** unknown LLM fields show `—`; held samples are marked stale. Unknown activity is not guessed to be idle.
 
 ## Quick start
 
-You need Linux on `x86_64`, a GPU with a working driver (NVIDIA, AMD, or Intel), a recent `llama.cpp`, and `curl` for the installer. Rust is **not** required.
+You need **Linux x86_64** for the prebuilt release and `curl` for the installer. Rust is not required. GPU readings need a working vendor driver; LLM readings need a reachable supported server. Missing telemetry does not prevent the rest of the dashboard from working.
 
-**1. Install OrsikTop:**
+**1. Install the latest release:**
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/exclude-barrier/OrsikTop/releases/latest/download/orsiktop-installer.sh | sh
 ```
 
-**2. Start llama.cpp with metrics enabled:**
+This downloads and runs the release installer. For manual downloads, Cargo installation, PATH setup and release verification, see [Installation](docs/INSTALLATION.md).
+
+**2. Start llama.cpp with metrics enabled** if you do not already have a server:
 
 ```bash
 llama-server -m /path/to/model.gguf --metrics
 ```
 
-or with the newer `llama serve` form:
+The `llama serve` form also works:
 
 ```bash
 llama serve -hf user/model:Q4_K_M --metrics
 ```
 
-**3. Run OrsikTop:**
+**3. Open the dashboard:**
 
 ```bash
 orsiktop
 ```
 
-OrsikTop finds the local llama.cpp process automatically (auto discovery) and shows model, throughput, GPU, system and process telemetry in the terminal.
-
-If `orsiktop` returns `command not found` right after installation, see [PATH setup](#make-orsiktop-available-in-the-current-shell).
-
-## What OrsikTop monitors
-
-### LLM inference
-
-OrsikTop reads llama.cpp telemetry and displays:
-
-- model and configured context size
-- current context usage
-- live prompt-processing / prefill throughput
-- live decode / generation throughput
-- server-wide average throughput
-- prompt, cache and generated token counters
-- active and queued/deferred requests
-- active / total slots
-- speculative decoding / MTP state and acceptance data when available
-- cumulative prompt and generation time
-- 60-second prefill and decode history
-- connection state, uptime and the smoothed sample interval (`SAMPLE`)
-- an activity phase (`IDLE`/`PREFILL`/`GENERATING`/`PROCESSING`/`QUEUED`) shown only when the telemetry supports it: a connected server with no activity evidence at all reads `UNKNOWN` rather than a guessed `IDLE`, while an offline or never-answered server shows no phase (`—`)
-- transient reconnect handling so short polling interruptions do not immediately show the server as offline; while such a last-good sample is held it is marked as not fresh (`STALE (held sample)` in the panel, `stale … ago` in the server selector) and its rates are not highlighted as live
-
-With a `--parallel` server (multiple slots) the panel aggregates across slots: `SLOTS busy/total` counts active slots, and the live prefill / decode throughput lines sum the per-slot deltas of slots with a verified identity — the server's own slot `id`, matched against the previous sample with the same task. Array position is never treated as identity: if any slot lacks a unique `id`, a slot appears or disappears, or the task changes, the per-slot path abstains and OrsikTop falls back to the aggregated `/metrics` counters instead of fabricating throughput (so reordering or replacing slots cannot create activity). The context pair (`used / size`) is always read from a single slot — the most-used busy slot, or the most-used slot overall when no slot is busy — because an idle slot keeps its last task's context, so mixing a maximum `used` with a maximum `n_ctx` across slots could pair values from two different slots.
-
-`/metrics` must be enabled in llama.cpp. `/props` is cached and `/slots` is treated as optional telemetry. If `/slots` is unavailable, OrsikTop falls back gracefully instead of inventing values.
-
-Both llama.cpp's Prometheus `/metrics` text format and the Strata inference
-server's JSON `/metrics` format are recognised automatically from the response
-body. llama.cpp support is unchanged; a Strata server is monitored when it is
-configured explicitly with `server=`/`servers=` (local auto discovery still
-matches llama.cpp processes only).
-
-For Strata, the LIVE decode rate is the server's own short-windowed
-`live.tok_s`, shown only while Strata reports it is generating. When idle or
-reading the prompt the live rate is unavailable (`—`) rather than a stale
-value, and Strata exposes no instantaneous prefill rate, so LIVE PP stays
-unavailable. Per-request means are never shown as instantaneous, and the
-AVG (LIFE) row is derived separately from Strata's cumulative `totals` tokens
-and millisecond timings. A counter reset or a switch between the two formats
-restarts the baseline instead of reporting a false spike. Fields Strata does
-not expose — the context high-water mark, an active-request count and
-cache-token counters — stay unavailable (`—`) rather than a fabricated zero.
-
-Strata context: the CTX `used` figure comes only from a slot's direct
-`n_prompt_tokens` field (a newer Strata addition — the slot's reported
-prompt-context footprint, retained after a request ends; it is the server's
-reported figure, not an exact physical KV-cache measurement). Strata 0.1.40
-predates that field and reports
-only `id`, `n_ctx` and `is_processing`, so its CTX `used` stays `—` against the
-configured capacity rather than being inferred from prompt or generated counts
-(an upstream API limitation, fixed in newer Strata). On every Strata version
-the active request's prompt length and generated-token progress appear in the
-REQUEST row, taken from the already-fetched `/metrics` `live` fields. The
-slot's `n_prompt_tokens` is context occupancy only and is never shown as
-REQUEST progress; without an explicit `n_prompt_tokens_processed` counter (or
-Strata `live` field) REQUEST prompt stays `—`.
-
-### GPU
-
-GPU telemetry is read through a vendor-neutral provider layer: NVIDIA via NVML
-(no `nvidia-smi` subprocesses on every refresh), AMD via the amdgpu kernel
-sysfs and hwmon, Intel via the i915/xe sysfs and hwmon. OrsikTop discovers
-GPUs from Linux DRM/sysfs and picks the backend from the device's vendor.
-
-Depending on the vendor and driver, the available metrics include:
-
-- GPU utilization
-- VRAM used / total (discrete GPUs)
-- memory-controller utilization
-- graphics and memory clocks
-- temperature
-- power draw and enforced power limit
-- P-state and throttle reasons
-- fan speed
-- encoder / decoder utilization
-- PCIe RX / TX throughput
-- 60-second GPU and VRAM history
-
-Metrics the driver does not expose are shown as unavailable (`—`) instead of
-false zeroes.
-
-### Linux system
-
-- CPU utilization and frequency
-- package temperature
-- load averages and I/O wait
-- Intel P-core / E-core grouping when exposed by Linux
-- per-core activity
-- RAM and swap usage
-- 60-second CPU and RAM history
-
-### Processes
-
-- process list with CPU, memory, thread counts and resident GPU memory
-- per-process GPU usage from DRM fdinfo (per-engine utilization, resident
-  memory) when the driver exposes it
-- sorting by PID, program, CPU, memory or threads
-- processes with the same program name grouped together
-- right-click groups to expand / collapse them
-- keyboard navigation with selection auto-scroll
-- double-click to pin a process
-- mouse-wheel scrolling
-- `/` process search by program, command or PID
-
-## Supported stack
-
-OrsikTop targets a deliberately focused setup:
-
-- Linux
-- `x86_64` prebuilt releases
-- NVIDIA GPUs through NVML, AMD GPUs/APUs through the amdgpu kernel
-  interface, Intel GPUs/APUs through i915/xe and hwmon
-- `llama.cpp` (`llama-server` or `llama serve`)
-- the Strata inference server, when configured explicitly (JSON `/metrics`)
-- local or manually configured endpoints
-- terminal-first, low-overhead monitoring
-
-The GPU layer runs behind a vendor-neutral provider interface: discovery
-comes from Linux DRM/sysfs, and each device is sampled by the backend that
-matches its vendor.
-
-## Installation
-
-### Recommended: standalone installer
-
-Install the latest release with:
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/exclude-barrier/OrsikTop/releases/latest/download/orsiktop-installer.sh | sh
-```
-
-The installer is generated with `dist` and installs two executables into:
-
-```text
-~/.local/bin/
-├── orsiktop
-└── orsiktop-update
-```
-
-A successful installation currently ends with output similar to:
-
-```text
-downloading orsiktop 0.3.2 x86_64-unknown-linux-gnu
-installing to /home/user/.local/bin
-  orsiktop
-  orsiktop-update
-```
-
-Those final executable names are normal installer output. The installation is complete at that point.
-
-### Make OrsikTop available in the current shell
-
-The installer can configure future shells, but it cannot change the `PATH` of the terminal that launched it. If `orsiktop` returns `command not found` right after installation, run:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-hash -r
-```
-
-Then verify the installation:
-
-```bash
-command -v orsiktop
-orsiktop --version
-```
-
-Expected output is similar to:
-
-```text
-/home/user/.local/bin/orsiktop
-orsiktop 0.3.2
-```
-
-You can then start OrsikTop with `orsiktop`.
-
-### Persistent PATH fallback
-
-Normally the installer handles the persistent PATH setup. If a newly opened terminal still cannot find `orsiktop`, add `~/.local/bin` to the startup file for your shell.
-
-**Bash:**
-
-```bash
-grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.bashrc || \
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-**Zsh:**
-
-```bash
-grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.zshrc || \
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-**Fish:**
-
-```fish
-fish_add_path "$HOME/.local/bin"
-```
-
-### Install with Cargo
-
-Cargo remains available for developers and as a fallback installation method.
-
-Install directly from GitHub:
-
-```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
-```
-
-Or install from a local checkout:
-
-```bash
-git clone https://github.com/exclude-barrier/OrsikTop.git
-cd OrsikTop
-cargo install --path . --locked --force
-```
-
-Cargo normally installs binaries into `~/.cargo/bin`.
-
-If a Cargo installation succeeds but `orsiktop` is not found:
-
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-hash -r
-```
-
-For a persistent Bash setup, for example:
-
-```bash
-grep -qxF 'export PATH="$HOME/.cargo/bin:$PATH"' ~/.bashrc || \
-  echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
-```
-
-## Updating
-
-Standalone installations include the updater next to the main binary:
-
-```bash
-orsiktop update
-```
-
-`orsiktop update` launches `orsiktop-update`, which updates OrsikTop from GitHub Releases.
-
-OrsikTop does **not** perform automatic background update checks.
-
-If OrsikTop was installed with Cargo instead of the standalone installer, update it with Cargo:
-
-```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --locked --force
-```
-
-## Uninstalling
-
-Standalone installations uninstall themselves:
-
-```bash
-orsiktop uninstall
-```
-
-This removes `~/.local/bin/orsiktop` and `~/.local/bin/orsiktop-update` and prints every file it removed. Your saved settings are kept; add `--purge` to remove them as well:
-
-```bash
-orsiktop uninstall --purge
-```
-
-which also deletes the config directory (`$XDG_CONFIG_HOME/orsiktop`, usually `~/.config/orsiktop`).
-
-If OrsikTop was installed with Cargo, `orsiktop uninstall` detects that, leaves the binaries in place, and tells you to run:
-
-```bash
-cargo uninstall orsiktop
-```
-
-## Auto discovery
-
-With **Auto discovery = ON**, OrsikTop scans local `/proc` entries for a running `llama-server` or `llama serve` process and derives its `--host` and `--port` automatically.
-
-A wildcard bind such as `0.0.0.0` or `::` is reached through loopback.
-
-If no local llama.cpp process is found, OrsikTop uses the saved endpoint and finally falls back to:
-
-```text
-http://127.0.0.1:8080
-```
-
-Auto discovery only inspects local processes. OrsikTop does **not** scan your LAN for llama.cpp servers.
-
-For a remote or fixed endpoint, disable Auto discovery in Settings and enter the desired host and port, or use `--server` for a one-off override.
-
-## Monitoring multiple servers
-
-OrsikTop monitors every locally discovered llama.cpp server **and** every configured endpoint at the same time, polling them all in the background. The details and LLM panels show the currently selected server; use the server selector to switch.
-
-- Press `s` to open the server selector: it lists every known server with its connection state, slot counts, context and throughput. `↑`/`↓` highlight a row, `Enter` selects it and `Esc` closes the selector. The header shows the selected server as `[n/N]` when more than one server is monitored.
-- Add, edit or remove extra endpoints in **Settings → SERVER LIST** (see [Settings](#settings)), or edit the config directly, comma-separated, next to the existing `server=`:
-
-```text
-server=http://127.0.0.1:8080
-servers=http://127.0.0.1:8081,http://192.168.1.20:8080
-```
-
-Each server is identified by its normalized endpoint, so `http://127.0.0.1:8081` and `http://127.0.0.1:8081/` are the same server, while `127.0.0.1` and `localhost` are kept distinct. An unreachable server is shown as offline and does not affect the others; its counters resume from a clean baseline when it returns.
-
-Each server keeps its own in-memory throughput history for the duration of the run, so every monitored server — selected or not — accumulates history and switching between servers preserves it (a proven same-endpoint restart starts a fresh history).
-
-At most **16** servers are polled. If you configure more, OrsikTop keeps the extra endpoints in the server selector under **NOT MONITORED — limit reached** and shows `· N over limit` in the header, instead of silently ignoring them; they are not polled and your saved config is left untouched.
-
-For a locally running server, the LLM panel shows the GPU it uses (`GPU <id>`) — a verified association from the server's process identity plus NVIDIA NVML compute-process / DRM render-node evidence, and it changes with the selected server. A remote or otherwise unverifiable server shows `GPU —` (not determined); this is not the same as CPU-only or 0% utilization.
-
-## Controls
-
-| Action | Control |
-| --- | --- |
-| Quit | `Esc` |
-| Help | `h` |
-| Settings | `q` |
-| Server selector | `s` |
-| Process search | `/` |
-| Faster refresh | click `[ - ]`, `-` or `[` |
-| Slower refresh | click `[ + ]`, `+` or `]` |
-| Process navigation | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn`, `Home` / `End` |
-| Scroll processes | mouse wheel |
-| Pin process | double-click process row |
-| Expand / collapse process group | right-click group |
-| Sort processes | click `PID`, `PROGRAM`, `CPU`, `MEM` or `THR` |
-
-The main telemetry refresh interval can be changed live from **100 ms to 10,000 ms**.
-
-The `h` help popup also carries a short legend for the LLM panel and selector
-fields — what `CTX` and `REQUEST` mean (current context occupancy vs. the
-in-flight request's tokens), the `PP`/`TG` rate columns, the `STATE` phases,
-the `SAMPLE` freshness field and the rule that an unknown value is shown as
-`—`, never as a fabricated zero.
-
-## Settings
-
-Press `q` to open the in-app settings menu:
-
-```text
-LLM Host/IP      127.0.0.1
-LLM Port         8081
-GPU              0
-Refresh          100 ms
-Process refresh  1000 ms
-Offline grace    2500 ms
-Auto discovery   ON
-
-SERVER LIST  2 additional · monitored 3/16
-  http://127.0.0.1:8081        primary
-> http://192.168.1.20:8080     monitored
-  https://llm.example:8443/…?… monitored
-```
-
-Settings can be changed without restarting OrsikTop.
-
-- `Tab`, `↑`, `↓` — move between fields
-- type / `Backspace` — edit values
-- `Space`, `←`, `→` — toggle Auto discovery
-- `Enter` — validate, save and apply
-- `Esc` — discard changes and close
-
-**SERVER LIST** manages the additional endpoints (`servers=`) next to the primary one. Focus it with `Tab` (or `↑` from the first field); then:
-
-- `↑` / `↓` — highlight an entry (at either end of the list they move on to the neighbouring field)
-- `a` (or `Insert`) — add an endpoint; type the full URL, e.g. `http://192.168.1.20:8080`
-- `e` — edit the highlighted endpoint
-- `d` (or `Delete`) — remove the highlighted endpoint
-- while typing an entry: `Enter` keeps it, `Esc` discards only that entry
-- `Enter` (outside an entry) — save and apply the whole dialog, as for the other fields; `Esc` discards every change, including list edits
-
-An entry must be an absolute URL with a host. A duplicate — the same target as the primary endpoint or another entry, written differently (trailing slash, case, default port, other credentials) — is rejected with a message. The saved list is adopted live: newly added servers start being polled and removed ones stop, without a restart. Up to **16** configured endpoints are monitored; entries beyond that are kept in the config and marked *not monitored*.
-
-Credentials, paths and query values are never shown: list rows and messages show only scheme, host and port (`…` marks a hidden path or query), and while you type an entry its userinfo and query values are masked with `•`. The stored value keeps them unchanged.
-
-Configuration is stored in:
-
-```text
-$XDG_CONFIG_HOME/orsiktop/config
-```
-
-or, when `XDG_CONFIG_HOME` is not set:
-
-```text
-~/.config/orsiktop/config
-```
-
-Saved settings include the LLM endpoint, the additional server list, GPU selection, main refresh interval, process refresh interval, offline grace period and auto-discovery state.
-
-**LLM Host/IP** and **LLM Port** edit the endpoint in place. The scheme (including `https`), path, credentials and query of an existing endpoint are preserved, and saving without changing host or port keeps the stored endpoint exactly as it was — changing only the refresh interval or the GPU can never rewrite `https://…` to `http://…` or drop a path.
-
-## CLI
-
-Show the built-in help:
-
-```bash
-orsiktop --help
-```
-
-Show the installed version:
-
-```bash
-orsiktop --version
-```
-
-Subcommands:
-
-| Command | Effect |
-| --- | --- |
-| `orsiktop update` | Updates a standalone installation to the latest release |
-| `orsiktop diag` | Prints a no-secrets diagnostics summary for bug reports (honors `--server` and `--gpu`/`--gpu-index`) |
-| `orsiktop diag --servers` | Prints the multi-server overview: every monitored endpoint (up to 16) probed once, plus any configured endpoint past the cap listed as *not monitored* (never probed) |
-| `orsiktop uninstall` | Removes the standalone binaries, keeps the config |
-| `orsiktop uninstall --purge` | Removes the binaries and the config directory |
-
-Available one-off overrides for a single run:
-
-| Option | Environment variable | Purpose |
-| --- | --- | --- |
-| `--server` | `ORSIKTOP_SERVER` | llama.cpp endpoint; disables auto discovery for that run |
-| `--gpu` | `ORSIKTOP_GPU` | GPU by PCI BDF (any vendor), vendor UUID (NVIDIA) or a bare number (n-th NVIDIA GPU; on NVIDIA-less machines the n-th device overall) |
-| `--gpu-index` | `ORSIKTOP_GPU_INDEX` | legacy n-th NVIDIA GPU index (prefer `--gpu`) |
-
-Examples:
-
-```bash
-orsiktop --server http://192.168.1.20:8081
-orsiktop --interval-ms 500
-orsiktop --gpu 0000:41:00.0
-```
-
-## Troubleshooting
-
-### `orsiktop: command not found`
-
-First confirm that the standalone installer created the binary:
-
-```bash
-ls -l "$HOME/.local/bin/orsiktop"
-```
-
-If it exists, activate the path in the current shell:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-hash -r
-orsiktop --version
-```
-
-If a new terminal still cannot find it, use the persistent PATH instructions in the installation section above.
-
-### LLM telemetry is offline or incomplete
-
-Make sure llama.cpp was started with metrics enabled:
-
-```bash
---metrics
-```
-
-You can test the metrics endpoint directly:
-
-```bash
-curl http://127.0.0.1:8080/metrics
-```
-
-Adjust the port if your llama.cpp server uses a different one.
-
-If you use a fixed or remote server, either configure it in OrsikTop Settings or run:
+Local llama.cpp servers are discovered automatically. For a fixed or remote endpoint, including Strata, use:
 
 ```bash
 orsiktop --server http://HOST:PORT
 ```
 
-### GPU data is unavailable
+Auto discovery only inspects local processes; it does not scan your LAN. See [Server discovery](docs/USAGE.md#server-discovery) for selection rules.
 
-OrsikTop discovers GPUs from Linux DRM/sysfs and reads each device's native
-interface: NVIDIA through NVML (loaded dynamically via `nvml-wrapper`, no
-`nvidia-smi` subprocesses), AMD and Intel through their kernel sysfs and
-hwmon. A normal vendor driver installation provides these interfaces.
+## Everyday use
 
-Check that your driver is working:
+| Action | Control |
+| --- | --- |
+| Help and metric legend | `h` |
+| Settings and additional server list | `q` |
+| Server selector | `s` |
+| Search processes | `/` |
+| Navigate processes | `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn` |
+| Change refresh interval | `-` / `+`, or click `[ - ]` / `[ + ]` |
+| Quit dashboard / close dialog | `Esc` |
 
-```bash
-nvidia-smi            # NVIDIA
-cat /sys/class/drm/card*/device/vendor   # any vendor (0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel)
-```
+Press `s`, move with `↑` / `↓`, then press `Enter` to select a server. The selector shows connection state, activity phase, sample age, backend, slots, context and throughput.
 
-Metrics the driver does not expose are shown as `—` (unavailable) rather than
-false zeroes. OrsikTop does not bundle GPU drivers or vendor libraries.
+![OrsikTop server selector showing a connected llama.cpp endpoint generating tokens](assets/server-selector.png)
 
-## Release integrity
+*Server selector during the same inference run, with activity phase, backend, slots, context, live decode rate and sample interval.*
 
-Standalone releases are built and published through GitHub Actions with `dist`.
+To manage endpoints, open **`q` → SERVER LIST**: `a` adds, `e` edits and `d` removes an additional endpoint. `Enter` keeps an entry; `Enter` outside entry editing saves the whole dialog. `Esc` discards the current entry or dialog. The primary endpoint stays in the Host/IP and Port fields.
 
-Release artifacts include SHA-256 checksums and GitHub artifact attestations.
-
-The release page contains the installer, updater, prebuilt archive, checksums and source archive for each published version.
-
-## Build from source
+Update a standalone installation with:
 
 ```bash
-git clone https://github.com/exclude-barrier/OrsikTop.git
-cd OrsikTop
-cargo build --release --locked
-./target/release/orsiktop
+orsiktop update
 ```
 
-## Architecture
+There are no automatic background update checks. Full controls, configuration, CLI overrides and telemetry definitions are in the [Usage guide](docs/USAGE.md).
 
-```text
-src/
-├── main.rs         terminal setup, CLI, subcommands and updater entry point
-├── config.rs       persistent runtime settings
-├── domain.rs       normalized, vendor-neutral telemetry models
-├── app.rs          event loop and telemetry workers
-├── llama.rs        llama.cpp client: polling and metric mapping (LlamaMonitor)
-│   └── llama/       extracted submodules (behaviour-preserving split)
-│       ├── http.rs         HTTP fetch helpers for the telemetry endpoints
-│       ├── metrics.rs      /metrics body dispatch (Prometheus text or Strata JSON)
-│       ├── props.rs        /props parsing and display-safe error text
-│       ├── slots.rs        /slots parsing and per-slot throughput
-│       └── speculative.rs  speculative-decoding / MTP config detection
-├── strata.rs       Strata inference server JSON /metrics adapter
-├── discovery.rs    vendor-neutral GPU discovery (Linux DRM/sysfs)
-├── discovery_llm.rs  llama.cpp server discovery (processes + config)
-├── gpu_map.rs      llama.cpp server → GPU(s) mapping
-├── drm.rs          per-process GPU usage from DRM fdinfo
-├── providers/      GpuProvider interface and vendor backends
-│   ├── nvidia.rs    NVIDIA NVML backend
-│   ├── amd.rs       AMD amdgpu sysfs + hwmon backend
-│   └── intel.rs     Intel i915/xe sysfs + hwmon backend
-├── gpu.rs          GPU provider factory and PCIe link math
-├── cpu.rs          CPU topology (hybrid P/E/LP classification)
-├── cpu_sensors.rs  CPU frequency, temperature and RAPL power
-├── diagnostics.rs  `orsiktop diag` bug-report summary
-├── redact.rs       no-secrets URL rendering shared by diagnostics and telemetry errors
-├── server_editor.rs  pure helpers for the Settings server list (identity, validation, masking)
-├── system.rs       filesystem abstraction (real + fixture)
-└── ui.rs           ratatui rendering, event handling and histories
-    └── ui/          extracted per-panel submodules (behaviour-preserving split)
-        ├── dialogs.rs     help, settings and server-selection dialogs
-        ├── gpu_panel.rs   GPU panel
-        ├── history.rs     history and sparkline rendering
-        ├── llm.rs         LLM telemetry panel
-        ├── processes.rs   process list and grouping
-        ├── system.rs      CPU / RAM system panel
-        └── widgets.rs     shared table and text widgets
+## Compatibility and limits
+
+- **Platform:** Linux. Prebuilt releases target `x86_64-unknown-linux-gnu`; macOS and Windows are not supported.
+- **Backends:** llama.cpp Prometheus `/metrics` and Strata JSON `/metrics` are detected from their responses, not merely from a reachable URL. Strata endpoints must be configured explicitly. Strata does not expose instantaneous prefill throughput; older slot schemas also lack current context occupancy.
+- **GPUs:** NVIDIA uses NVML; AMD uses amdgpu sysfs/hwmon; Intel uses i915/xe sysfs/hwmon. Metrics are not identical across vendors. AMD hardware and NVIDIA MIG remain fixture-tested, not live-verified. See the [hardware support matrix](docs/HARDWARE_SUPPORT.md) and [backend compatibility reference](docs/BACKEND_VERSIONS.md).
+- **Remote servers:** LLM telemetry can come from remote endpoints. CPU, RAM, GPU and process panels describe the machine running OrsikTop, not the remote host. Remote server-to-GPU association remains unknown.
+- **Server limit:** at most 16 servers are polled. Extra configured endpoints are retained and marked **NOT MONITORED — limit reached**, not reported as offline.
+- **Terminal size:** the full dashboard needs at least **72×22** cells. A reduced layout works from **54×16**; smaller terminals show a resize notice.
+- **Measurements:** `CTX` is reported slot context occupancy, not request progress or exact physical KV-cache use. `REQUEST` describes the in-flight request. Unavailable values stay `—`.
+
+## Troubleshooting
+
+- **`orsiktop: command not found`:** activate `~/.local/bin` in your shell. See [PATH setup](docs/INSTALLATION.md#path-setup).
+- **Offline or incomplete LLM telemetry:** check the endpoint and ensure llama.cpp was started with `--metrics`. `/slots` is optional; missing fields remain unavailable. See [Telemetry troubleshooting](docs/USAGE.md#troubleshooting).
+- **Missing GPU readings:** check drivers, permissions and the [hardware support matrix](docs/HARDWARE_SUPPORT.md). Not every GPU exposes every metric.
+
+For a bug report, collect the read-only diagnostics:
+
+```bash
+orsiktop diag
+orsiktop diag --servers
 ```
 
-Two worker threads publish snapshots and the UI renders only the latest one: a fast worker samples system, GPU and process data, and a separate LLM worker performs the llama.cpp HTTP polling. A slow `/metrics` or `/slots` response therefore does not block keyboard/mouse input or fast GPU updates. `llama.rs` (`LlamaMonitor`, polling, metric mapping) and `ui.rs` (layout, event handling, state) remain the main modules; focused helpers were extracted into `src/llama/` and `src/ui/`. Put new helper code in the matching submodule where one exists.
+Diagnostics redact endpoint credentials, paths and query values. Review the report before publishing it: it still contains hardware details, hostnames and addresses.
 
-## Design goals
+## Documentation
 
-OrsikTop should stay:
+- [Installation](docs/INSTALLATION.md): standalone and Cargo installs, shell PATH, updating, uninstalling, checksums and attestations.
+- [Usage](docs/USAGE.md): controls, settings, multi-server behavior, configuration, CLI and metric meanings.
+- [Development](docs/DEVELOPMENT.md): source build, module responsibilities and validation commands.
+- [Hardware support](docs/HARDWARE_SUPPORT.md) and [hardware test matrix](docs/HARDWARE_TEST_MATRIX.md): implemented paths, live evidence and remaining gaps.
+- [Backend versions](docs/BACKEND_VERSIONS.md) and [live vs fixture evidence](docs/LIVE_VS_FIXTURE.md): telemetry schema support and verification limits.
+- [Changelog](CHANGELOG.md) and [releases](https://github.com/exclude-barrier/OrsikTop/releases).
 
-- fast
-- readable
-- useful for local LLM inference
-- easy to run
-- deliberately small
+## Contributing
 
-Features are added when they improve monitoring rather than simply making the TUI busier.
+Bug reports and focused feature requests are welcome through [GitHub Issues](https://github.com/exclude-barrier/OrsikTop/issues). Include your OrsikTop version, expected behavior, steps to reproduce and reviewed diagnostics where useful. Keep changes focused on making monitoring clearer and more useful.
 
-## Status
-
-OrsikTop is still early software. The GPU layer runs behind a vendor-neutral provider interface (NVIDIA, AMD and Intel backends; see the [hardware support matrix](docs/HARDWARE_SUPPORT.md)). NVIDIA MIG is implemented (S17) but not yet live-verified on MIG hardware; the remaining focus is that live verification rather than new vendor support.
-
-Bug reports and focused feature requests are welcome through GitHub Issues.
+For source builds and checks before submitting changes, see [Development](docs/DEVELOPMENT.md).
 
 ## License
 
-Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
