@@ -55,6 +55,23 @@ be meaningless under a parallel run. When the binary is not single-threaded
 they are printed (in the `ORSKTOP_SOAK|…` report line) but not asserted. Run it
 on an otherwise idle machine; it binds loopback ports only.
 
+## Release-binary soak (SOAK-01)
+
+The release harness runs the optimized binary against four loopback mock
+servers for an arbitrary duration. It is an external measurement, not a test
+with assertions, and it never contacts a real inference server:
+
+```sh
+python3 scripts/perf_release_bench.py --scenarios soak_mock_4 \
+    --soak-duration 14400 --out /tmp/orsiktop-bench/soak4h
+```
+
+It samples `/proc/<pid>` every 50 ms and records CPU, RSS/VmHWM, thread
+count/high-water, thread arrivals (sampling lower bound), frame cadence, poll
+requests/cycle and shutdown time. The JSON result is the long-run evidence for
+RSS/thread stability; a flat trend supports keeping the current polling
+architecture, a growing trend is a concrete leak candidate.
+
 ## Current-SHA long run (2026-10-17, ee2d778)
 
 Run on `cf-laptop` with the default 60 s per server count. The host was

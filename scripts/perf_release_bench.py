@@ -3,10 +3,10 @@
 
 Measures the *real* release binary (`target/release/orsiktop`) from the
 outside. The application runs in its own pseudo-terminal; every application
-figure (CPU, RSS, threads, frames, input latency, startup) is read from
-`/proc/<app pid>` or from the application's own terminal output. The runner
-and the loopback mock servers run in *separate* processes and are never
-counted as application cost.
+figure (CPU, RSS, threads, thread arrivals as a sampling lower bound, frames,
+input latency, startup) is read from `/proc/<app pid>` or from the application's
+own terminal output. The runner and the loopback mock servers run in *separate*
+processes and are never counted as application cost.
 
 No real inference server is contacted: every monitored endpoint is a
 loopback mock started by this script (or a closed loopback port for the
@@ -358,6 +358,7 @@ SCENARIOS = {
     "mock_1": (1, 1000, 0),
     "mock_4": (4, 1000, 0),
     "mock_16": (16, 1000, 0),
+    "mock_16_refresh_250": (16, 250, 0),
     "mock_1_refresh_100": (1, 100, 0),
     "mock_1_refresh_250": (1, 250, 0),
     "mock_1_refresh_5000": (1, 5000, 0),
@@ -443,6 +444,8 @@ def run_scenario(name: str, binary: Path, duration: float, warmup: float,
                 result["startup_model_on_screen_ms"] = _ms(app.model_seen, app.t_spawn)
                 # --- steady-state window ---------------------------------
                 samples = []
+                seen_tids = set(os.listdir(f"/proc/{app.pid}/task"))
+                thread_starts = 0
                 f0 = len(app.frames)
                 t0 = time.monotonic()
                 c0 = proc_cpu_ticks(app.pid)
@@ -450,6 +453,9 @@ def run_scenario(name: str, binary: Path, duration: float, warmup: float,
                 s0 = proc_status(app.pid)
                 while time.monotonic() - t0 < duration:
                     st = proc_status(app.pid)
+                    tids = set(os.listdir(f"/proc/{app.pid}/task"))
+                    thread_starts += len(tids - seen_tids)
+                    seen_tids |= tids
                     samples.append((time.monotonic() - t0, st["VmRSS"], st["Threads"]))
                     time.sleep(0.05)
                 t1 = time.monotonic()
@@ -486,6 +492,10 @@ def run_scenario(name: str, binary: Path, duration: float, warmup: float,
                     [s[1] for s in samples if s[0] > elapsed - 10] or rss)
                 result["vm_hwm_kb"] = s1["VmHWM"]
                 result["threads"] = summarize(thr)
+                # Sampling can miss threads that start and exit inside one
+                # 50 ms interval; this is a lower bound, not a start count.
+                result["thread_starts_lower_bound"] = thread_starts
+                result["thread_starts_lower_bound_per_s"] = thread_starts / elapsed
                 result["ctx_switches_per_s"] = (
                     (s1["voluntary_ctxt_switches"] - s0["voluntary_ctxt_switches"])
                     + (s1["nonvoluntary_ctxt_switches"] - s0["nonvoluntary_ctxt_switches"])

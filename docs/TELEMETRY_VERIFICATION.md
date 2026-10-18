@@ -1,7 +1,18 @@
 # Telemetrie — systematische Verifikation gegen HEAD
 
 **Ticket:** CFA-33 (EPIC 2.1, CFA-27)
-**Verifizierter Stand:** Branch `feature/cfa27-integration`, HEAD `2e0d37f`
+
+> **Current status (2026-10-17, `main` `2e1f0d2`):** the semantic contract
+> below still holds; the detailed CFA-33 verification is historical (HEAD
+> `2e0d37f`). Current gate: **583 passed / 8 ignored**. Concise contract:
+> CTX = direct slot occupancy only; REQUEST = `n_prompt_tokens_processed`;
+> LIVE = verified slot/aggregate delta, otherwise unavailable; AVG = lifetime
+> counters ÷ lifetime seconds; missing = `—`, never zero; counter reset and
+> stale reconnect data are unavailable/stale, never a fresh rate.
+> Regression evidence: `src/llama/slots.rs`, `src/llama/metrics.rs`,
+> `src/ui/llm.rs`, `src/app.rs` tests.
+
+**Historischer verifizierter Stand:** Branch `feature/cfa27-integration`, HEAD `2e0d37f`
 **Testnachweis:** `pc-project cargo test --all-targets --locked` auf `test-desktop`,
 `468 passed / 0 failed / 3 ignored`, Exitcode 0, `source_unchanged: true`.
 Belegt durch zwei Läufe am gleichen Quellstand:

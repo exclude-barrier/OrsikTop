@@ -18,10 +18,10 @@ The source code and its tests remain the source of truth. This matrix records
 `docs/HARDWARE_SUPPORT.md` / `docs/LIVE_VS_FIXTURE.md`, and where hardware is
 missing the gap is named, never filled with a fabricated value.
 
-Matrix baseline: OrsikTop **v0.4.0**, git `e9600d6` (2026-10-14). Every test
-name and `file:line` below was re-checked against this revision. Test *names*
-are the stable key; Rust line numbers move with the tree and are indicative
-only.
+Matrix baseline: OrsikTop **v0.4.1**, git `2e1f0d2` (2026-10-17). Test
+*names* are the stable key; Rust line numbers move with the tree and are
+indicative only. The live-evidence rows below remain v0.4.0-era observations;
+this rebaseline adds no new live claim.
 
 ## Evidence levels
 
@@ -68,7 +68,7 @@ environments*), so no live value can be recorded.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | exact model | — | — | — | — | — | — | — |
 | kernel / driver version | — | — | — | — | — | — | — |
-| OrsikTop version | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 | v0.4.0 |
+| OrsikTop version | v0.4.1 | v0.4.1 | v0.4.1 | v0.4.1 | v0.4.1 | v0.4.1 | v0.4.1 |
 | test method | §4.1 | §4.1 | §4.2 | §4.2 | §4.3 | §4.4 | §4.5 |
 | real measurement | — | — | — | — | — | — | — |
 | field availability (provider; implemented + fixture-tested) | busy %, VRAM total/used, `product_name`, temp, sclk/mclk, power, fan | VRAM carveout via `mem_info_vram_*` | graphics clock, throttle reasons | `temp1_input`, `power1_max` (PL1) | `Tctl`/package temp (k10temp, zenpower) | per-GPU provider sample + `Index(n)` selection | MIG child identity + instance attribution |
@@ -300,7 +300,10 @@ was checked against the source at the current HEAD. Where a live claim could not
 be traced to a recorded run it is not asserted; where hardware is absent the row
 is marked **Open**, not guessed.
 
-Re-verified 2026-10-14 against git `e9600d6`: all cited test/function names and
+Test names re-checked 2026-10-17 against `2e1f0d2`: all 38 cited identifiers are
+present in `src/`. Line numbers remain indicative.
+
+Historical re-verification 2026-10-14 against git `e9600d6`: all cited test/function names and
 their `file:line` were re-resolved in the working tree; one stale reference was
 corrected (`gpu_in_mapping_matches_mig_parent_and_child`, `src/ui.rs` 3728 →
 3753). The evidence-required table above was added for HW-01; it asserts no new
