@@ -15,6 +15,10 @@ All notable changes to OrsikTop will be documented here.
   16 servers use 5.49 % of one CPU, 39.12 MiB RSS and peak at 67 threads.
 - **Long soak validation.** The 16-server long soak passes with peak 78
   threads, flat RSS and 1.2 s shutdown.
+- **4-hour release soak.** Four servers run for `14400 s`: threads stable at
+  mean 8.02 (max 24), RSS ends below its first-window value, poll cycle
+  1000.07 ms, shutdown 32.9 ms. No leak; CPU is not a clean baseline because
+  foreign load rose during the run.
 - **PERF-02 thread peak measured.** At 16 servers / 250 ms the release binary
   peaks at 75 threads (mean 20.66), uses 11.1 % of one CPU, and holds a 250.1 ms
   poll cycle. The thread-per-poll architecture stays; no pool without a

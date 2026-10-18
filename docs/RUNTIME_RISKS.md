@@ -141,6 +141,9 @@ case is one request timeout per cycle, and the UI already keeps the last values.
   lower bound (`13,0–13,6`/s at 50-ms sampling), not a complete count.
   **Decision:** keep thread-per-poll; no pool without a measured long-run
   trend.
+- 4-h release soak (four servers, `14400 s`): threads mean `8,02`, p95 `8`,
+  max `24`; RSS first/last `42 334`/`39 052` kB, HWM `51 920` kB. No thread or
+  RSS accumulation; shutdown `32,9` ms. See `docs/SOAK_HARNESS.md`.
 
 **Effect:** no leak — the scoped threads end with each cycle — but a measurable
 creation/teardown cost and a peak that is bounded by the server cap plus the
@@ -165,7 +168,8 @@ bounded peak, so the pool is not justified without a long-run trend.
 deadline is missed, `run()` still returns `Ok(())`; the worker stays detached
 and is reclaimed by the OS at process exit. A final sample can be lost, and the
 UI never shows "a worker did not stop". Measured shutdown in the CFA-94 long
-soak: `shutdown_ms` ≈ 1.2 s (all three runs), well inside the bound.
+soak: `shutdown_ms` ≈ 1.2 s (all three runs); 4-h release soak: `32,9` ms.
+Both are well inside the bound.
 
 **Recommended follow-up:** none required for the deadline itself; optionally
 record that a worker was leaked during shutdown (a flag/`diag` note), so a

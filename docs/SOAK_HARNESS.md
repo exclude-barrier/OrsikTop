@@ -72,6 +72,35 @@ requests/cycle and shutdown time. The JSON result is the long-run evidence for
 RSS/thread stability; a flat trend supports keeping the current polling
 architecture, a growing trend is a concrete leak candidate.
 
+### 4-hour release soak (2026-10-18)
+
+Run on `cf-desktop` with four loopback mocks, `--soak-duration 14400`
+(4 h), release binary `c013880` (SHA-256 `d872c5a2…`):
+
+```sh
+python3 scripts/perf_release_bench.py --scenarios soak_mock_4 \
+    --soak-duration 14400 --out /tmp/orsiktop-bench/soak4h
+```
+
+| Metrik | Wert |
+| --- | --- |
+| Duration / exit | `14400 s` / `0` |
+| RSS first → last | `42 334` → `39 052` kB |
+| RSS mean / median / HWM | `38 685` / `34 020` / `51 920` kB |
+| Threads mean / p95 / max | `8,02` / `8` / `24` |
+| Thread starts (50-ms lower bound) | `6 070` total, `0,42`/s |
+| Poll requests | `8,13`/s (`117 108` total) |
+| Poll cycle median / p95 | `1 000,07` / `1 000,78` ms |
+| Fan-out spread median | `0,65` ms |
+| Shutdown | `32,9` ms |
+
+No RSS or thread accumulation over 4 h; RSS ends below its first-window value
+and threads stay at the 8-thread steady state. Poll cadence is stable. Host
+load rose from `0,30` to `9,63` during the run due to foreign work, so the
+reported `47,36 %` of one CPU (fast worker `46,32 %`) is **not** a clean
+performance baseline; the resource/stability result is still valid. Raw data:
+`target/perf-bench-soak4h.json` (not versioned).
+
 ## Current-SHA long run (2026-10-17, ee2d778)
 
 Run on `cf-laptop` with the default 60 s per server count. The host was
