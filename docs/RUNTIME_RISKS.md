@@ -116,7 +116,7 @@ does not claim the cycle rate is independent of the slowest server.
 fixed per-server poll pool with independent cadences. Low priority: the worst
 case is one request timeout per cycle, and the UI already keeps the last values.
 
-## F5 — Thread count stays bounded under 16 servers, but with high thread churn (low)
+## F5 — Thread count stays bounded under 16 servers (low, measured; keep architecture)
 
 **Evidence**
 - Steady-state threads: 1 main (`run`), 1 fast worker (`spawn_fast_worker`,
@@ -135,6 +135,12 @@ case is one request timeout per cycle, and the UI already keeps the last values.
 - Long soak on `ee2d778` (60 s per server count): 16 servers peak `78`,
   settling to `2` after shutdown; RSS median `18 848` → `17 660` kB. See
   `docs/SOAK_HARNESS.md`.
+- Release run on `cf-desktop` at 16 servers / 250 ms (two 60-s runs): peak
+  `68`/`75`, mean `20,66`, CPU `11,05–11,08 %` of one CPU, poll cycle median
+  `250,1` ms, shutdown `32`/`114` ms. The thread-start rate is only an external
+  lower bound (`13,0–13,6`/s at 50-ms sampling), not a complete count.
+  **Decision:** keep thread-per-poll; no pool without a measured long-run
+  trend.
 
 **Effect:** no leak — the scoped threads end with each cycle — but a measurable
 creation/teardown cost and a peak that is bounded by the server cap plus the
@@ -143,9 +149,9 @@ stays at the cap-driven level and the driver-thread gap is closed; the
 transient peak is higher than the steady state but below the long-soak peak.
 Not a correctness risk.
 
-**Recommended follow-up:** a small fixed poll pool (16 workers, work stealing or
-per-server assignment) would remove the churn. Optional; only if profiling shows
-it matters.
+**Recommended follow-up:** none after PERF-02. A fixed poll pool would remove
+the churn, but 16 servers at 250 ms measured only 11.1 % of one CPU and a
+bounded peak, so the pool is not justified without a long-run trend.
 
 ## F6 — Shutdown is orderly and bounded; a worker that misses the deadline is not hard-killed (low)
 

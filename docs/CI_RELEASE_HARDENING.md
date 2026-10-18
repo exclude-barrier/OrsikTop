@@ -1,8 +1,9 @@
 # CI and release hardening review
 
 Ticket: CFA-100 (roadmap phase 3, EPIC 6, CI-01). Analysis only: no workflow,
-release or repository setting was changed. Baseline: `origin/main` `536e424`
-(v0.4.0 plus the GitHub Actions bumps #43–#45), checked on 2026-10-15.
+release or repository setting was changed. Baseline: `origin/main` `2e1f0d2`
+(v0.4.1 plus post-release hardening), checked on 2026-10-17. The detailed
+finding text below is historical; the applied-hardening section is current.
 
 Repository files were read directly; server-side settings (branch protection,
 rulesets, code scanning, workflow token defaults) were read through the GitHub
@@ -161,6 +162,11 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   `release.yml` now runs only on `main` and tag pushes, so a PR never receives
   the write scope needed to create a release. Re-check this split after
   `dist generate`.
+- **CodeQL (2026-10-17).** The GitHub code-scanning alerts API reports **0 open
+  alerts** for this repository; this supersedes the audit's “unspecified”.
+- **Current verification (`2e1f0d2`).** Main CI run `39069363749` passed with
+  `583 passed / 8 ignored`; the release run `39069363730` skipped `plan`, all
+  build jobs and `host`, so a `main` push did not publish.
 - The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
   passed only to the `plan` step that invokes `dist host --steps=create`.
 - GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned

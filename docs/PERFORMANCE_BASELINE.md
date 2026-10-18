@@ -2,6 +2,11 @@
 
 **Ticket:** CFA-35 (EPIC 3.1 „Reproduzierbares Performance-Profiling“, CFA-27)
 
+> **Current status:** the clean current-SHA release baseline and PERF-02 thread
+> measurement are in [Current-SHA-Referenz](#current-sha-referenz-2026-10-17-c013880-sauber).
+> The CFA-35/36/92/93 sections below are historical evidence, not current
+> thresholds.
+
 Dieses Dokument trennt strikt zwischen **gemessenen** Werten, **abgeleiteten**
 Werten und **modellierten** Werten und kennzeichnet jede Zahl als eines davon.
 Es ändert keine Produktionslogik; insbesondere bleibt `src/strata.rs`
@@ -874,6 +879,30 @@ Poll-Zyklus, kein dauerhafter Anstieg im Messfenster; alle Läufe enden mit
 `exit_code=0`. Der RTX-4090-Treiber war aktiv, daher enthält diese Messung
 NVML-/Treiber-Threads — die frühere F5-Lücke ist damit auf dem Release-Pfad
 geschlossen.
+
+### PERF-02 — Peak-Threads bei 16 Servern und 250 ms
+
+Zwei 60-s-Läufe mit `mock_16_refresh_250` auf demselben idle `cf-desktop` und
+Binary. Die Startrate ist eine **untere Schranke** aus 50-ms-Abtastung von
+`/proc/<pid>/task`; kurzlebige Threads können zwischen zwei Samples starten und
+enden. Das ist kein vollständiger Startzähler. Rohdaten:
+`target/perf-bench-thread-250.json` (nicht versioniert).
+
+| Lauf | CPU % | Frames/s | Eingabe p95 ms | RSS MiB | Threads mean/max | Start-LB/s | Shutdown ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 11,08 | 8,11 | 1,74 | 40,37 | 20,66 / 68 | 13,60 | 31,9 |
+| 1 | 11,05 | 7,46 | 2,49 | 40,27 | 20,66 / 75 | 12,99 | 114,0 |
+
+Polling blieb exakt im Takt: `128,5` Requests/s, Zyklus-Median `250,1` ms,
+Fan-out-Spread `2,8` ms. Peak-Threads `75` bei 16 Servern und 64 Poll-Zyklen/s,
+Duty-Cycle-Mittelwert `20,66`; RSS im 60-s-Fenster stabil (`40,3–40,4 MiB`).
+
+**Entscheidung PERF-03: aktuelle Thread-pro-Poll-Architektur beibehalten.** Ein
+fester Poll-Pool ist bei diesem Profil nicht gerechtfertigt: Peak und CPU sind
+niedrig, der Takt ist stabil und es gibt keinen gemessenen Leak. Die 4-h-Soak
+prüft die Langzeitstabilität; erst ein dort sichtbarer Trend würde einen Pool
+rechtfertigen. Die statische Obergrenze aus dem Audit bleibt dokumentiert, ist
+aber keine gemessene Startrate.
 
 **Einordnung:** Das ist die saubere aktuelle Release-Referenz. Die Werte sind
 maschinenspezifisch (`cf-desktop`); für andere Hosts ist der Lauf dort zu
