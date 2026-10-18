@@ -36,11 +36,17 @@ Environments (both non-root, kernel `7.2.5-omarchy`; see
   `llama serve` (b10909, `--parallel 2`). Captured 2026-09-18 (S24).
 - One live backend run (Strata) names no box (commit text only).
 
-Baseline `main @ c06bded`, 467 tests green on test-desktop; the one regression
-test added by this document brings the suite to 468. Ignored-by-default
+Baseline `main @ 2c087a3`, **583 passed / 8 ignored**. Ignored-by-default
 live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 `intel_real_system_smoke` (`src/providers/intel.rs:581`),
 `drm_real_system_smoke` (`src/drm.rs:904`) — run with `cargo test -- --ignored`.
+
+**2026-10-18 live diag on `cf-desktop`:** the Intel i915 iGPU
+(`0000:00:02.0`) and NVIDIA RTX 4090 (`0000:01:00.0`) were both discovered by
+DRM/sysfs; CPU topology/frequency/temperature were live. NVML was unavailable
+with `RM detects a driver/library version mismatch` (userspace `615.78`), so
+the GPU provider reported the error and `—` values, not fake zeros; `diag`
+exited `0`. No new GPU-inference or i915-provider sample was captured.
 
 ## Matrix
 
@@ -48,16 +54,16 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 | --- | --- | --- | --- | --- |
 | LLM telemetry — llama.cpp | Single-slot: a **remote** single-slot server observed from the dev box (`0 busy / 1 total`); multi-slot `--parallel 2`: remote b10909 over Tailscale + local test-desktop (S24) | Prometheus/slots/props parsing, slot pairing, spec/MTP, counter reset; candidate ordering across **>1** server (tested, never observed live) | — | `tests/fixtures/*.prom`, `slots_*.json`, `props.json`; `src/llama.rs` tests |
 | LLM telemetry — Strata backend | `/metrics` against a real Strata build `0.1.40` (box not named) — totals completion-batched, `live.tok_s` windowed | Wire-format dispatch, phase normalization, old/new `/slots` schema (incl. the newer `n_prompt_tokens` shape: captured, not live-re-verified) | — | `src/strata.rs` tests; `tests/fixtures/slots_strata_{old,new}.json` |
-| GPU — NVIDIA discrete | RTX 4090 on test-desktop, under active inference | Parsers, sanitizers, MIG topology; multi-NVIDIA index selection (`index_selects_the_nth_nvidia_on_igpu_dgpu_machines`, `src/gpu.rs:285`); UUID half of identity | — | `src/providers/nvidia.rs` tests |
+| GPU — NVIDIA discrete | RTX 4090 on test-desktop, under active inference; 2026-10-18 diag on the same box hit an NVML driver/library mismatch and reported unavailable values without a panic | Parsers, sanitizers, MIG topology; multi-NVIDIA index selection (`index_selects_the_nth_nvidia_on_igpu_dgpu_machines`, `src/gpu.rs:285`); UUID half of identity | — | `src/providers/nvidia.rs` tests |
 | GPU — AMD (dGPU and APU) | — | Full amdgpu sysfs + hwmon shapes, carveout, malformed values | — | `src/providers/amd.rs` tests |
 | GPU — Intel xe (iGPU/APU) | xe iGPU on dev box (discovery, clock, throttle; temp/power `None`) | xe dGfx-hwmon + APU shapes (`samples_xe_dgpu_with_hwmon`, `xe_apu_without_hwmon_keeps_clock_and_reason`) | — | `intel_real_system_smoke`; `src/providers/intel.rs` tests |
 | GPU — Intel i915 / Arc dGPU | — | i915 root-GT and `gt/gt0` fallback, dGfx hwmon (`temp1_input`, PL1) | — | `src/providers/intel.rs::tests` |
 | GPU — NVIDIA MIG | — | Topology, stable child keys, process attribution, UI matching | Exact `MIG-…` UUID form a driver emits; `Device::uuid()` on a child handle | `src/providers/nvidia.rs`, `src/gpu_map.rs`, `src/domain.rs`, `src/ui.rs` |
-| CPU / sensors | Hybrid P+E topology, cpufreq, hwmon temperature, RAPL `None` under non-root (dev box) | LP-E class; conventional (all-P) Intel; **AMD CPU thermal sensors** (`k10temp`/`Tctl`); capacity fallback | — | `src/cpu.rs`, `src/cpu_sensors.rs` tests |
+| CPU / sensors | Hybrid P+E topology, cpufreq, hwmon temperature, RAPL `None` under non-root (dev box); 2026-10-18 `cf-desktop` diag: i9-12900K P=8/E=8, 4428 MHz, 51 °C, power `—` | LP-E class; conventional (all-P) Intel; **AMD CPU thermal sensors** (`k10temp`/`Tctl`); capacity fallback | — | `src/cpu.rs`, `src/cpu_sensors.rs` tests |
 | Multi-server | — (only a **single** server was ever auto-discovered; parallel polling/isolation/selector never observed live) | Concurrency, per-server isolation, selector rendering, diagnostics inventory | — | `src/app.rs`, `src/discovery_llm.rs`, `src/ui.rs`, `src/diagnostics.rs` tests |
 | TUI | Observed on both boxes (rendered against live data) | 116 `TestBackend` render/interaction tests | — | `src/ui.rs::tests` |
 | Discovery / DRM / GPU mapping / domain | DRM/sysfs discovery + per-process fdinfo on the dev box; BDF identity on both boxes; NVML compute-app mapping on test-desktop | Parser/shape branches; multi-render-node attribution; render-fd mapping branch; `Multi` mapping state | — | `discovery_real_system_smoke`, `drm_real_system_smoke`; `src/discovery.rs`, `src/drm.rs`, `src/gpu_map.rs`, `src/domain.rs` tests |
-| Config / diagnostics / redaction | `orsiktop diag` on test-desktop (`docs/HARDWARE_SUPPORT.md:55`, `:66`) and the dev box (`docs/S18_STAGE_SUMMARY.md:72`) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
+| Config / diagnostics / redaction | `orsiktop diag` on test-desktop (`docs/HARDWARE_SUPPORT.md:55`, `:66`), the dev box (`docs/S18_STAGE_SUMMARY.md:72`), and `cf-desktop` on 2026-10-18 with broken NVML (exit `0`, unavailable values) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
 
 ## Area detail
 
