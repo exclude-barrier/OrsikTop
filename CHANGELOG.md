@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-18
+
 ### Added
 
 - **Snapshot drop visibility.** The footer shows `DROPS fN lN` when a fast or
