@@ -40,6 +40,10 @@ Live environments (both non-root, kernel `7.2.5-omarchy`):
 - **test-desktop** — Intel Core i9-12900K (8P+8E/24T), Intel iGPU (i915,
   `0000:00:02.0`), NVIDIA GeForce RTX 4090 (`0000:01:00.0`), a local
   `llama serve` (b10909, `--parallel 2`). Captured 2026-09-18 (S24).
+- **2026-10-18 `cf-desktop` diag:** the same i915/NVIDIA devices were
+  discovered, but NVML was unavailable (`RM detects a driver/library version
+  mismatch`, userspace `615.78`). The provider reported `—`/unavailable, not
+  fake zeros; `diag` exited `0`.
 
 ## Priority matrix
 
