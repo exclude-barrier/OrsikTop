@@ -1,9 +1,9 @@
 # CI and release hardening review
 
 Ticket: CFA-100 (roadmap phase 3, EPIC 6, CI-01). Analysis only: no workflow,
-release or repository setting was changed. Baseline: `origin/main` `2e1f0d2`
-(v0.4.1 plus post-release hardening), checked on 2026-10-17. The detailed
-finding text below is historical; the applied-hardening section is current.
+release or repository setting was changed. Baseline: `origin/main` `9fdf5c1`
+(v0.4.2), checked on 2026-10-18. The detailed finding text below is historical;
+the applied-hardening section is current.
 
 Repository files were read directly; server-side settings (branch protection,
 rulesets, code scanning, workflow token defaults) were read through the GitHub
@@ -151,10 +151,14 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
 - **F2 resolved.** The tag trigger is narrowed to
   `v[0-9]+.[0-9]+.[0-9]+*`. A tag ruleset protects `refs/tags/v*` against
   deletion and non-fast-forward updates, with no bypass actor.
-- The manual tag-triggered publish was verified with `v0.4.1` on 2026-10-17:
-  `prepare`, `plan`, `build-local-artifacts`, `build-global-artifacts` and
-  `host` succeeded, and the release assets, SHA-256 checksum and build
-  attestation were verified. Re-check this path after a `dist generate`.
+- The manual tag-triggered publish was verified with `v0.4.2` on 2026-10-18
+  (run `39167010373`): `prepare`, `plan`, `build-local-artifacts`,
+  `build-global-artifacts` and `host` succeeded. The release is public,
+  non-draft and non-prerelease; the archive SHA-256
+  `41cc86e8aa30b6e1904268ef14395cb6163bdd38fa0c3f2c43e4ebb3af348aa4`
+  verifies, the Sigstore attestation verifies, the published binary reports
+  `orsiktop 0.4.2`, and a temp-HOME installer run installed `0.4.2`. Re-check
+  this path after a `dist generate`.
 - **F3 resolved.** The workflow default is `contents: read`. Write access is
   scoped to `plan` and `host`; `prepare` no longer needs it.
 - **F3 follow-up (2026-10-17).** Pull-request release planning moved to
@@ -164,9 +168,9 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   `dist generate`.
 - **CodeQL (2026-10-17).** The GitHub code-scanning alerts API reports **0 open
   alerts** for this repository; this supersedes the audit's “unspecified”.
-- **Current verification (`2e1f0d2`).** Main CI run `39069363749` passed with
-  `583 passed / 8 ignored`; the release run `39069363730` skipped `plan`, all
-  build jobs and `host`, so a `main` push did not publish.
+- **Current verification (`9fdf5c1`).** Main CI run `39166920967` passed; the
+  release run `39166920928` skipped `plan`, all build jobs and `host`, so a
+  `main` push did not publish. The tag run `39167010373` published `v0.4.2`.
 - The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
   passed only to the `plan` step that invokes `dist host --steps=create`.
 - GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned
