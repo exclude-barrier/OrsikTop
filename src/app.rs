@@ -1519,7 +1519,26 @@ fn sleep_until_next_cycle(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        accepts_llm_sample, apply_fast_snapshot, build_server_summaries, change_refresh,
+        changed_identity_keys, collect_process_stats, drain_try_recv, io_wait_percent,
+        join_bounded, map_server_identity, new_server_monitor, next_cycle_target, parse_cpu_times,
+        per_cpu_usage_by_id, publish_selected_mapping, read_process_thread_count,
+        rebuild_server_monitors, reconcile_server, refresh_process_metadata, sample_process_gpus,
+        selected_identity_of, spawn_llm_worker, stabilize_llm_sample, try_send_snapshot, ui,
+        update_resolved_server, DashboardSnapshot, DrmSamplerState, FastSnapshot, GpuMapping,
+        LlamaMonitor, LlmCommand, LlmSample, LlmStats, LocalServerIdentity, ProcessCache,
+        ProcessIdentity, ProcessStats, RealSys, RedrawScheduler, ServerBackend, ServerChange,
+        ServerSpec, SystemStats, UiState, IDLE_REDRAW_INTERVAL, MAX_MONITORED_SERVERS,
+        MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
+    };
+    use ratatui::Terminal;
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     mod soak;
 
