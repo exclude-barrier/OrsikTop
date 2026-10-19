@@ -168,10 +168,11 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   `dist generate`.
 - **CodeQL (2026-10-17).** The GitHub code-scanning alerts API reports **0 open
   alerts** for this repository; this supersedes the audit's “unspecified”.
-- **Parser mutation fuzz.** `parser_mutation_fuzz_smoke_does_not_panic` mutates
-  the Prometheus/Strata seeds 3 000 times in the normal gate. A libFuzzer target
-  would require extracting the parsers into a library crate; the mutation test
-  keeps malformed-input coverage without that refactor.
+- **Parser fuzzing.** `fuzz/fuzz_targets/parse_prometheus.rs` is a libFuzzer
+  target over the dependency-free Prometheus parser; `fuzz/README.md` has the
+  command. `parser_mutation_fuzz_smoke_does_not_panic` also mutates the
+  Prometheus/Strata seeds 3 000 times in the normal gate, so malformed input is
+  covered without requiring nightly/cargo-fuzz in CI.
 - **Current verification (`9fdf5c1`).** Main CI run `39166920967` passed; the
   release run `39166920928` skipped `plan`, all build jobs and `host`, so a
   `main` push did not publish. The tag run `39167010373` published `v0.4.2`.
