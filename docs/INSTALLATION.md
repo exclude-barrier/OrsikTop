@@ -143,7 +143,7 @@ For a custom Cargo install root, use Cargo's uninstall command with the matching
 
 ## Release integrity
 
-Standalone releases are built and published through GitHub Actions using `dist`. Each release includes the Linux archive, installer, updater, source archive and SHA-256 checksums. GitHub artifact attestations are published for release artifacts.
+Standalone releases are built and published through GitHub Actions using `dist`. Each release includes the Linux archive, installer, updater, source archive and SHA-256 checksums. The generated installer verifies both the application archive and the separate `orsiktop-update` binary; `sha256.sum` also lists the updater. GitHub artifact attestations are published for release artifacts.
 
 Download the archive and its matching `.sha256` file from the same release. In the download directory, verify the archive with:
 

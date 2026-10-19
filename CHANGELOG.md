@@ -4,6 +4,18 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **Updater lookup is sibling-only.** `orsiktop update` no longer falls back to
+  a same-named binary on `PATH`, preventing local command hijack.
+- **Installer verifies the updater.** The generated shell installer now checks
+  the separate `orsiktop-update` SHA-256 and fails closed without `sha256sum`;
+  the aggregate `sha256.sum` includes the updater.
+- **Config stays private.** Every config save forces `0600`, including when an
+  existing config was world-readable and may contain credential-bearing URLs.
+- **Telemetry paths no longer panic.** DRM/GPU invariant unwraps were replaced
+  with graceful skips or `None`.
+
 ## [0.4.2] - 2026-10-18
 
 ### Added

@@ -173,6 +173,10 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   `main` push did not publish. The tag run `39167010373` published `v0.4.2`.
 - The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
   passed only to the `plan` step that invokes `dist host --steps=create`.
+- The release `host` job runs `scripts/patch_installer_updater.py` before
+  `dist host` uploads artifacts. It embeds the updater SHA-256 in the generated
+  installer and appends the updater to `sha256.sum`; the installer fails closed
+  if `sha256sum` is unavailable.
 - GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned
   `dtolnay/rust-toolchain`, `Swatinem/rust-cache` and
   `actions-rust-lang/audit`. SHA pinning is required repository-wide.

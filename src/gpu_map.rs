@@ -263,7 +263,10 @@ pub fn combine_gpus(
 
     match devices.len() {
         0 => GpuMapping::None,
-        1 => GpuMapping::Single(devices.into_iter().next().unwrap()),
+        1 => match devices.into_iter().next() {
+            Some(device) => GpuMapping::Single(device),
+            None => GpuMapping::None,
+        },
         _ => GpuMapping::Multi(devices),
     }
 }
