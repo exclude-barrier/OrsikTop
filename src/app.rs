@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     io::Stdout,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,20 +22,28 @@ use crate::{
     discovery::discover_gpus,
     discovery_llm::LocalServerIdentity,
     domain::{
-        DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessStats, ServerBackend,
-        ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
-        MIN_REFRESH_MS, REFRESH_STEP_MS,
+        DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessStats, SystemStats,
+        MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
     drm::DrmSamplerState,
     gpu::new_gpu_provider,
-    gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
-    llama::{LlamaMonitor, LlmStats},
+    gpu_map::{nvml_compute_gpus, process_render_gpus},
+    llama::LlmStats,
     providers::nvidia::discover_mig_children,
     ui::{self, UiState},
 };
 use nvml_wrapper::Nvml;
 
 mod process;
+mod server;
+
+pub(crate) use server::{
+    build_server_summaries, map_server_identity, new_server_monitor, publish_selected_mapping,
+    rebuild_server_monitors, selected_identity_of, stabilize_llm_sample, sync_server_set,
+    update_resolved_server, LlmCommand, LlmServerMonitor, ServerSpec,
+};
+#[cfg(test)]
+pub(crate) use server::{changed_identity_keys, reconcile_server, ServerChange};
 
 pub(crate) use process::{
     collect_process_stats, io_wait_percent, per_cpu_usage_by_id, read_cpu_frequency_mhz,
@@ -621,29 +629,6 @@ fn change_refresh(refresh_ms: &mut u64, increase: bool, shared: &AtomicU64) {
     shared.store(*refresh_ms, Ordering::Relaxed);
 }
 
-/// Which parts of the resolved monitor target changed between two
-/// resolutions. Each field is independent so the caller can react precisely:
-/// only an endpoint change requires resetting the LLM HTTP session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ServerChange {
-    endpoint: bool,
-    pid: bool,
-    auto: bool,
-}
-
-/// Compare two resolutions of the monitor target field by field, instead of
-/// keying everything off the URL.
-fn reconcile_server(
-    previous: &crate::ResolvedServer,
-    next: &crate::ResolvedServer,
-) -> ServerChange {
-    ServerChange {
-        endpoint: previous.endpoint != next.endpoint,
-        pid: previous.identity != next.identity,
-        auto: previous.auto != next.auto,
-    }
-}
-
 /// One LLM sample tagged with the session generation it was produced for.
 ///
 /// A sample is sampled synchronously by the LLM worker, so an endpoint change
@@ -661,77 +646,6 @@ struct LlmSample {
 /// True when an LLM sample belongs to the currently selected LLM generation.
 fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
     sample.generation == current_generation
-}
-
-/// Build the compact per-server summaries for the overview, in `order`.
-///
-/// All new per-server fields are pure derivations from already-collected data:
-/// the activity phase and backend come from that server's `LlmStats`, and the
-/// measurement age / sample interval from its own per-server UI history — no
-/// extra polling and no telemetry-semantics change.
-fn build_server_summaries(
-    order: &[String],
-    endpoints: &BTreeMap<String, String>,
-    registry: &BTreeMap<String, LlmStats>,
-    ui_state: &UiState,
-    now: Instant,
-) -> Vec<ServerSummary> {
-    order
-        .iter()
-        .map(|key| {
-            let endpoint = endpoints.get(key).cloned().unwrap_or_default();
-            let stats = registry.get(key);
-            let label = stats
-                .map(|stats| stats.model.clone())
-                .filter(|model| !model.is_empty())
-                .unwrap_or_else(|| crate::redact::safe_endpoint(&endpoint));
-            ServerSummary {
-                key: key.clone(),
-                endpoint,
-                label,
-                connected: stats.is_some_and(|stats| stats.connected && !stats.reconnecting),
-                reconnecting: stats.is_some_and(|stats| stats.reconnecting),
-                // Absent telemetry leaves the phase unknown (`—`), never a
-                // guessed `IDLE`; a server with evidence carries its phase.
-                phase: stats.and_then(crate::llama::activity_phase),
-                age_ms: ui_state.server_sample_age_ms(key, now),
-                sample_interval_ms: ui_state.server_sample_interval_ms(key),
-                backend: stats.map_or(ServerBackend::Unknown, |stats| stats.backend),
-                // Slot availability is propagated explicitly so an absent or
-                // failed `/slots` never collapses to a fabricated `0/0`.
-                slots_available: stats.is_some_and(|stats| stats.slots_available),
-                slot_count: stats.map_or(0, |stats| stats.slot_count),
-                busy_slots: stats.map_or(0, |stats| stats.busy_slots),
-                props_slot_count: stats.map_or(0, |stats| stats.props_slot_count),
-                context_used: stats.and_then(|stats| stats.context_used),
-                context_size: stats.map_or(0, |stats| stats.context_size),
-                generation_tps: stats.and_then(|stats| stats.generation_tps),
-            }
-        })
-        .collect()
-}
-
-/// One server to monitor: a stable key, the endpoint to poll, and (for a
-/// locally discovered process) its identity so a same-endpoint restart can be
-/// detected and that server's caches reset.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ServerSpec {
-    pub key: String,
-    pub endpoint: String,
-    pub identity: Option<LocalServerIdentity>,
-}
-
-/// Command to the LLM worker.
-enum LlmCommand {
-    /// Replace the monitored server set. `generation` tags every sample the
-    /// worker produces from now on; a monitor whose key, endpoint and identity
-    /// all persist keeps its per-server baselines, while a new key — or the
-    /// same key with a changed process identity (a same-port restart) — starts
-    /// fresh, and a dropped key is discarded.
-    SetServers {
-        generation: u64,
-        servers: Vec<ServerSpec>,
-    },
 }
 
 /// Apply a fast snapshot.
@@ -753,147 +667,6 @@ fn apply_fast_snapshot(
     if next.mapping_generation == current_mapping_generation {
         snapshot.gpu_map = next.gpu_map;
     }
-}
-
-/// Update the tracked primary `resolved` server (used for the header endpoint
-/// and the `auto` label). It no longer drives GPU attribution: the association
-/// follows the *selected* server via `publish_selected_mapping`.
-fn update_resolved_server(current: &mut crate::ResolvedServer, next: crate::ResolvedServer) {
-    let change = reconcile_server(current, &next);
-    if change.endpoint || change.pid || change.auto {
-        *current = next;
-    }
-}
-
-/// Reconcile the monitored server set against the current settings/discovery.
-///
-/// When the set changes, a new LLM generation is started and the worker is
-/// told the full new list. Per-server baselines for keys that persist are kept
-/// by the worker. The selection falls back deterministically to the first
-/// entry (by discovery order) only when the selected server is gone.
-#[allow(clippy::too_many_arguments)]
-fn sync_server_set(
-    settings: &config::AppConfig,
-    server_list: &mut Vec<ServerSpec>,
-    overflow: &mut Vec<ServerSpec>,
-    order: &mut Vec<String>,
-    endpoints: &mut BTreeMap<String, String>,
-    registry: &mut BTreeMap<String, LlmStats>,
-    selected: &mut String,
-    llm_generation: &mut u64,
-    mapping_generation: &mut u64,
-    server_tx: &mpsc::Sender<LlmCommand>,
-    server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
-    snapshot: &mut DashboardSnapshot,
-    ui_state: &mut UiState,
-) {
-    let next = crate::collect_server_list(settings);
-    let monitored_changed = next.monitored != *server_list;
-    let overflow_changed = next.overflow != *overflow;
-    if !monitored_changed && !overflow_changed {
-        return;
-    }
-    *overflow = next.overflow;
-
-    if monitored_changed {
-        let next_list = next.monitored;
-        // A server whose process identity changed while its endpoint stayed the
-        // same is a known restart: start a fresh history boundary for it so
-        // pre/post-restart throughput is never drawn as continuous.
-        for key in changed_identity_keys(server_list, &next_list) {
-            ui_state.reset_llm_history(&key);
-        }
-
-        *llm_generation = llm_generation.wrapping_add(1);
-        let _ = server_tx.send(LlmCommand::SetServers {
-            generation: *llm_generation,
-            servers: next_list.clone(),
-        });
-        *server_list = next_list;
-        *order = server_list.iter().map(|spec| spec.key.clone()).collect();
-        endpoints.clear();
-        endpoints.extend(
-            server_list
-                .iter()
-                .map(|spec| (spec.key.clone(), spec.endpoint.clone())),
-        );
-        registry.retain(|key, _| endpoints.contains_key(key));
-        // Bound per-server history memory and drop histories of servers that
-        // are gone (no tombstone growth).
-        let live_keys: HashSet<String> = server_list.iter().map(|spec| spec.key.clone()).collect();
-        ui_state.retain_llm_histories(&live_keys);
-        if !endpoints.contains_key(selected) {
-            *selected = order.first().cloned().unwrap_or_default();
-            snapshot.llm = registry.get(selected).cloned().unwrap_or_default();
-            ui_state.select_llm_history(selected);
-        }
-        // The selected server's identity (or its disappearance) may have
-        // changed: republish so the GPU association follows it and any stale
-        // mapping is invalidated.
-        publish_selected_mapping(
-            selected_identity_of(server_list, selected),
-            mapping_generation,
-            server_identity_tx,
-        );
-        snapshot.gpu_map = GpuMapping::None;
-    }
-}
-
-/// The verified local process identity of the selected server, if it has one.
-/// A remote or explicitly configured endpoint without a matching process is
-/// `None` and must stay UNKNOWN — never guessed.
-fn selected_identity_of(server_list: &[ServerSpec], selected: &str) -> Option<LocalServerIdentity> {
-    server_list
-        .iter()
-        .find(|spec| spec.key == selected)
-        .and_then(|spec| spec.identity)
-}
-
-/// Publish which process's GPU association the fast worker should resolve,
-/// advancing the mapping generation so a stale mapping of a previously
-/// selected server cannot be applied.
-fn publish_selected_mapping(
-    identity: Option<LocalServerIdentity>,
-    mapping_generation: &mut u64,
-    server_identity_tx: &mpsc::Sender<(u64, Option<LocalServerIdentity>)>,
-) {
-    *mapping_generation = mapping_generation.wrapping_add(1);
-    let _ = server_identity_tx.send((*mapping_generation, identity));
-}
-
-/// Keys present in both sets whose process identity changed (a known
-/// same-endpoint restart). A new or removed key is not a restart.
-fn changed_identity_keys(old: &[ServerSpec], new: &[ServerSpec]) -> Vec<String> {
-    let previous: BTreeMap<&str, Option<LocalServerIdentity>> = old
-        .iter()
-        .map(|spec| (spec.key.as_str(), spec.identity))
-        .collect();
-    new.iter()
-        .filter(
-            |spec| matches!(previous.get(spec.key.as_str()), Some(prev) if *prev != spec.identity),
-        )
-        .map(|spec| spec.key.clone())
-        .collect()
-}
-
-/// Map the local server to a GPU, gated on its identity.
-///
-/// `current_start_time` is `/proc/<pid>/stat` field 22 read now for the
-/// expected PID. It must equal the start time captured at discovery: a PID
-/// reused by another process (or an unreadable one) yields `Unknown` instead
-/// of attributing the new process's GPU usage to the earlier server. The next
-/// server resync supplies the fresh identity that re-enables the mapping.
-fn map_server_identity(
-    expected: LocalServerIdentity,
-    current_start_time: Option<u64>,
-    render: Vec<crate::domain::DeviceId>,
-    nvml: Vec<crate::domain::DeviceId>,
-    gpus: &[crate::discovery::DiscoveredGpu],
-) -> GpuMapping {
-    if current_start_time != Some(expected.start_time) {
-        return GpuMapping::Unknown;
-    }
-    map_server_gpus(true, render, nvml, gpus)
 }
 
 fn spawn_fast_worker(
@@ -1085,61 +858,6 @@ fn spawn_fast_worker(
     })
 }
 
-/// One monitored server's worker-side state.
-struct LlmServerMonitor {
-    key: String,
-    endpoint: String,
-    /// Process identity of a locally discovered server (pid + start time); a
-    /// change on the same key means the process restarted, so the monitor's
-    /// caches are rebuilt.
-    identity: Option<LocalServerIdentity>,
-    monitor: Option<LlamaMonitor>,
-    init_error: String,
-    /// Per-server last good sample and its time, for the offline-grace hold.
-    last_good: Option<(LlmStats, Instant)>,
-}
-
-fn new_server_monitor(spec: ServerSpec) -> LlmServerMonitor {
-    let monitor = LlamaMonitor::new(&spec.endpoint).ok();
-    let init_error = if monitor.is_none() {
-        "failed to initialize HTTP client".to_string()
-    } else {
-        String::new()
-    };
-    LlmServerMonitor {
-        key: spec.key,
-        endpoint: spec.endpoint,
-        identity: spec.identity,
-        monitor,
-        init_error,
-        last_good: None,
-    }
-}
-
-/// Rebuild the monitor list for a new server set. A monitor is preserved only
-/// when its key, endpoint *and* process identity all still match, so a periodic
-/// resync keeps telemetry for an unchanged server while a same-endpoint
-/// restart (new identity) resets that server's caches.
-fn rebuild_server_monitors(
-    existing: Vec<LlmServerMonitor>,
-    list: Vec<ServerSpec>,
-) -> Vec<LlmServerMonitor> {
-    let mut old: BTreeMap<String, LlmServerMonitor> = existing
-        .into_iter()
-        .map(|monitor| (monitor.key.clone(), monitor))
-        .collect();
-    list.into_iter()
-        .map(|spec| match old.remove(&spec.key) {
-            Some(existing)
-                if existing.endpoint == spec.endpoint && existing.identity == spec.identity =>
-            {
-                existing
-            }
-            _ => new_server_monitor(spec),
-        })
-        .collect()
-}
-
 fn spawn_llm_worker(
     initial_servers: Vec<ServerSpec>,
     refresh_ms: Arc<AtomicU64>,
@@ -1228,38 +946,6 @@ fn spawn_llm_worker(
     })
 }
 
-fn stabilize_llm_sample(
-    mut stats: LlmStats,
-    last_good: &mut Option<(LlmStats, Instant)>,
-    now: Instant,
-    offline_grace: Duration,
-) -> LlmStats {
-    if stats.connected {
-        stats.reconnecting = false;
-        *last_good = Some((stats.clone(), now));
-        return stats;
-    }
-
-    let error = stats.error.to_ascii_lowercase();
-    let hard_failure = error.contains("metrics disabled")
-        || error.contains("--metrics")
-        || error.contains("http 501")
-        || error.contains("failed to initialize http client");
-
-    if !hard_failure {
-        if let Some((previous, at)) = last_good.as_ref() {
-            if now.saturating_duration_since(*at) <= offline_grace {
-                let mut held = previous.clone();
-                held.error.clear();
-                held.reconnecting = true;
-                return held;
-            }
-        }
-    }
-
-    stats
-}
-
 /// Sleeps until the next cycle boundary, clamping the live refresh value to
 /// `[min_ms, MAX_REFRESH_MS]`. Callers pass their own floor: `MIN_REFRESH_MS`
 /// for the fast worker and `MIN_LLM_POLL_MS` for the LLM worker, so a fast UI
@@ -1302,14 +988,14 @@ mod tests {
         per_cpu_usage_by_id, publish_selected_mapping, read_process_thread_count,
         rebuild_server_monitors, reconcile_server, refresh_process_metadata, selected_identity_of,
         spawn_llm_worker, stabilize_llm_sample, try_send_snapshot, ui, update_resolved_server,
-        DashboardSnapshot, DrmSamplerState, FastSnapshot, GpuMapping, LlamaMonitor, LlmCommand,
-        LlmSample, LlmStats, LocalServerIdentity, ProcessCache, ProcessStats, RealSys,
-        RedrawScheduler, ServerBackend, ServerChange, ServerSpec, SystemStats, UiState,
-        IDLE_REDRAW_INTERVAL, MAX_MONITORED_SERVERS, MAX_POLL_INTERVAL, MAX_REFRESH_MS,
-        MIN_LLM_POLL_MS, MIN_REFRESH_MS,
+        DashboardSnapshot, DrmSamplerState, FastSnapshot, GpuMapping, LlmCommand, LlmSample,
+        LlmStats, LocalServerIdentity, ProcessCache, ProcessStats, RealSys, RedrawScheduler,
+        ServerChange, ServerSpec, SystemStats, UiState, IDLE_REDRAW_INTERVAL,
+        MAX_MONITORED_SERVERS, MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
     };
-    use crate::domain::ProcessIdentity;
+    use crate::domain::{ProcessIdentity, ServerBackend};
     use crate::drm::sample_process_gpus;
+    use crate::llama::LlamaMonitor;
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
