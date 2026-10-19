@@ -15,7 +15,7 @@ use ratatui::{
 use super::widgets::{clamp_percent, compact_rate, fit_cell};
 use super::{
     LlmHistory, TimedSample, UiState, CYAN, DIM_GREEN, HISTORY_MAX_SAMPLES, HISTORY_WINDOW,
-    INNER_GREEN, MUTED, ORK_GREEN,
+    INNER_GREEN, MUTED, ORK_GREEN, WHITE,
 };
 use crate::domain::LlmStats;
 
@@ -134,6 +134,79 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
         return;
     }
 
+    // On a normal full layout, add the two LLM rates beside the host history.
+    // Narrow panes keep the 2x2 host grid so the graphs stay readable.
+    if inner.width >= 60 && inner.height >= 10 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(rows[0]);
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(rows[1]);
+
+        draw_history_column(
+            frame,
+            top[0],
+            "GPU",
+            &state.gpu_history,
+            ORK_GREEN,
+            true,
+            true,
+        );
+        draw_history_column(frame, top[1], "VRAM", &state.vram_history, CYAN, true, true);
+        draw_history_rate_column(
+            frame,
+            top[2],
+            "DECODE",
+            &state.llm_history.decode,
+            ORK_GREEN,
+            false,
+            true,
+        );
+        draw_history_column(
+            frame,
+            bottom[0],
+            "CPU",
+            &state.cpu_history,
+            ORK_GREEN,
+            true,
+            false,
+        );
+        draw_history_column(
+            frame,
+            bottom[1],
+            "RAM",
+            &state.ram_history,
+            CYAN,
+            true,
+            false,
+        );
+        draw_history_rate_column(
+            frame,
+            bottom[2],
+            "PREFILL",
+            &state.llm_history.prefill,
+            WHITE,
+            false,
+            false,
+        );
+        return;
+    }
+
     // A 2x2 grid gives time-series data horizontal resolution while leaving the
     // right side of the dashboard available for the btop-style process table.
     let rows = Layout::default()
@@ -238,6 +311,68 @@ pub(super) fn draw_history_column(
             rows[1].width as usize,
             rows[1].height as usize,
             color,
+        )),
+        rows[1],
+    );
+}
+
+/// Rate variant of [`draw_history_column`]: header uses `tok/s` and the graph
+/// is scaled to the window maximum instead of a fixed 100 percent.
+pub(super) fn draw_history_rate_column(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    history: &VecDeque<TimedSample>,
+    color: Color,
+    right_border: bool,
+    bottom_border: bool,
+) {
+    let borders = match (right_border, bottom_border) {
+        (true, true) => Borders::RIGHT | Borders::BOTTOM,
+        (true, false) => Borders::RIGHT,
+        (false, true) => Borders::BOTTOM,
+        (false, false) => Borders::NONE,
+    };
+    let block = Block::default()
+        .borders(borders)
+        .border_style(Style::default().fg(INNER_GREEN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height < 2 {
+        return;
+    }
+
+    let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    if !llm_rate_history_has_activity(history) {
+        frame.render_widget(
+            Paragraph::new(fit_cell(&format!(" {title} idle"), inner.width as usize))
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
+        return;
+    }
+
+    let scale = history_max(history).max(1.0);
+    frame.render_widget(
+        Paragraph::new(fit_cell(
+            &format!(" {title} {} tok/s", compact_rate(latest)),
+            inner.width as usize,
+        ))
+        .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(trend_lines_scaled(
+            history,
+            rows[1].width as usize,
+            rows[1].height as usize,
+            color,
+            scale,
         )),
         rows[1],
     );

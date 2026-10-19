@@ -178,7 +178,7 @@ pub(super) fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &
             format!("{:>3.0}%", utilization),
             vec![
                 fixed_data_pair("CORE", core_text, ORK_GREEN, 21),
-                fixed_data_pair("PSTATE", gpu.pstate.clone(), CYAN, 16),
+                fixed_data_pair("PSTATE", gpu.pstate.clone(), WHITE, 16),
             ],
         ),
         None => unavailable_meter_line(
@@ -186,7 +186,7 @@ pub(super) fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &
             bar_width,
             vec![
                 fixed_data_pair("CORE", core_text, ORK_GREEN, 21),
-                fixed_data_pair("PSTATE", gpu.pstate.clone(), CYAN, 16),
+                fixed_data_pair("PSTATE", gpu.pstate.clone(), WHITE, 16),
             ],
         ),
     };
@@ -206,7 +206,7 @@ pub(super) fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &
             format!("{:>3.0}%", pct),
             vec![
                 fixed_data_pair("USED", used_text, vram_tint, 25),
-                fixed_data_pair("VCLK", vclk_text, CYAN, 20),
+                fixed_data_pair("VCLK", vclk_text, WHITE, 20),
             ],
         ),
         None => unavailable_meter_line(
@@ -214,7 +214,7 @@ pub(super) fn draw_gpu(frame: &mut Frame, area: Rect, gpu: &GpuStats, gpu_map: &
             bar_width,
             vec![
                 fixed_data_pair("USED", used_text, vram_tint, 25),
-                fixed_data_pair("VCLK", vclk_text, CYAN, 20),
+                fixed_data_pair("VCLK", vclk_text, WHITE, 20),
             ],
         ),
     };

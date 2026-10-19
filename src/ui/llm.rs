@@ -147,10 +147,10 @@ pub(super) fn draw_llm(
                 .filter(|value| *value > 0)
                 .map(|value| format!("MTP{value}"))
                 .unwrap_or_else(|| "MTP".to_string()),
-            CYAN,
+            WHITE,
         )
     } else if llm.spec_enabled {
-        ("SPEC".to_string(), CYAN)
+        ("SPEC".to_string(), WHITE)
     } else {
         ("MTP OFF".to_string(), MUTED)
     };
@@ -212,10 +212,6 @@ pub(super) fn draw_llm(
     let fresh = !llm.reconnecting;
     let pp_active = fresh && llm.prompt_tps.is_some_and(|value| value > 0.05);
     let tg_active = fresh && llm.generation_tps.is_some_and(|value| value > 0.05);
-    let pp_header_color = if pp_active { CYAN } else { MUTED };
-    let tg_header_color = if tg_active { ORK_GREEN } else { MUTED };
-    let pp_live_color = if pp_active { CYAN } else { MUTED };
-    let tg_live_color = if tg_active { ORK_GREEN } else { MUTED };
     let request_color = if fresh && llm.busy_slots > 0 {
         WHITE
     } else {
@@ -224,11 +220,8 @@ pub(super) fn draw_llm(
 
     let metric_width = ((inner.width as usize).saturating_sub(12) / 2).clamp(16, 30);
     let mut state_line = vec![
-        label_span(" STATE      "),
-        value_span(phase, phase_color),
-        llm_sep(),
-        label_span("SLOTS "),
-        value_span(&slots, CYAN),
+        label_span(" SLOTS      "),
+        value_span(&slots, WHITE),
         llm_sep(),
         label_span("REQ "),
         value_span(&req, req_color),
@@ -245,11 +238,8 @@ pub(super) fn draw_llm(
     }
     if inner.width < 66 {
         state_line = vec![
-            label_span(" STATE      "),
-            value_span(phase, phase_color),
-            Span::raw("  "),
-            label_span("SLOTS "),
-            value_span(&slots, CYAN),
+            label_span(" SLOTS      "),
+            value_span(&slots, WHITE),
             Span::raw("  "),
             value_span(&mtp, mtp_color),
         ];
@@ -262,7 +252,7 @@ pub(super) fn draw_llm(
         // are attributed, otherwise "—" (not determined — distinct from
         // CPU-only or 0% utilization).
         match gpu_attribution_label(gpu_map) {
-            Some(label) => state_line.push(value_span(&label, CYAN)),
+            Some(label) => state_line.push(value_span(&label, WHITE)),
             None => state_line.push(value_span("—", MUTED)),
         }
     }
@@ -272,6 +262,38 @@ pub(super) fn draw_llm(
         llm_metric_cell(&total_pp, metric_width, WHITE, false),
         llm_metric_cell(&total_tg, metric_width, WHITE, false),
     ];
+
+    let mut hero = vec![
+        label_span(" STATE      "),
+        value_span(phase, phase_color),
+        llm_sep(),
+        label_span("DECODE "),
+        Span::styled(
+            live_tg.clone(),
+            Style::default()
+                .fg(if tg_active { BRIGHT_GREEN } else { MUTED })
+                .add_modifier(if tg_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+    ];
+    if inner.width >= 78 {
+        hero.push(llm_sep());
+        hero.push(label_span("PREFILL "));
+        hero.push(value_span(&live_pp, if pp_active { WHITE } else { MUTED }));
+        hero.push(llm_sep());
+        hero.push(label_span("CTX "));
+        if context_used.is_some() && llm.context_size > 0 {
+            hero.push(value_span(
+                &format!("{context_pct:.1}%"),
+                context_color(context_pct),
+            ));
+        } else {
+            hero.push(value_span("—", MUTED));
+        }
+    }
 
     let mut lines = vec![
         Line::from(vec![
@@ -291,17 +313,8 @@ pub(super) fn draw_llm(
             label_span("SAMPLE "),
             value_span(&llm_last_sample_text(state, llm), MUTED),
         ]),
+        Line::from(hero),
         Line::from(state_line),
-        Line::from(vec![
-            label_span("            "),
-            llm_metric_cell("PREFILL / PP", metric_width, pp_header_color, pp_active),
-            llm_metric_cell("DECODE / TG", metric_width, tg_header_color, tg_active),
-        ]),
-        Line::from(vec![
-            label_span(" LIVE       "),
-            llm_metric_cell(&live_pp, metric_width, pp_live_color, pp_active),
-            llm_metric_cell(&live_tg, metric_width, tg_live_color, tg_active),
-        ]),
         Line::from(vec![
             label_span(" AVG (LIFE) "),
             llm_metric_cell(
@@ -684,7 +697,7 @@ pub(super) fn llm_phase(llm: &LlmStats) -> (&'static str, Color) {
     };
     let color = match phase {
         ActivityPhase::Idle | ActivityPhase::Unknown => MUTED,
-        ActivityPhase::Prefill => CYAN,
+        ActivityPhase::Prefill => WHITE,
         ActivityPhase::Generating => ORK_GREEN,
         ActivityPhase::Processing | ActivityPhase::Queued | ActivityPhase::Reconnecting => YELLOW,
     };
