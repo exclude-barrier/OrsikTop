@@ -13,6 +13,12 @@ All notable changes to OrsikTop will be documented here.
   for memory/context; spec tags and clocks are no longer cyan.
 - **LLM rates in the history panel.** GPU/VRAM/DECODE and CPU/RAM/PREFILL share
   the 3x2 history grid on normal widths.
+- **Clearer process table and focus.** Active sort is shown without bracket
+  chrome, group counts move out of the PID column, inactive names use `MUTED`,
+  the process pane has the focus border, and wide footers list `s` and refresh
+  keys.
+- **Independent server polls.** A slow server no longer delays the next poll of
+  healthy servers; one in-flight request per server stays bounded.
 
 ### Security
 

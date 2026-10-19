@@ -38,12 +38,15 @@ mod process;
 mod server;
 
 pub(crate) use server::{
-    build_server_summaries, map_server_identity, new_server_monitor, publish_selected_mapping,
-    rebuild_server_monitors, selected_identity_of, stabilize_llm_sample, sync_server_set,
-    update_resolved_server, LlmCommand, LlmServerMonitor, ServerSpec,
+    build_server_summaries, map_server_identity, publish_selected_mapping, rebuild_poll_slots,
+    selected_identity_of, stabilize_llm_sample, sync_server_set, update_resolved_server,
+    LlmCommand, LlmPollSlot, ServerSpec,
 };
 #[cfg(test)]
-pub(crate) use server::{changed_identity_keys, reconcile_server, ServerChange};
+pub(crate) use server::{
+    changed_identity_keys, new_server_monitor, rebuild_server_monitors, reconcile_server,
+    ServerChange,
+};
 
 pub(crate) use process::{
     collect_process_stats, io_wait_percent, per_cpu_usage_by_id, read_cpu_frequency_mhz,
@@ -648,6 +651,15 @@ fn accepts_llm_sample(current_generation: u64, sample: &LlmSample) -> bool {
     sample.generation == current_generation
 }
 
+/// Clears a server's in-flight flag even if the poll thread unwinds.
+struct PollFlag(Arc<AtomicBool>);
+
+impl Drop for PollFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Apply a fast snapshot.
 ///
 /// `gpu`/`system` are always applied — they do not belong to the server
@@ -873,10 +885,9 @@ fn spawn_llm_worker(
         // be rejected. Each server additionally carries its own key, so samples
         // never cross server boundaries.
         let mut generation: u64 = 0;
-        let mut servers: Vec<LlmServerMonitor> = initial_servers
-            .into_iter()
-            .map(new_server_monitor)
-            .collect();
+        let mut servers: Vec<LlmPollSlot> =
+            initial_servers.into_iter().map(LlmPollSlot::new).collect();
+        let (sample_tx, sample_rx) = mpsc::channel::<LlmSample>();
 
         while !stop.load(Ordering::Relaxed) {
             let cycle_started = Instant::now();
@@ -887,7 +898,7 @@ fn spawn_llm_worker(
                         servers: list,
                     } => {
                         generation = next_generation;
-                        servers = rebuild_server_monitors(servers, list);
+                        servers = rebuild_poll_slots(servers, list);
                     }
                 }
             }
@@ -897,51 +908,71 @@ fn spawn_llm_worker(
                     .load(Ordering::Relaxed)
                     .min(config::MAX_OFFLINE_GRACE_MS),
             );
-            // Poll every server concurrently (bounded by the server cap) and
-            // deliver each completed sample to the app as soon as it is ready,
-            // so a slow or hanging server cannot delay a healthy server's
-            // refresh for the whole cycle. A scoped thread per server is
-            // bounded and joined when the scope closes.
-            let disconnected = thread::scope(|scope| {
-                let (done_tx, done_rx) = mpsc::channel::<LlmSample>();
-                for server in servers.iter_mut() {
-                    let done_tx = done_tx.clone();
-                    scope.spawn(move || {
-                        let raw_stats = match server.monitor.as_mut() {
-                            Some(monitor) => monitor.sample(),
-                            None => LlmStats {
-                                error: server.init_error.clone(),
-                                ..Default::default()
-                            },
-                        };
-                        let stats = stabilize_llm_sample(
-                            raw_stats,
-                            &mut server.last_good,
-                            Instant::now(),
-                            offline_grace,
-                        );
-                        let _ = done_tx.send(LlmSample {
-                            server: server.key.clone(),
-                            generation,
-                            stats,
-                        });
+            // One poll per server at a time. A slow or hanging server keeps
+            // its own in-flight slot and is simply skipped next cycle; other
+            // servers continue on their own cadence.
+            for slot in &servers {
+                if slot
+                    .in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let monitor = Arc::clone(&slot.monitor);
+                let in_flight = Arc::clone(&slot.in_flight);
+                let sample_tx = sample_tx.clone();
+                let generation = generation;
+                thread::spawn(move || {
+                    let _flag = PollFlag(in_flight);
+                    let mut server = monitor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let raw_stats = match server.monitor.as_mut() {
+                        Some(monitor) => monitor.sample(),
+                        None => LlmStats {
+                            error: server.init_error.clone(),
+                            ..Default::default()
+                        },
+                    };
+                    let stats = stabilize_llm_sample(
+                        raw_stats,
+                        &mut server.last_good,
+                        Instant::now(),
+                        offline_grace,
+                    );
+                    let _ = sample_tx.send(LlmSample {
+                        server: server.key.clone(),
+                        generation,
+                        stats,
                     });
+                });
+            }
+
+            let mut disconnected = false;
+            while let Ok(sample) = sample_rx.try_recv() {
+                if !try_send_snapshot(&tx, sample, &drops) {
+                    disconnected = true;
+                    break;
                 }
-                drop(done_tx);
-                let mut disconnected = false;
-                for sample in done_rx.iter() {
-                    if !try_send_snapshot(&tx, sample, &drops) {
-                        disconnected = true;
-                        break;
-                    }
-                }
-                disconnected
-            });
+            }
             if disconnected {
                 return;
             }
 
             sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_LLM_POLL_MS, &stop);
+        }
+
+        // Do not let detached poll threads outlive the worker: bounded by the
+        // request timeout plus margin. A truly wedged request is left for
+        // process exit, as before.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && servers
+                .iter()
+                .any(|slot| slot.in_flight.load(Ordering::Acquire))
+        {
+            thread::sleep(Duration::from_millis(25));
         }
     })
 }
@@ -2682,11 +2713,13 @@ mod tests {
         );
 
         let mut b_model = None;
+        let mut b_samples = 0;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && b_model.is_none() {
+        while Instant::now() < deadline && b_samples < 2 {
             if let Ok(sample) = sample_rx.recv_timeout(Duration::from_millis(500)) {
                 if sample.server == key_b && sample.stats.connected {
                     b_model = Some(sample.stats.model.clone());
+                    b_samples += 1;
                 }
             }
         }
@@ -2694,6 +2727,10 @@ mod tests {
             b_model.as_deref(),
             Some("model-B"),
             "healthy B must be delivered while A hangs"
+        );
+        assert!(
+            b_samples >= 2,
+            "healthy B must keep polling while A hangs, got {b_samples} samples"
         );
 
         // Release A so the worker's scope can finish and shut down.

@@ -5,7 +5,9 @@
 //! The polling loop itself stays in `app::spawn_llm_worker`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config;
@@ -291,6 +293,7 @@ pub(crate) fn new_server_monitor(spec: ServerSpec) -> LlmServerMonitor {
 /// when its key, endpoint *and* process identity all still match, so a periodic
 /// resync keeps telemetry for an unchanged server while a same-endpoint
 /// restart (new identity) resets that server's caches.
+#[cfg(test)]
 pub(crate) fn rebuild_server_monitors(
     existing: Vec<LlmServerMonitor>,
     list: Vec<ServerSpec>,
@@ -307,6 +310,62 @@ pub(crate) fn rebuild_server_monitors(
                 existing
             }
             _ => new_server_monitor(spec),
+        })
+        .collect()
+}
+
+/// Shared monitor plus an in-flight flag. One poll per server may run at a
+/// time, but a slow server does not block polls of the other servers.
+pub(crate) struct LlmPollSlot {
+    pub(crate) monitor: Arc<Mutex<LlmServerMonitor>>,
+    pub(crate) in_flight: Arc<AtomicBool>,
+}
+
+impl LlmPollSlot {
+    pub(crate) fn new(spec: ServerSpec) -> Self {
+        Self {
+            monitor: Arc::new(Mutex::new(new_server_monitor(spec))),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Rebuild poll slots for a new server set. An unchanged server keeps its
+/// monitor and in-flight flag; a restart gets a fresh monitor and its old
+/// in-flight sample is rejected by generation.
+pub(crate) fn rebuild_poll_slots(
+    existing: Vec<LlmPollSlot>,
+    list: Vec<ServerSpec>,
+) -> Vec<LlmPollSlot> {
+    let mut old: BTreeMap<String, LlmPollSlot> = existing
+        .into_iter()
+        .map(|slot| {
+            let key = slot
+                .monitor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .key
+                .clone();
+            (key, slot)
+        })
+        .collect();
+    list.into_iter()
+        .map(|spec| match old.remove(&spec.key) {
+            Some(existing) => {
+                let unchanged = {
+                    let monitor = existing
+                        .monitor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    monitor.endpoint == spec.endpoint && monitor.identity == spec.identity
+                };
+                if unchanged {
+                    existing
+                } else {
+                    LlmPollSlot::new(spec)
+                }
+            }
+            None => LlmPollSlot::new(spec),
         })
         .collect()
 }
