@@ -41,6 +41,22 @@ jobs:
           createIssues: false
           denyWarnings: true
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Cargo deny
+        run: cargo deny check
+
+      - name: Generate SBOM
+        run: python3 scripts/sbom.py --locked > orsiktop-sbom.cdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: orsiktop-sbom
+          path: orsiktop-sbom.cdx.json
+          retention-days: 7
+
       - name: CLI smoke test
         run: |
           cargo run --locked -- --help
