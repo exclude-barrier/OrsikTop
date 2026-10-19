@@ -175,7 +175,7 @@ pub(super) fn draw_system(frame: &mut Frame, area: Rect, system: &SystemStats) {
         ),
         Line::from(vec![
             label_span("      "),
-            value_span(&frequency, CYAN),
+            value_span(&frequency, WHITE),
             label_span("   "),
             value_span(&temperature, temperature_tint),
             label_span("   IOW "),
@@ -320,7 +320,7 @@ pub(super) fn physical_core_minibar_rows(
         Span::raw("            "),
         Span::styled(
             "E-CORES",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
     ]));
 

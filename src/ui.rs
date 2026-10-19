@@ -5255,6 +5255,60 @@ mod tests {
     }
 
     #[test]
+    fn hero_line_shows_live_decode_prefill_and_context() {
+        let llm = LlmStats {
+            connected: true,
+            metrics_available: true,
+            model: "test-model".to_string(),
+            slots_available: true,
+            slot_count: 1,
+            busy_slots: 1,
+            generation_tps: Some(119.9),
+            prompt_tps: Some(5.0),
+            context_used: Some(10),
+            context_size: 100,
+            ..Default::default()
+        };
+        let text = render_llm_panel(&llm, 100, 14);
+        assert!(text.contains("STATE"), "{text}");
+        assert!(text.contains("GENERATING"), "{text}");
+        assert!(text.contains("DECODE 119.9 tok/s"), "{text}");
+        assert!(text.contains("PREFILL 5.0 tok/s"), "{text}");
+        assert!(text.contains("CTX 10.0%"), "{text}");
+    }
+
+    #[test]
+    fn history_panel_includes_llm_decode_and_prefill_rates() {
+        let mut state = UiState::default();
+        let now = Instant::now();
+        state.llm_history.decode.push_back(TimedSample {
+            at: now,
+            value: 12.0,
+        });
+        state.llm_history.prefill.push_back(TimedSample {
+            at: now,
+            value: 3.0,
+        });
+        let area = Rect::new(0, 0, 90, 12);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_history(frame, area, &state))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("DECODE"), "{text}");
+        assert!(text.contains("12.0 tok/s"), "{text}");
+        assert!(text.contains("PREFILL"), "{text}");
+        assert!(text.contains("3.0 tok/s"), "{text}");
+    }
+
+    #[test]
     fn held_reconnecting_sample_is_marked_stale_in_the_panel() {
         // During the offline grace the last good sample is still drawn; the
         // panel must say it is not fresh and must not highlight held rates as

@@ -4,6 +4,16 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Clear LLM hero line.** The panel now leads with state, decode rate,
+  prefill and context; the duplicated LIVE/header rows are gone. Only the
+  active decode rate is bright green.
+- **Consistent color roles.** Neutral values use white/muted; cyan is reserved
+  for memory/context; spec tags and clocks are no longer cyan.
+- **LLM rates in the history panel.** GPU/VRAM/DECODE and CPU/RAM/PREFILL share
+  the 3x2 history grid on normal widths.
+
 ### Security
 
 - **Updater lookup is sibling-only.** `orsiktop update` no longer falls back to
