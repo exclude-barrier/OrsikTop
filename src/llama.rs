@@ -9,6 +9,7 @@ use serde_json::Value;
 // Extracted submodules (behavior-preserving refactor).
 mod http;
 mod metrics;
+mod prometheus;
 mod props;
 mod slots;
 mod speculative;
@@ -16,6 +17,8 @@ use http::{endpoint_url, fetch_json, fetch_raw, join_or};
 use metrics::{
     average_over_seconds, counter_delta_opt, counter_rate, parse_metrics_body, pick_metric_opt,
 };
+use prometheus::parse_prometheus;
+pub(crate) use prometheus::MetricSample;
 use props::{json_string, json_u64_path, model_display_name, sanitize_error_text};
 use slots::{apply_slots_json, choose_live_throughput, slot_delta_tps};
 use speculative::{
@@ -265,13 +268,6 @@ struct CachedProps {
     /// (including an explicit `0`, which disables it).
     spec_n_max_known: bool,
     last_refresh: Option<Instant>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MetricSample {
-    pub name: String,
-    pub labels: Option<String>,
-    pub value: f64,
 }
 
 pub struct LlamaMonitor {
@@ -912,48 +908,6 @@ struct LocalSpeculativeConfig {
     enabled: bool,
     is_mtp: bool,
     n_max: Option<u64>,
-}
-
-pub(crate) fn parse_prometheus(input: &str) -> Vec<MetricSample> {
-    let mut metrics = Vec::new();
-
-    for line in input.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let Some(name_with_labels) = parts.next() else {
-            continue;
-        };
-        let Some(raw_value) = parts.next() else {
-            continue;
-        };
-        let Ok(value) = raw_value.parse::<f64>() else {
-            continue;
-        };
-        if !value.is_finite() {
-            continue;
-        }
-
-        let (name, labels) = match name_with_labels.split_once('{') {
-            Some((name, raw_labels)) => {
-                let labels = raw_labels.trim_end_matches('}');
-                let labels = (!labels.is_empty()).then(|| labels.to_string());
-                (name, labels)
-            }
-            None => (name_with_labels, None),
-        };
-
-        metrics.push(MetricSample {
-            name: name.to_string(),
-            labels,
-            value,
-        });
-    }
-
-    metrics
 }
 
 /// Longest model display string, in `char`s. A server-controlled name is
