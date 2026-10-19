@@ -272,25 +272,20 @@ fn sync_parent_dir(path: &Path) {
     }
 }
 
-/// Give `tmp` the permissions of an existing `path`, or `0o600` for a new
-/// config file.
+/// Keep every saved config private.
 ///
-/// `fs::write` creates the temporary file with the process umask, so without
-/// this step a deliberately private config (for example one holding a
-/// credential-bearing endpoint) would be replaced by a more permissive file.
-fn apply_target_permissions(path: &Path, tmp: &Path) -> io::Result<()> {
+/// The config can contain credential-bearing endpoint URLs. An existing
+/// world-readable file must not remain world-readable after a save, so this
+/// always applies `0o600` instead of preserving the target mode.
+fn apply_target_permissions(_path: &Path, tmp: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = match fs::metadata(path) {
-            Ok(metadata) => metadata.permissions().mode() & 0o7777,
-            Err(_) => 0o600,
-        };
-        fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
+        fs::set_permissions(tmp, fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, tmp);
+        let _ = tmp;
     }
     Ok(())
 }
@@ -745,7 +740,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn atomic_save_preserves_existing_permissions_and_restricts_new_files() {
+    fn atomic_save_keeps_config_private_and_restricts_existing_files() {
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("permissions");
         let path = dir.join("config");
@@ -755,6 +750,15 @@ mod tests {
         save_to_path(&path, &AppConfig::default()).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600, "an existing private config must stay private");
+
+        // An inherited world-readable config must be tightened: it can carry a
+        // credential-bearing endpoint URL.
+        let loose = dir.join("config-loose");
+        fs::write(&loose, "server=http://old:1\n").unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o644)).unwrap();
+        save_to_path(&loose, &AppConfig::default()).unwrap();
+        let mode = fs::metadata(&loose).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600, "a saved config must never stay world-readable");
 
         // A brand-new config gets the restrictive default, not the umask one.
         let fresh = dir.join("config-new");

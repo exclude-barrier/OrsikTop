@@ -47,7 +47,7 @@ Example:
 sha256sum -c orsiktop-x86_64-unknown-linux-gnu.tar.xz.sha256
 ```
 
-Release artifacts are also covered by GitHub artifact attestations, which provide cryptographic evidence of where and how each artifact was built. Attestations are attached to the release assets and can be verified locally with:
+The generated installer verifies both the application archive and the separate `orsiktop-update` binary; `sha256.sum` also includes the updater. Release artifacts are also covered by GitHub artifact attestations, which provide cryptographic evidence of where and how each artifact was built. Attestations are attached to the release assets and can be verified locally with:
 
 ```bash
 gh attestation verify orsiktop-x86_64-unknown-linux-gnu.tar.xz \

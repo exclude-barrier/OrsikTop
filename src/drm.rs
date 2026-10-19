@@ -183,7 +183,9 @@ pub fn sample_process_gpus<S: Sys>(
 
     let mut result: Vec<DrmProcessGpu> = Vec::with_capacity(order.len());
     for bdf in &order {
-        let agg = by_bdf.get_mut(bdf).expect("bdf present in map");
+        let Some(agg) = by_bdf.get_mut(bdf) else {
+            continue;
+        };
         let mut engines: Vec<DrmEngine> = Vec::with_capacity(agg.engines.len());
         for (name, engine) in agg.engines.iter_mut() {
             let utilization = engine_utilization(
@@ -298,7 +300,7 @@ fn engine_utilization(
     let utilization = match (busy_now, (cycles_busy_now, cycles_total_now)) {
         (Some(busy), _) if prev.as_ref().is_some_and(|p| p.busy_ns.is_some()) => {
             // i915 / amdgpu: busy ns over elapsed wall time.
-            let prev = prev.unwrap();
+            let prev = prev.as_ref()?;
             let elapsed_ns = now.duration_since(prev.sampled_at?).as_nanos() as u64;
             utilization_ns(busy, prev.busy_ns?, elapsed_ns)
         }
@@ -308,7 +310,7 @@ fn engine_utilization(
                 .is_some_and(|p| p.cycles_busy.is_some() && p.cycles_total.is_some()) =>
         {
             // xe: busy cycles over total cycles (wall-time independent).
-            let prev = prev.unwrap();
+            let prev = prev.as_ref()?;
             utilization_cycles(busy, prev.cycles_busy?, total, prev.cycles_total?)
         }
         _ => None,

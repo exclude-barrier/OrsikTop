@@ -182,22 +182,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 
-fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
-    let sibling_updater = env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("orsiktop-update")))
-        .filter(|path| path.is_file());
+fn sibling_updater(exe: &Path) -> Option<PathBuf> {
+    exe.parent()
+        .map(|dir| dir.join("orsiktop-update"))
+        .filter(|path| path.is_file())
+}
 
-    let result = if let Some(path) = sibling_updater {
-        run_updater_command(Command::new(path))
-    } else {
-        run_updater_command(Command::new("orsiktop-update"))
+fn run_updater() -> Result<(), Box<dyn std::error::Error>> {
+    // Never fall back to PATH: a same-named binary earlier on PATH would be
+    // executed with the user's privileges.
+    let Some(path) = env::current_exe()
+        .ok()
+        .and_then(|exe| sibling_updater(&exe))
+    else {
+        return Err(format!(
+            "orsiktop-update was not found next to the running binary. Self-update is available for standalone installations created by the OrsikTop installer. If you installed OrsikTop with Cargo, update it with:\n{CARGO_UPDATE_COMMAND}"
+        )
+        .into());
     };
 
-    match result {
+    match run_updater_command(Command::new(path)) {
         Ok(()) => Ok(()),
         Err(UpdaterError::NotFound) => Err(format!(
-            "orsiktop-update was not found. Self-update is available for standalone installations created by the OrsikTop installer. If you installed OrsikTop with Cargo, update it with:\n{CARGO_UPDATE_COMMAND}"
+            "orsiktop-update was not found next to the running binary. Self-update is available for standalone installations created by the OrsikTop installer. If you installed OrsikTop with Cargo, update it with:\n{CARGO_UPDATE_COMMAND}"
         )
         .into()),
         Err(UpdaterError::TimedOut) => Err(format!(
@@ -627,6 +634,22 @@ mod tests {
             Duration::from_millis(10),
         );
         assert!(matches!(result, Err(UpdaterError::Failed(message)) if message.contains("3")));
+    }
+
+    #[test]
+    fn sibling_updater_is_resolved_only_next_to_the_binary() {
+        let dir = std::env::temp_dir().join(format!("orsiktop-updater-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("orsiktop");
+        fs::write(&exe, b"binary").unwrap();
+        assert_eq!(sibling_updater(&exe), None);
+
+        let updater = dir.join("orsiktop-update");
+        fs::write(&updater, b"updater").unwrap();
+        assert_eq!(sibling_updater(&exe), Some(updater));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

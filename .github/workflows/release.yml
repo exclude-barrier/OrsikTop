@@ -290,6 +290,11 @@ jobs:
           path: target/distrib/
           merge-multiple: true
 
+      # cargo-dist checksums the archive but not the separately published
+      # updater; embed its hash in the installer before `dist host` uploads it.
+      - name: Verify updater checksum in installer
+        run: python3 scripts/patch_installer_updater.py target/distrib
+
       - id: host
         shell: bash
         run: |
