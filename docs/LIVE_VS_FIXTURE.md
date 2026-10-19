@@ -46,7 +46,14 @@ live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 DRM/sysfs; CPU topology/frequency/temperature were live. NVML was unavailable
 with `RM detects a driver/library version mismatch` (userspace `615.78`), so
 the GPU provider reported the error and `—` values, not fake zeros; `diag`
-exited `0`. No new GPU-inference or i915-provider sample was captured.
+exited `0`.
+
+**2026-10-19 re-run (driver `615.78.08`):** Auto selected the RTX 4090 and
+reported utilization `0 %`, temperature `37 °C`, power `38.4 W` with all
+advertised fields available. `--gpu 0000:00:02.0` selected the i915 iGPU and
+reported `clocks` only; utilization, memory, temperature, power, fan, PCIe and
+enc/dec stayed `—`. CPU: `1304 MHz`/`26 °C` (Auto) and `1070 MHz`/`26 °C`
+(i915 run). No inference server was contacted.
 
 ## Matrix
 
@@ -57,7 +64,7 @@ exited `0`. No new GPU-inference or i915-provider sample was captured.
 | GPU — NVIDIA discrete | RTX 4090 on test-desktop, under active inference; 2026-10-18 diag on the same box hit an NVML driver/library mismatch and reported unavailable values without a panic | Parsers, sanitizers, MIG topology; multi-NVIDIA index selection (`index_selects_the_nth_nvidia_on_igpu_dgpu_machines`, `src/gpu.rs:285`); UUID half of identity | — | `src/providers/nvidia.rs` tests |
 | GPU — AMD (dGPU and APU) | — | Full amdgpu sysfs + hwmon shapes, carveout, malformed values | — | `src/providers/amd.rs` tests |
 | GPU — Intel xe (iGPU/APU) | xe iGPU on dev box (discovery, clock, throttle; temp/power `None`) | xe dGfx-hwmon + APU shapes (`samples_xe_dgpu_with_hwmon`, `xe_apu_without_hwmon_keeps_clock_and_reason`) | — | `intel_real_system_smoke`; `src/providers/intel.rs` tests |
-| GPU — Intel i915 / Arc dGPU | — | i915 root-GT and `gt/gt0` fallback, dGfx hwmon (`temp1_input`, PL1) | — | `src/providers/intel.rs::tests` |
+| GPU — Intel i915 / Arc dGPU | i915 iGPU on `cf-desktop` (live `--gpu 0000:00:02.0 diag`: clocks available; utilization/memory/temp/power/fan/pcie/encdec `—`) | i915 root-GT and `gt/gt0` fallback, dGfx hwmon (`temp1_input`, PL1) | Arc dGPU live sample | `src/providers/intel.rs::tests` |
 | GPU — NVIDIA MIG | — | Topology, stable child keys, process attribution, UI matching | Exact `MIG-…` UUID form a driver emits; `Device::uuid()` on a child handle | `src/providers/nvidia.rs`, `src/gpu_map.rs`, `src/domain.rs`, `src/ui.rs` |
 | CPU / sensors | Hybrid P+E topology, cpufreq, hwmon temperature, RAPL `None` under non-root (dev box); 2026-10-18 `cf-desktop` diag: i9-12900K P=8/E=8, 4428 MHz, 51 °C, power `—` | LP-E class; conventional (all-P) Intel; **AMD CPU thermal sensors** (`k10temp`/`Tctl`); capacity fallback | — | `src/cpu.rs`, `src/cpu_sensors.rs` tests |
 | Multi-server | — (only a **single** server was ever auto-discovered; parallel polling/isolation/selector never observed live) | Concurrency, per-server isolation, selector rendering, diagnostics inventory | — | `src/app.rs`, `src/discovery_llm.rs`, `src/ui.rs`, `src/diagnostics.rs` tests |
