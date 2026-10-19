@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
     io::Stdout,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,9 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEve
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use std::path::PathBuf;
-
-use crate::system::{RealSys, Sys};
+use crate::system::RealSys;
 use crate::{
     config,
     cpu::{detect_cpu_topology, CpuTopology},
@@ -25,11 +22,11 @@ use crate::{
     discovery::discover_gpus,
     discovery_llm::LocalServerIdentity,
     domain::{
-        DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessIdentity, ProcessStats,
-        ServerBackend, ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS,
-        MIN_LLM_POLL_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
+        DashboardSnapshot, FastSnapshot, GpuMapping, GpuSelector, ProcessStats, ServerBackend,
+        ServerSummary, SystemStats, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
+        MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
-    drm::{sample_process_gpus, DrmSamplerState},
+    drm::DrmSamplerState,
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
     llama::{LlamaMonitor, LlmStats},
@@ -37,6 +34,16 @@ use crate::{
     ui::{self, UiState},
 };
 use nvml_wrapper::Nvml;
+
+mod process;
+
+pub(crate) use process::{
+    collect_process_stats, io_wait_percent, per_cpu_usage_by_id, read_cpu_frequency_mhz,
+    read_cpu_times, read_load_average, ProcessCache,
+};
+#[cfg(test)]
+pub(crate) use process::{parse_cpu_times, read_process_thread_count, refresh_process_metadata};
+
 const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 /// S12: CPU temperature and power are slow-changing; they are sampled on this
 /// slower cadence (not the 250 ms system cadence) and reused in between.
@@ -1078,237 +1085,6 @@ fn spawn_fast_worker(
     })
 }
 
-/// Cached *static* process metadata, keyed by [`ProcessIdentity`].
-///
-/// The kernel recycles PIDs, so identity is `pid + start_time`. Once a
-/// process has been seen, its static metadata (program name, executable
-/// path) is cached and reused; only the dynamic counters (CPU, memory,
-/// thread count) are resampled on each process refresh.
-///
-/// The thread count is deliberately **not** cached here: a process can create
-/// and destroy threads at any time, so a cached value goes stale immediately,
-/// and a one-off read failure must not pin a fabricated count forever. It is
-/// re-read from `/proc/<pid>/status` on every process refresh (not per UI
-/// frame) and reported as `Option`: an unreadable process is `None` and the
-/// next refresh retries.
-#[derive(Default)]
-struct ProcessCache {
-    entries: std::collections::HashMap<ProcessIdentity, CachedProcess>,
-}
-
-struct CachedProcess {
-    program: String,
-    command: String,
-}
-
-impl ProcessCache {
-    /// Return the cached static metadata for `identity`, computing and storing
-    /// it on first sight. Only identity-bound, stable fields are cached.
-    fn stable(
-        &mut self,
-        identity: ProcessIdentity,
-        program: &str,
-        command: &str,
-    ) -> (String, String) {
-        let entry = self
-            .entries
-            .entry(identity)
-            .or_insert_with(|| CachedProcess {
-                program: program.to_string(),
-                command: command.to_string(),
-            });
-        // `execve` keeps the PID and start time, so the same identity can name a
-        // new image. Refresh the cached names when the freshly read ones change
-        // (an empty read is transient and keeps the last good value).
-        if !program.is_empty() && entry.program != program {
-            entry.program = program.to_string();
-        }
-        if !command.is_empty() && entry.command != command {
-            entry.command = command.to_string();
-        }
-        (entry.program.clone(), entry.command.clone())
-    }
-
-    /// Drop entries for identities that no longer exist (exited processes).
-    fn retain(&mut self, live: impl Iterator<Item = ProcessIdentity>) {
-        let live: std::collections::HashSet<_> = live.collect();
-        self.entries.retain(|identity, _| live.contains(identity));
-    }
-}
-
-/// Per-CPU usage indexed by kernel CPU id (matching the id-indexed topology
-/// vectors), so a non-prefix online set does not misalign the heatmap. sysinfo
-/// only reports the online CPUs; offline holes stay `0.0`. When the ids are
-/// not recoverable from the names the compact order is kept.
-fn per_cpu_usage_by_id(cpus: &[(&str, f32)]) -> Vec<f64> {
-    let ids: Option<Vec<usize>> = cpus
-        .iter()
-        .map(|(name, _)| {
-            name.strip_prefix("cpu")
-                .and_then(|id| id.parse::<usize>().ok())
-        })
-        .collect();
-    match ids {
-        Some(ids) => {
-            let span = ids.iter().copied().max().map_or(0, |max| max + 1);
-            let mut usage = vec![0.0; span];
-            for ((_, value), id) in cpus.iter().zip(ids) {
-                if let Some(slot) = usage.get_mut(id) {
-                    *slot = *value as f64;
-                }
-            }
-            usage
-        }
-        None => cpus.iter().map(|(_, value)| *value as f64).collect(),
-    }
-}
-
-/// Static metadata from the cache plus a freshly read dynamic thread count.
-///
-/// `read_threads` is injected so the refresh behavior is testable without a
-/// live `/proc`: the count is read on every call (never taken from the
-/// cache), and a failed read yields `None` rather than a substitute value.
-fn refresh_process_metadata<F>(
-    cache: &mut ProcessCache,
-    identity: ProcessIdentity,
-    program: &str,
-    command: &str,
-    read_threads: F,
-) -> (String, String, Option<usize>)
-where
-    F: FnOnce(u32) -> Option<usize>,
-{
-    let (program, command) = cache.stable(identity, program, command);
-    (program, command, read_threads(identity.pid))
-}
-
-fn collect_process_stats(
-    system: &System,
-    cache: &mut ProcessCache,
-    drm: &mut DrmSamplerState,
-) -> Vec<ProcessStats> {
-    let now = Instant::now();
-    let mut stats = Vec::with_capacity(system.processes().len());
-    let mut live = Vec::new();
-    for (pid, process) in system.processes().iter() {
-        let identity = ProcessIdentity::new(pid.as_u32(), process.start_time());
-        live.push(identity);
-
-        let program = process.name().to_string_lossy().into_owned();
-        let command = process
-            .exe()
-            .map(|path| path.display().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| program.clone());
-
-        let (program, command, threads) = refresh_process_metadata(
-            cache,
-            identity,
-            &program,
-            &command,
-            read_process_thread_count,
-        );
-
-        // S8: per-device GPU usage from the process's DRM fdinfo entries.
-        let gpu = sample_process_gpus(&RealSys, now, identity, drm);
-
-        stats.push(ProcessStats {
-            pid: identity.pid,
-            program,
-            command,
-            cpu_pct: process.cpu_usage() as f64,
-            memory_bytes: process.memory(),
-            threads,
-            start_time: identity.start_time,
-            gpu,
-        });
-    }
-    cache.retain(live.iter().copied());
-    drm.retain(live.into_iter());
-    stats
-}
-
-fn read_process_thread_count(pid: u32) -> Option<usize> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status.lines().find_map(|line| {
-        let value = line.strip_prefix("Threads:")?;
-        value.trim().parse().ok()
-    })
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct CpuTimes {
-    total: u64,
-    io_wait: u64,
-}
-
-fn read_cpu_times() -> Option<CpuTimes> {
-    let text = fs::read_to_string("/proc/stat").ok()?;
-    parse_cpu_times(&text)
-}
-
-fn parse_cpu_times(text: &str) -> Option<CpuTimes> {
-    let line = text.lines().find(|line| line.starts_with("cpu "))?;
-    let values = line
-        .split_whitespace()
-        .skip(1)
-        .take(8)
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    if values.len() < 5 {
-        return None;
-    }
-
-    Some(CpuTimes {
-        total: values.iter().copied().sum(),
-        io_wait: values[4],
-    })
-}
-
-fn io_wait_percent(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
-    let total_delta = current.total.saturating_sub(previous.total);
-    if total_delta == 0 {
-        return None;
-    }
-    let io_wait_delta = current.io_wait.saturating_sub(previous.io_wait);
-    Some(io_wait_delta as f64 / total_delta as f64 * 100.0)
-}
-
-fn read_load_average() -> Option<(f64, f64, f64)> {
-    let text = fs::read_to_string("/proc/loadavg").ok()?;
-    let mut fields = text.split_whitespace();
-    Some((
-        fields.next()?.parse().ok()?,
-        fields.next()?.parse().ok()?,
-        fields.next()?.parse().ok()?,
-    ))
-}
-
-fn read_cpu_frequency_mhz(sys: &dyn Sys) -> Option<f64> {
-    let text = sys.read_to_string(&PathBuf::from("/proc/cpuinfo"))?;
-    let mut total = 0.0;
-    let mut count = 0u64;
-
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        if key.trim() != "cpu MHz" {
-            continue;
-        }
-        let Ok(mhz) = value.trim().parse::<f64>() else {
-            continue;
-        };
-        if mhz.is_finite() && mhz > 0.0 {
-            total += mhz;
-            count += 1;
-        }
-    }
-
-    (count > 0).then_some(total / count as f64)
-}
-
 /// One monitored server's worker-side state.
 struct LlmServerMonitor {
     key: String,
@@ -1524,14 +1300,16 @@ mod tests {
         changed_identity_keys, collect_process_stats, drain_try_recv, io_wait_percent,
         join_bounded, map_server_identity, new_server_monitor, next_cycle_target, parse_cpu_times,
         per_cpu_usage_by_id, publish_selected_mapping, read_process_thread_count,
-        rebuild_server_monitors, reconcile_server, refresh_process_metadata, sample_process_gpus,
-        selected_identity_of, spawn_llm_worker, stabilize_llm_sample, try_send_snapshot, ui,
-        update_resolved_server, DashboardSnapshot, DrmSamplerState, FastSnapshot, GpuMapping,
-        LlamaMonitor, LlmCommand, LlmSample, LlmStats, LocalServerIdentity, ProcessCache,
-        ProcessIdentity, ProcessStats, RealSys, RedrawScheduler, ServerBackend, ServerChange,
-        ServerSpec, SystemStats, UiState, IDLE_REDRAW_INTERVAL, MAX_MONITORED_SERVERS,
-        MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
+        rebuild_server_monitors, reconcile_server, refresh_process_metadata, selected_identity_of,
+        spawn_llm_worker, stabilize_llm_sample, try_send_snapshot, ui, update_resolved_server,
+        DashboardSnapshot, DrmSamplerState, FastSnapshot, GpuMapping, LlamaMonitor, LlmCommand,
+        LlmSample, LlmStats, LocalServerIdentity, ProcessCache, ProcessStats, RealSys,
+        RedrawScheduler, ServerBackend, ServerChange, ServerSpec, SystemStats, UiState,
+        IDLE_REDRAW_INTERVAL, MAX_MONITORED_SERVERS, MAX_POLL_INTERVAL, MAX_REFRESH_MS,
+        MIN_LLM_POLL_MS, MIN_REFRESH_MS,
     };
+    use crate::domain::ProcessIdentity;
+    use crate::drm::sample_process_gpus;
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
