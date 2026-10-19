@@ -20,6 +20,10 @@ All notable changes to OrsikTop will be documented here.
 - **Independent server polls.** A slow server no longer delays the next poll of
   healthy servers; one in-flight request per server stays bounded.
 
+- **Parser mutation fuzz smoke.** 3 000 deterministic mutations over the
+  Prometheus/Strata seeds run in the normal test gate; malformed input must not
+  panic.
+
 ### Security
 
 - **Updater lookup is sibling-only.** `orsiktop update` no longer falls back to

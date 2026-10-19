@@ -1663,6 +1663,34 @@ mod tests {
     }
 
     #[test]
+    fn parser_mutation_fuzz_smoke_does_not_panic() {
+        // Deterministic mutation fuzzing over the checked-in parser seeds.
+        // A libFuzzer target needs a library crate; this keeps parser
+        // robustness in the normal gate without adding a dependency.
+        const SEEDS: [&str; 4] = [
+            include_str!("../tests/fixtures/metrics_current.prom"),
+            include_str!("../tests/fixtures/metrics_speculative.prom"),
+            include_str!("../tests/fixtures/metrics_partial.prom"),
+            include_str!("../tests/fixtures/slots_active.json"),
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..3_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let seed = SEEDS[(state as usize) % SEEDS.len()];
+            let mut bytes = seed.as_bytes().to_vec();
+            for _ in 0..8 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let index = (state as usize) % bytes.len();
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bytes[index] = (state >> 32) as u8;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let _ = parse_metrics_body(&text);
+            let _ = parse_prometheus(&text);
+        }
+    }
+
+    #[test]
     fn parses_current_llama_metrics_fixture() {
         let metrics = parse_prometheus(include_str!("../tests/fixtures/metrics_current.prom"));
 
