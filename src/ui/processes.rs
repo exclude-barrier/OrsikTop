@@ -12,7 +12,7 @@ use ratatui::{
 use super::widgets::{compact_memory, fit_cell, gpu_cell, pad_cell, thread_cell};
 use super::{
     ProcessDisplayRow, ProcessGroup, ProcessHeaderHit, ProcessRowTarget, ProcessRowsHit,
-    ProcessSortKey, UiState, BRIGHT_GREEN, CYAN, DIM_GREEN, INNER_GREEN, MUTED, ORANGE, ORK_GREEN,
+    ProcessSortKey, UiState, BRIGHT_GREEN, CYAN, INNER_GREEN, MUTED, ORANGE, ORK_GREEN,
     PROCESS_SELECTED_BG, YELLOW,
 };
 use crate::domain::{ProcessIdentity, ProcessStats};
@@ -254,7 +254,7 @@ pub(super) fn draw_processes(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM_GREEN));
+        .border_style(Style::default().fg(ORK_GREEN));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -454,14 +454,18 @@ pub(super) fn process_header_button(
     } else {
         "↕"
     };
-    let button = format!("[{label}{arrow}]");
+    let button = if is_active {
+        format!("{label}{arrow}")
+    } else {
+        label.to_string()
+    };
     let cell = if right_align {
         format!("{button:>width$}")
     } else {
         format!("{button:<width$}")
     };
     let mut style = Style::default()
-        .fg(if is_active { ORK_GREEN } else { CYAN })
+        .fg(if is_active { ORK_GREEN } else { MUTED })
         .add_modifier(Modifier::BOLD);
     if is_active {
         style = style
@@ -627,16 +631,15 @@ pub(super) fn process_group_line_compact(
 ) -> Line<'static> {
     let fixed = 7 + 7 + 9 + 6;
     let program_width = width.saturating_sub(fixed).max(8);
-    let count_label = format!("×{count}");
     let arrow = if expanded { "▾" } else { "▸" };
-    let program = fit_cell(&format!("{arrow} {program}"), program_width);
+    let program = fit_cell(&format!("{arrow} ×{count} {program}"), program_width);
     let cpu = process_cpu_color(cpu_pct);
     let marker = if selected { "›" } else { " " };
 
     Line::from(vec![
         Span::styled(
-            format!("{marker}{:<6}", count_label),
-            process_cell_style(CYAN, selected, false),
+            format!("{marker}{:<6}", "—"),
+            process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
             pad_cell(&program, program_width),
@@ -684,7 +687,7 @@ pub(super) fn process_line_compact(
         Span::styled(
             pad_cell(&program, program_width),
             process_cell_style(
-                if program_bold { ORK_GREEN } else { DIM_GREEN },
+                if program_bold { ORK_GREEN } else { MUTED },
                 selected,
                 program_bold,
             ),
@@ -718,18 +721,17 @@ pub(super) fn process_group_line_wide(
 ) -> Line<'static> {
     let fixed = 7 + 17 + 7 + 9 + 6 + 7;
     let command_width = width.saturating_sub(fixed).max(12);
-    let count_label = format!("×{count}");
     let arrow = if expanded { "▾" } else { "▸" };
     let program = fit_cell(&format!("{arrow} {program}"), 16);
-    let command = fit_cell(&format!("{count} processes"), command_width);
+    let command = fit_cell(&format!("×{count} · {count} processes"), command_width);
     let cpu = process_cpu_color(cpu_pct);
     let marker = if selected { "›" } else { " " };
     let gpu_text = gpu_cell(gpu_bytes);
 
     Line::from(vec![
         Span::styled(
-            format!("{marker}{:<6}", count_label),
-            process_cell_style(CYAN, selected, false),
+            format!("{marker}{:<6}", "—"),
+            process_cell_style(MUTED, selected, false),
         ),
         Span::styled(
             pad_cell(&program, 16),
@@ -787,7 +789,7 @@ pub(super) fn process_line_wide(
         Span::styled(
             pad_cell(&program, 16),
             process_cell_style(
-                if program_bold { ORK_GREEN } else { DIM_GREEN },
+                if program_bold { ORK_GREEN } else { MUTED },
                 selected,
                 program_bold,
             ),

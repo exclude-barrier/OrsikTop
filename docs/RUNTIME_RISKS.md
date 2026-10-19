@@ -97,24 +97,25 @@ combination with F2/F4.
 footer reports the fast and LLM counters together. The snapshot is still
 replaced by the next refresh, so no history is fabricated.
 
-## F4 — The poll rate under many servers is bounded by the slowest server, not the count (low)
+## F4 — Polls are independent per server (resolved)
 
 **Evidence**
-- `src/app.rs:1372-1409` — one scoped thread per server per cycle (up to 16),
-  each publishing its sample immediately; the cycle then waits for **all** of
-  them in `for sample in done_rx.iter()` (`:1399`) before
-  `sleep_until_next_cycle` (`src/app.rs:1414`).
-- HTTP bounds: `LLM_CONNECT_TIMEOUT_MS = 750`, `LLM_REQUEST_TIMEOUT_MS = 1200`
-  (`src/llama.rs:42-44`).
+- `spawn_llm_worker` keeps one shared monitor and one `in_flight` flag per
+  server (`LlmPollSlot`). Each cycle starts a poll only for a server whose
+  previous request finished; a slow server is simply skipped and the next cycle
+  starts on schedule for the others.
+- Samples are forwarded from a persistent channel as they arrive; the cycle no
+  longer joins a scoped thread per server.
+- Shutdown waits up to 2 s for in-flight poll flags to clear before the worker
+  returns.
 
-**Effect:** a hanging server does not delay *delivery* of the others (they send
-as soon as they finish), but it does delay the *next cycle of all servers* by up
-to ~1.2 s. The comment at `src/app.rs:1367-1371` describes delivery only; it
-does not claim the cycle rate is independent of the slowest server.
+**Effect:** a hanging or slow server no longer delays healthy servers' next
+poll. At most one request per server is in flight, so thread growth stays
+bounded by the 16-server cap. The worst case is a slow server refreshing less
+often; its last value remains visible.
 
-**Recommended follow-up:** if a hung server must not slow the others, move to a
-fixed per-server poll pool with independent cadences. Low priority: the worst
-case is one request timeout per cycle, and the UI already keeps the last values.
+**Remaining limit:** a truly wedged request can outlive the worker until process
+exit; the HTTP request timeout bounds normal cases to ~1.2 s.
 
 ## F5 — Thread count stays bounded under 16 servers (low, measured; keep architecture)
 

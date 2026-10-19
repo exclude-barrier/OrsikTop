@@ -57,7 +57,10 @@ use processes::{
     draw_processes, grouped_process_rows_filtered, process_row_target, take_pinned_group_rows,
 };
 #[cfg(test)]
-use processes::{grouped_process_rows, process_matches_search, sorted_processes_with_pin};
+use processes::{
+    grouped_process_rows, process_group_line_wide, process_header_wide, process_matches_search,
+    sorted_processes_with_pin,
+};
 #[cfg(test)]
 use system::{
     core_heatmap_rows, core_usage_color, core_usage_glyph, physical_core_average,
@@ -1797,6 +1800,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, llm: &LlmStats, gpu: &GpuStats, st
             " SEARCH /{}▏  [enter] apply  [esc] clear ",
             fit_cell(&state.process_search_query, 30)
         )
+    } else if inner.width >= 110 {
+        " [esc] quit  [h] help  [s] servers  [q] settings  [-/+] refresh  [/] search  [dbl] pin "
+            .to_string()
     } else {
         " [esc] quit  [h] help  [q] settings  [/] search  [dbl] pin ".to_string()
     };
@@ -1853,6 +1859,40 @@ pub fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::*;
     use crate::domain::{DeviceId, GpuEvidence, GpuVendor, MappedGpu};
+
+    #[test]
+    fn process_header_marks_only_the_active_sort_without_brackets() {
+        let line = process_header_wide(100, ProcessSortKey::Cpu, true);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("CPU↓"), "{text}");
+        assert!(!text.contains('['), "{text}");
+    }
+
+    #[test]
+    fn process_group_count_moves_out_of_the_pid_cell() {
+        let line = process_group_line_wide(
+            "llama-server",
+            30,
+            12.0,
+            1024,
+            0,
+            Some(3),
+            false,
+            false,
+            100,
+        );
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("×30"), "{text}");
+        assert_eq!(line.spans[0].content.trim(), "—", "{text}");
+    }
 
     #[test]
     fn same_named_processes_are_grouped_with_aggregate_metrics() {
