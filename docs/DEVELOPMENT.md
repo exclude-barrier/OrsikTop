@@ -38,8 +38,9 @@ For an installed development build, see [Cargo installation](INSTALLATION.md#car
 | [`src/server_editor.rs`](../src/server_editor.rs) | Pure additional-endpoint validation, identity, monitoring flags and masking helpers |
 | [`src/system.rs`](../src/system.rs) | Filesystem access for real systems and fixtures |
 | [`src/ui.rs`](../src/ui.rs) and [`src/ui/`](../src/ui/) | UI state, layout, dialogs, per-panel rendering and histories |
+| [`src/ui/tests/`](../src/ui/tests/), [`src/app/tests/`](../src/app/tests/) and [`src/llama/tests/`](../src/llama/tests/) | Test modules split by unit under test; shared test helpers live in each `tests/mod.rs` |
 
-The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared widgets. Keep focused parsing and rendering helpers in the corresponding existing submodule rather than growing another monolith.
+The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared widgets. Keep focused parsing and rendering helpers in the corresponding existing submodule rather than growing another monolith. Tests follow the same pattern: add tests to the matching theme file under `tests/`, and put fixtures or helpers used by more than one theme file in that `tests/mod.rs`.
 
 ## Runtime boundaries
 
