@@ -704,6 +704,13 @@ fn spec_counter_reset_does_not_create_fake_acceptance() {
     assert_eq!(stats.spec_acceptance_pct, None);
 }
 
+/// A deterministic mock `/props`/`/metrics`/`/slots` backend.
+///
+/// `respond(path, n)` returns `(status, content_type, body)` for the `n`-th
+/// request to that exact path. Counting per path (never globally) keeps a
+/// sequenced endpoint deterministic even though `sample()` fetches the
+/// three endpoints concurrently. The server thread stops when the handle is
+/// dropped.
 struct MockBackend {
     base: String,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

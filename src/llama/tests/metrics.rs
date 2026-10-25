@@ -1316,14 +1316,6 @@ fn model_path_is_shortened_for_display() {
     );
 }
 
-/// A deterministic mock `/props`/`/metrics`/`/slots` backend.
-///
-/// `respond(path, n)` returns `(status, content_type, body)` for the `n`-th
-/// request to that exact path. Counting per path (never globally) keeps a
-/// sequenced endpoint deterministic even though `sample()` fetches the
-/// three endpoints concurrently. The server thread stops when the handle is
-/// dropped.
-
 #[test]
 fn prometheus_payload_with_unknown_fields_keeps_known_metrics_and_labels() {
     let metrics = parse_prometheus(include_str!(
