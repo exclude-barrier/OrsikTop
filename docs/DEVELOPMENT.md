@@ -38,9 +38,10 @@ For an installed development build, see [Cargo installation](INSTALLATION.md#car
 | [`src/server_editor.rs`](../src/server_editor.rs) | Pure additional-endpoint validation, identity, monitoring flags and masking helpers |
 | [`src/system.rs`](../src/system.rs) | Filesystem access for real systems and fixtures |
 | [`src/ui.rs`](../src/ui.rs) and [`src/ui/`](../src/ui/) | UI state, layout, dialogs, per-panel rendering and histories |
+| [`src/ui/state_*.rs`](../src/ui/) | `UiState` behavior in four domains: `state_shell.rs` (drop counters, help), `state_llm.rs` (histories, server selector), `state_process.rs` (navigation, selection, search, clicks) and `state_settings.rs` (settings dialog, server-list editor) |
 | [`src/ui/tests/`](../src/ui/tests/), [`src/app/tests/`](../src/app/tests/) and [`src/llama/tests/`](../src/llama/tests/) | Test modules split by unit under test; shared test helpers live in each `tests/mod.rs` |
 
-The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared widgets. Keep focused parsing and rendering helpers in the corresponding existing submodule rather than growing another monolith. Tests follow the same pattern: add tests to the matching theme file under `tests/`, and put fixtures or helpers used by more than one theme file in that `tests/mod.rs`.
+The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared widgets. Keep focused parsing and rendering helpers in the corresponding existing submodule rather than growing another monolith. `UiState` behavior lives in the `state_*.rs` modules as separate `impl UiState` blocks: add a method to the block of its domain, and if it is called from outside that module, give it `pub(crate)`. Types shared between `ui.rs` and a state module are `pub(super)` in the state module and re-imported in `ui.rs` so submodules and tests keep their existing `super::` paths. Tests follow the same pattern: add tests to the matching theme file under `tests/`, and put fixtures or helpers used by more than one theme file in that `tests/mod.rs`.
 
 ## Runtime boundaries
 
