@@ -42,7 +42,14 @@ jobs:
           denyWarnings: true
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.20.2 --locked
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked || {
+            # rust-cache can restore a stale binary without its install
+            # state; drop it and retry once.
+            echo "cargo-deny install failed; removing stale binary and retrying"
+            rm -f "$CARGO_HOME/bin/cargo-deny"
+            cargo install cargo-deny --version 0.20.2 --locked
+          }
 
       - name: Cargo deny
         run: cargo deny check
