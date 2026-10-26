@@ -3,7 +3,8 @@
 
 cargo-dist checksums the application archive but downloads the separately
 published `<app>-update` binary without a checksum. This script runs in the
-release workflow after `dist build` and before `dist host --steps=upload`,
+release workflow before the assets are published, applied to both
+`target/distrib/` and the `artifacts/` copy that the release step uploads,
 tightening the generated installer without changing cargo-dist itself.
 
 Usage: python3 scripts/patch_installer_updater.py target/distrib
