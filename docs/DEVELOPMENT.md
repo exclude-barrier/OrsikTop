@@ -38,7 +38,8 @@ For an installed development build, see [Cargo installation](INSTALLATION.md#car
 | [`src/diagnostics.rs`](../src/diagnostics.rs) and [`src/redact.rs`](../src/redact.rs) | Bug-report diagnostics and shared display-safe endpoint rendering |
 | [`src/server_editor.rs`](../src/server_editor.rs) | Pure additional-endpoint validation, identity, monitoring flags and masking helpers |
 | [`src/system.rs`](../src/system.rs) | Filesystem access for real systems and fixtures |
-| [`src/ui.rs`](../src/ui.rs) and [`src/ui/`](../src/ui/) | UI state, layout, dialogs, per-panel rendering and histories |
+| [`src/ui.rs`](../src/ui.rs) and [`src/ui/`](../src/ui/) | UI state, dialogs, per-panel rendering and histories |
+| [`src/ui/draw.rs`](../src/ui/draw.rs) | Dashboard layout shell: full/compact/too-small draw paths, header, LLM/system, bottom and footer panels |
 | [`src/ui/state_*.rs`](../src/ui/) | `UiState` behavior in four domains: `state_shell.rs` (drop counters, help), `state_llm.rs` (histories, server selector), `state_process.rs` (navigation, selection, search, clicks) and `state_settings.rs` (settings dialog, server-list editor) |
 | [`src/ui/tests/`](../src/ui/tests/), [`src/app/tests/`](../src/app/tests/) and [`src/llama/tests/`](../src/llama/tests/) | Test modules split by unit under test; shared test helpers live in each `tests/mod.rs` |
 
