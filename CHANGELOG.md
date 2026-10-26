@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-26
+
 ### Changed
 
 - **Clear LLM hero line.** The panel now leads with state, decode rate,
