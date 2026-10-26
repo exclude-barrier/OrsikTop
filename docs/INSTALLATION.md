@@ -79,7 +79,7 @@ cargo install --git https://github.com/exclude-barrier/OrsikTop --locked
 This builds the repository revision fetched by Cargo, which can be newer than the latest published release. To install the published version instead, use its release tag, for example:
 
 ```bash
-cargo install --git https://github.com/exclude-barrier/OrsikTop --tag v0.4.2 --locked
+cargo install --git https://github.com/exclude-barrier/OrsikTop --tag v0.4.3 --locked
 ```
 
 From a local checkout:

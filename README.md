@@ -16,8 +16,8 @@ OrsikTop brings **LLM inference, GPU telemetry, Linux system load and processes*
 
 ## Highlights
 
-- **Inference at a glance:** live prefill and decode rates, lifetime averages, context occupancy, request progress, slots and speculative-decoding metrics when the backend exposes them.
-- **Multiple servers:** monitor up to 16 endpoints concurrently, with separate connection state and throughput history. Switch servers without losing their histories.
+- **Inference at a glance:** live prefill and decode rates with 60-second rate histories, lifetime averages, context occupancy, request progress, slots and speculative-decoding metrics when the backend exposes them.
+- **Multiple servers:** monitor up to 16 endpoints concurrently, with separate connection state and throughput history. Servers poll independently, so a slow endpoint never delays the healthy ones. Switch servers without losing their histories.
 - **Settings in the TUI:** add, edit and remove additional endpoints; change GPU selection and refresh settings without restarting.
 - **GPU and system telemetry:** NVIDIA, AMD and Intel backends, CPU/core activity, RAM, swap, sensors and 60-second histories. Available metrics depend on hardware, drivers and permissions.
 - **Interactive processes:** sort, search, group and pin processes, with per-process GPU telemetry where available.
