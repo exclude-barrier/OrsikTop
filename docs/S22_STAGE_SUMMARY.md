@@ -137,3 +137,15 @@ Final sizes: `src/ui.rs` 253, `src/app.rs` 426, `src/llama.rs` 918 lines
 (was 5.717 / 4.511 / 3.612), with the logic now living in
 `src/ui/draw.rs` + `src/ui/state_*.rs`, `src/app/{channels,workers,loop_events}.rs`
 and the `tests/` trees.
+
+## 7. Follow-up — `llama/monitor.rs` (post v0.4.3)
+
+The one step deliberately left out of scope above landed afterwards as
+PR #101 (`refactor(llama): extract LlamaMonitor into monitor.rs`): the
+540-line `LlamaMonitor` impl moved from `llama.rs` (918 → 377 lines)
+into `src/llama/monitor.rs`, same discipline — line-multiset-verified
+pure move, one commit, **589 tests** green. Forced visibility changes:
+5 impl methods and 3 helper types (`JsonOutcome`, `SlotCounter`,
+`LocalSpeculativeConfig`) to `pub(crate)` (the tests call the methods
+directly; E0446 for the types in method signatures) and `std::thread`
+kept as a `#[cfg(test)]` re-import in `llama.rs` for the test glob.

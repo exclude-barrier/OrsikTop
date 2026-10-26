@@ -27,7 +27,7 @@ For an installed development build, see [Cargo installation](INSTALLATION.md#car
 | [`src/app.rs`](../src/app.rs) | App loop skeleton, snapshot application, refresh constants and re-exports for the app submodules |
 | [`src/app/`](../src/app/) | App submodules: `channels.rs` (non-blocking channel drains, drop counting, bounded worker join), `workers.rs` (fast system/GPU worker and LLM poll worker), `loop_events.rs` (snapshot pumping, key and mouse handling), `process.rs` (process stats collection) and `server.rs` (server-set reconciliation, identity and poll slots) |
 | [`src/llama.rs`](../src/llama.rs) | Single-endpoint monitor, telemetry normalization and rate derivation |
-| [`src/llama/`](../src/llama/) | HTTP, metrics, props, slots and speculative-decoding helpers |
+| [`src/llama/`](../src/llama/) | HTTP, the `LlamaMonitor` state machine (monitor), metrics, props, slots and speculative-decoding helpers |
 | [`src/strata.rs`](../src/strata.rs) | Strata JSON telemetry adapter |
 | [`src/discovery_llm.rs`](../src/discovery_llm.rs) | Local llama.cpp process discovery and configured endpoints |
 | [`src/discovery.rs`](../src/discovery.rs) | Linux DRM/sysfs GPU discovery |
