@@ -32,6 +32,7 @@ mod gpu_panel;
 mod history;
 mod llm;
 mod processes;
+mod state_shell;
 mod system;
 mod widgets;
 use dialogs::{
@@ -306,24 +307,6 @@ impl Default for UiState {
 }
 
 impl UiState {
-    /// Publish the worker drop counters for the footer. Called every loop
-    /// iteration, so a busy or stalled UI becomes visible without waiting for
-    /// the next successfully delivered snapshot.
-    pub(crate) fn set_snapshot_drops(&mut self, fast: u64, llm: u64) {
-        self.fast_snapshot_drops = fast;
-        self.llm_snapshot_drops = llm;
-    }
-
-    /// Compact footer warning, absent while no snapshot has been dropped.
-    pub(crate) fn snapshot_drop_text(&self) -> Option<String> {
-        (self.fast_snapshot_drops > 0 || self.llm_snapshot_drops > 0).then(|| {
-            format!(
-                "DROPS f{} l{}",
-                self.fast_snapshot_drops, self.llm_snapshot_drops
-            )
-        })
-    }
-
     pub fn push_sample(&mut self, gpu: &GpuStats, system: &SystemStats) {
         let now = Instant::now();
         let vram = match (gpu.memory_used_mib, gpu.memory_total_mib) {
@@ -743,20 +726,6 @@ impl UiState {
     fn process_search_query(&self) -> Option<&str> {
         let query = self.process_search_query.trim();
         (!query.is_empty()).then_some(query)
-    }
-
-    pub fn toggle_help(&mut self) {
-        self.settings_open = false;
-        self.process_search_open = false;
-        self.help_open = !self.help_open;
-    }
-
-    pub fn close_help(&mut self) {
-        self.help_open = false;
-    }
-
-    pub fn is_help_open(&self) -> bool {
-        self.help_open
     }
 
     pub fn open_settings(&mut self, active_server: &str, settings: &AppConfig) {
