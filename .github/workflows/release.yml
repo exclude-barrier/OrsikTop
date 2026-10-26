@@ -291,7 +291,9 @@ jobs:
           merge-multiple: true
 
       # cargo-dist checksums the archive but not the separately published
-      # updater; embed its hash in the installer before `dist host` uploads it.
+      # updater; embed its hash in the installer. The assets actually
+      # published to the release are the copies in `artifacts/` (uploaded by
+      # "Create GitHub release"), so the same patch is applied there as well.
       - name: Verify updater checksum in installer
         run: python3 scripts/patch_installer_updater.py target/distrib
 
@@ -311,6 +313,12 @@ jobs:
 
       - name: Cleanup manifests
         run: rm -f artifacts/*-dist-manifest.json
+
+      # The release assets are uploaded from `artifacts/`, the original
+      # action artifacts, not from `target/distrib/`; the updater checksum
+      # patch must be applied to that copy as well.
+      - name: Verify updater checksum in release assets
+        run: python3 scripts/patch_installer_updater.py artifacts
 
       - name: Create GitHub release
         env:
