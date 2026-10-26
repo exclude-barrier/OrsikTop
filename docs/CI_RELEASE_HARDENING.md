@@ -178,10 +178,26 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   `main` push did not publish. The tag run `39167010373` published `v0.4.2`.
 - The cargo-dist installer step no longer receives `GH_TOKEN`; the token is
   passed only to the `plan` step that invokes `dist host --steps=create`.
-- The release `host` job runs `scripts/patch_installer_updater.py` before
-  `dist host` uploads artifacts. It embeds the updater SHA-256 in the generated
-  installer and appends the updater to `sha256.sum`; the installer fails closed
-  if `sha256sum` is unavailable.
+- The release `host` job runs `scripts/patch_installer_updater.py` on both
+  `target/distrib/` and the `artifacts/` directory that "Create GitHub
+  release" uploads. It embeds the updater SHA-256 in the generated installer
+  and appends the updater to `sha256.sum`; the installer fails closed if
+  `sha256sum` is unavailable.
+- **Updater-checksum defect in v0.4.3 (2026-10-26).** The v0.4.3 release
+  (run `40344191700`) was published with the unpatched installer and
+  `sha256.sum`: the `host` job patched `target/distrib/`, but the release
+  assets are uploaded by "Create GitHub release" from `artifacts/` — the
+  original action artifacts — and `dist host --steps=upload` uploaded nothing
+  on that run (manifest `"upload_files": []`; every asset `updated_at`
+  timestamp matches the `gh release create` step). The published tarball and
+  updater were intact and their SHA-256 checksums verified; only the
+  installer's updater verification and the updater line in `sha256.sum` were
+  missing. v0.4.3 is an immutable release — GitHub stamps `immutable: true`
+  at publication and asset replacement returns 422 — so it cannot be fixed in
+  place. v0.4.4 re-releases the same code with the fixed pipeline (PR #103)
+  and supersedes it; its release notes carry the superseded banner. Re-check
+  the published installer for the `verify_checksum` guard after every
+  release.
 - GitHub Actions policy is `selected`: GitHub-owned actions plus SHA-pinned
   `dtolnay/rust-toolchain`, `Swatinem/rust-cache` and
   `actions-rust-lang/audit`. SHA pinning is required repository-wide.

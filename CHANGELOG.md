@@ -4,6 +4,23 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-26
+
+### Changed
+
+- **Re-release of 0.4.3.** No code changes. The release pipeline now patches
+  the asset copies that the release step actually uploads, so the published
+  installer and `sha256.sum` carry the updater SHA-256 verification that
+  0.4.3 promised but did not ship.
+
+### Security
+
+- **v0.4.3 assets are superseded.** The v0.4.3 installer did not verify the
+  `orsiktop-update` SHA-256 because the workflow patched a directory the
+  release step never uploaded. v0.4.3 remains available but is superseded by
+  this release; its tarball and updater checksums were valid. Install from
+  v0.4.4.
+
 ## [0.4.3] - 2026-10-26
 
 ### Changed
