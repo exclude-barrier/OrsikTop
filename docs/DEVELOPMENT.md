@@ -24,7 +24,8 @@ For an installed development build, see [Cargo installation](INSTALLATION.md#car
 | [`src/main.rs`](../src/main.rs) | Terminal setup, CLI overrides, server-set assembly, subcommands and install lifecycle |
 | [`src/config.rs`](../src/config.rs) | Persistent runtime settings and atomic saves |
 | [`src/domain.rs`](../src/domain.rs) | Vendor-neutral telemetry models, GPU identity and server identity |
-| [`src/app.rs`](../src/app.rs) | Event loop, worker lifecycle, snapshots, selected-server state and runtime synchronization |
+| [`src/app.rs`](../src/app.rs) | App loop skeleton, snapshot application, refresh constants and re-exports for the app submodules |
+| [`src/app/`](../src/app/) | App submodules: `channels.rs` (non-blocking channel drains, drop counting, bounded worker join), `workers.rs` (fast system/GPU worker and LLM poll worker), `loop_events.rs` (snapshot pumping, key and mouse handling), `process.rs` (process stats collection) and `server.rs` (server-set reconciliation, identity and poll slots) |
 | [`src/llama.rs`](../src/llama.rs) | Single-endpoint monitor, telemetry normalization and rate derivation |
 | [`src/llama/`](../src/llama/) | HTTP, metrics, props, slots and speculative-decoding helpers |
 | [`src/strata.rs`](../src/strata.rs) | Strata JSON telemetry adapter |
@@ -37,9 +38,12 @@ For an installed development build, see [Cargo installation](INSTALLATION.md#car
 | [`src/diagnostics.rs`](../src/diagnostics.rs) and [`src/redact.rs`](../src/redact.rs) | Bug-report diagnostics and shared display-safe endpoint rendering |
 | [`src/server_editor.rs`](../src/server_editor.rs) | Pure additional-endpoint validation, identity, monitoring flags and masking helpers |
 | [`src/system.rs`](../src/system.rs) | Filesystem access for real systems and fixtures |
-| [`src/ui.rs`](../src/ui.rs) and [`src/ui/`](../src/ui/) | UI state, layout, dialogs, per-panel rendering and histories |
+| [`src/ui.rs`](../src/ui.rs) and [`src/ui/`](../src/ui/) | UI state, dialogs, per-panel rendering and histories |
+| [`src/ui/draw.rs`](../src/ui/draw.rs) | Dashboard layout shell: full/compact/too-small draw paths, header, LLM/system, bottom and footer panels |
+| [`src/ui/state_*.rs`](../src/ui/) | `UiState` behavior in four domains: `state_shell.rs` (drop counters, help), `state_llm.rs` (histories, server selector), `state_process.rs` (navigation, selection, search, clicks) and `state_settings.rs` (settings dialog, server-list editor) |
+| [`src/ui/tests/`](../src/ui/tests/), [`src/app/tests/`](../src/app/tests/) and [`src/llama/tests/`](../src/llama/tests/) | Test modules split by unit under test; shared test helpers live in each `tests/mod.rs` |
 
-The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared widgets. Keep focused parsing and rendering helpers in the corresponding existing submodule rather than growing another monolith.
+The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared widgets. Keep focused parsing and rendering helpers in the corresponding existing submodule rather than growing another monolith. `UiState` behavior lives in the `state_*.rs` modules as separate `impl UiState` blocks: add a method to the block of its domain, and if it is called from outside that module, give it `pub(crate)`. Types shared between `ui.rs` and a state module are `pub(super)` in the state module and re-imported in `ui.rs` so submodules and tests keep their existing `super::` paths. The app submodules follow the same rule: helpers moved out of `app.rs` are `pub(super)` and re-imported there so the app loop, sibling modules and the test modules keep their existing `super::` paths, and names only the tests need stay behind `#[cfg(test)]`. Tests follow the same pattern: add tests to the matching theme file under `tests/`, and put fixtures or helpers used by more than one theme file in that `tests/mod.rs`.
 
 ## Runtime boundaries
 
