@@ -4,6 +4,19 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Live smoke test for the NVIDIA provider** (`nvidia_real_system_smoke`,
+  `#[ignore]`d, run with `cargo test -- --ignored nvidia_real`). The NVML
+  provider has no `Sys` seam, so its fixture tests cover only the pure
+  helpers (sanitize/clamp, MIG keys); the real sampling path — init,
+  enumeration, selector resolution, slow properties — was never exercised
+  against a live driver. The smoke asserts only the standing rule (a sample
+  reports a device or a reason, never a fabricated reading), prints the rest,
+  and skips hosts without NVIDIA hardware. Operator procedure recorded in
+  `HARDWARE_TEST_MATRIX.md`. The test gate moves from 589 to **590**
+  (581 run + 9 ignored).
+
 ### Changed
 
 - **Declared `rust-version = 1.95`.** The floor was previously implicit, set
@@ -39,7 +52,8 @@ All notable changes to OrsikTop will be documented here.
 
 - **Documentation housekeeping.** The test-count baselines in
   `LIVE_VS_FIXTURE.md` and `TELEMETRY_VERIFICATION.md` are marked as
-  historical and the pinned gate (**589** = 581 + 8) is stated alongside
+  historical and the pinned gate (**589** = 581 + 8 at that time; it is 590
+  now, see the Added section) is stated alongside
   them. Line anchors in the hardware documents now note they predate the
   `ui.rs`/`app.rs`/`llama.rs` decomposition (PR #98); stale anchors were
   updated to their post-split locations, the commit hash for the S23 TUI
