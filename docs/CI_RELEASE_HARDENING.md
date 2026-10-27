@@ -205,6 +205,10 @@ next `dist generate`. Any such change must be re-checked after a `dist` upgrade.
   archive, verify its published SHA-256 checksum, and install that binary
   directly. No installer script runs in either job. In the build job,
   `GH_TOKEN` is scoped to the `dist build` step.
-- Still open: the `announce` job is empty because no announcement target is
-  configured, and secret-scanning non-provider patterns/validity checks could
-  not be enabled on the current plan.
+- Decision (2026-10-27): the `announce` job stays an intentional no-op
+  placeholder — no announcement target is configured, the GitHub release is
+  created by the `host` job, and an in-workflow comment marks the placeholder.
+  It becomes real work only when an announcement target (changelog announcement
+  or Discord) is wanted. Secret-scanning non-provider patterns and validity
+  checks remain unavailable on the current GitHub plan; re-check when the plan
+  changes.
