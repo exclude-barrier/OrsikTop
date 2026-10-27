@@ -31,6 +31,14 @@ All notable changes to OrsikTop will be documented here.
   `PERFORMANCE_BASELINE.md` cross-references the post-split modules, and the
   `DEVELOPMENT.md` module table gained the `ui/dialogs.rs`, `ui/llm.rs` and
   `ui/processes.rs` rows.
+- **`uninstall` classifies install-directory entries instead of following
+  symlinks.** The entry list is built with `symlink_metadata`: regular
+  binaries are removed as before, a symlinked entry is reported as skipped
+  (`skipped <path> (symlink; not removed)`) instead of being treated as an
+  install binary because `is_file()` followed the link. A manipulated install
+  directory can no longer make the removal decision depend on the type of a
+  link target. Regression test with a symlink pointing outside the install
+  directory; the gate stays at 589 (581 + 8).
 
 ## [0.4.4] - 2026-10-26
 
