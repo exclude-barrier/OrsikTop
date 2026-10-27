@@ -288,10 +288,17 @@ fn run_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
         );
         lines.push("cargo uninstall orsiktop".to_string());
     } else {
-        for path in uninstall_files(dir) {
-            fs::remove_file(&path)
-                .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
-            lines.push(format!("removed {}", path.display()));
+        for entry in uninstall_entries(dir) {
+            match entry {
+                InstallEntry::Regular(path) => {
+                    fs::remove_file(&path)
+                        .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+                    lines.push(format!("removed {}", path.display()));
+                }
+                InstallEntry::Symlink(path) => {
+                    lines.push(format!("skipped {} (symlink; not removed)", path.display()));
+                }
+            }
         }
     }
 
@@ -329,11 +336,31 @@ fn is_cargo_install_dir(dir: &Path) -> bool {
             .is_some_and(|name| name == ".cargo")
 }
 
-fn uninstall_files(dir: &Path) -> Vec<PathBuf> {
+#[derive(Debug, PartialEq, Eq)]
+enum InstallEntry {
+    Regular(PathBuf),
+    Symlink(PathBuf),
+}
+
+/// Install-directory entries that `run_uninstall` may act on, classified by
+/// `symlink_metadata` instead of `is_file()`: `is_file()` follows symlinks, so
+/// a manipulated install directory would report a link to some file elsewhere
+/// as a plain install binary. Deletion is decided on the entry itself — a
+/// symlink is reported and skipped, never followed.
+fn uninstall_entries(dir: &Path) -> Vec<InstallEntry> {
     ["orsiktop", "orsiktop-update"]
         .into_iter()
-        .map(|name| dir.join(name))
-        .filter(|path| path.is_file())
+        .filter_map(|name| {
+            let path = dir.join(name);
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if metadata.file_type().is_symlink() {
+                Some(InstallEntry::Symlink(path))
+            } else if metadata.file_type().is_file() {
+                Some(InstallEntry::Regular(path))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -514,6 +541,14 @@ mod tests {
         discovery_llm::LocalServerIdentity { pid, start_time }
     }
 
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("orsiktop-main-test-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn manual_server_is_used_when_auto_discovery_is_disabled() {
         let settings = config::AppConfig {
@@ -575,22 +610,46 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_files_only_lists_existing_orsiktop_binaries() {
-        let dir =
-            std::env::temp_dir().join(format!("orsiktop-uninstall-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+    fn uninstall_entries_only_lists_regular_binaries_and_classifies_symlinks() {
+        let dir = unique_temp_dir("uninstall-entries");
+        let outside = unique_temp_dir("uninstall-target");
         let main_bin = dir.join("orsiktop");
         let updater = dir.join("orsiktop-update");
         let unrelated = dir.join("llama-server");
         fs::write(&main_bin, b"binary").unwrap();
         fs::write(&unrelated, b"binary").unwrap();
 
-        assert_eq!(uninstall_files(&dir), vec![main_bin.clone()]);
+        assert_eq!(
+            uninstall_entries(&dir),
+            vec![InstallEntry::Regular(main_bin.clone())]
+        );
 
         fs::write(&updater, b"binary").unwrap();
-        assert_eq!(uninstall_files(&dir), vec![main_bin, updater]);
+        assert_eq!(
+            uninstall_entries(&dir),
+            vec![
+                InstallEntry::Regular(main_bin.clone()),
+                InstallEntry::Regular(updater.clone())
+            ]
+        );
+
+        // The link is classified as the entry itself, not as what it points at:
+        // a manipulated install directory reports a symlink so `run_uninstall`
+        // skips it, and the target outside the install directory stays intact.
+        fs::remove_file(&updater).unwrap();
+        fs::write(outside.join("victim"), b"unrelated").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), &updater).unwrap();
+        assert_eq!(
+            uninstall_entries(&dir),
+            vec![
+                InstallEntry::Regular(main_bin.clone()),
+                InstallEntry::Symlink(updater.clone())
+            ]
+        );
+        assert!(outside.join("victim").is_file());
 
         fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]
