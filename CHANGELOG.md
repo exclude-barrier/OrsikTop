@@ -47,6 +47,10 @@ All notable changes to OrsikTop will be documented here.
   backend's self-expiring deadline — stays with the harness that asserts it, so
   a consolidation cannot quietly remove an asserted guarantee. No test renamed,
   added or removed; the gate count is unchanged.
+- **`clap` caret raised to the resolved minor** (`"4.5"` → `"4.6"`). Cargo.lock
+  is on 4.6.7, so the manifest read behind the lock and version audits reported
+  a line that does not describe the build graph. Lock unchanged, no behaviour
+  change.
 
 ### Fixed
 
