@@ -17,6 +17,11 @@ All notable changes to OrsikTop will be documented here.
   termwiz/termina backend tree are no longer pulled in. Cargo.lock shrinks by
   69 crate entries, which shrinks the audit and SBOM surface to what is
   actually compiled. No behaviour change.
+- **Release profile strips symbols** (`[profile.release]` with `strip = true`).
+  The `[profile.dist]` thin-LTO section inherits it; shipped release binaries
+  carried debug info the TUI never uses. `panic = "abort"` was deliberately
+  not set — unwinding keeps the graceful-degradation rule for telemetry paths.
+  No behaviour change; smaller artifacts.
 
 ### Fixed
 
