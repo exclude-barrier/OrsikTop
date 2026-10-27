@@ -51,6 +51,13 @@ All notable changes to OrsikTop will be documented here.
   is on 4.6.7, so the manifest read behind the lock and version audits reported
   a line that does not describe the build graph. Lock unchanged, no behaviour
   change.
+- **CI runs the ignored tests weekly** (`.github/workflows/scheduled.yml`, Mondays
+  03:13 UTC plus `workflow_dispatch`): the leak probe, the perf baseline and the
+  short soak (`ORSIK_SOAK_SECS=120`, single-threaded), plus a 60 s libFuzzer run of
+  the Prometheus parser. `discovery_real_system_smoke` is skipped because runners
+  have no GPU — hardware evidence stays an operator concern
+  (`HARDWARE_TEST_MATRIX.md` §5). The ignored set ran locally on the dev box:
+  7/7 green in 398 s.
 
 ### Fixed
 

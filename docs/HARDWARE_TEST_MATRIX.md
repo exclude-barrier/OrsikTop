@@ -262,6 +262,12 @@ the **command** and its exit code, the **raw output**, and the **snapshot hash**
 when run through `pc-project`. A claim that cannot be tied to such a record
 stays `implemented`/`fixture-tested`.
 
+GitHub-hosted runners have no GPU, so the weekly scheduled job
+(`.github/workflows/scheduled.yml`) runs the ignored set single-threaded but skips
+`discovery_real_system_smoke`. A hardware row is filled only by an operator run on
+the target hardware (§4), never by that job; provider smokes that print `skipping`
+on a runner without the vendor are not evidence either.
+
 ## Confirmed support vs. open hardware tests
 
 ### Confirmed support (live-verified)

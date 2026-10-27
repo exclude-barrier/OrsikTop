@@ -1,0 +1,62 @@
+# Weekly deeper check: the ignored tests that the PR gate never runs.
+# Leak probe, perf baseline, short soak, live smokes — run single-threaded.
+# Hardware-asserting smokes (discovery_real_system_smoke) are skipped:
+# GitHub-hosted runners have no GPU, and the operator runs them on the
+# target hardware per HARDWARE_TEST_MATRIX.md §4. Non-asserting provider
+# smokes print `skipping` on runners without that vendor; the printed
+# output is the evidence. cargo-dist does not manage scheduled workflows, so
+# `dist generate` leaves this file alone.
+
+name: Scheduled checks
+
+on:
+  schedule:
+    - cron: '13 3 * * 1'   # Mondays 03:13 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ignored-tests:
+    name: Ignored tests (leak probe, perf baseline, short soak, provider smokes)
+    runs-on: ubuntu-latest
+    env:
+      ORSIK_SOAK_SECS: "120"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.99.1
+        with:
+          toolchain: 1.99.1
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Cargo test --ignored
+        run: |
+          cargo test --all-targets --locked -- --ignored --test-threads=1 \
+            --skip discovery_real_system_smoke
+
+  fuzz:
+    name: Short fuzz (parse_prometheus, 60 s)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.99.1
+        with:
+          toolchain: nightly
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz the Prometheus parser for 60 seconds
+        run: cargo +nightly fuzz run parse_prometheus -- -max_total_time=60
