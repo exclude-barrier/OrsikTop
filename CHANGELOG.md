@@ -18,6 +18,20 @@ All notable changes to OrsikTop will be documented here.
   69 crate entries, which shrinks the audit and SBOM surface to what is
   actually compiled. No behaviour change.
 
+### Fixed
+
+- **Documentation housekeeping.** The test-count baselines in
+  `LIVE_VS_FIXTURE.md` and `TELEMETRY_VERIFICATION.md` are marked as
+  historical and the pinned gate (**589** = 581 + 8) is stated alongside
+  them. Line anchors in the hardware documents now note they predate the
+  `ui.rs`/`app.rs`/`llama.rs` decomposition (PR #98); stale anchors were
+  updated to their post-split locations, the commit hash for the S23 TUI
+  change was corrected (`88a7efc` → `a48596a`), `S0_AUDIT.md` carries a
+  historical banner, `SOAK_HARNESS.md` points at `src/app/tests/soak_scenarios.rs`,
+  `PERFORMANCE_BASELINE.md` cross-references the post-split modules, and the
+  `DEVELOPMENT.md` module table gained the `ui/dialogs.rs`, `ui/llm.rs` and
+  `ui/processes.rs` rows.
+
 ## [0.4.4] - 2026-10-26
 
 ### Changed

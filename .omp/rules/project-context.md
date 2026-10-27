@@ -44,12 +44,13 @@ accounts, browsers, or daemons.
   handling and throughput logic are reused. Only fields the verified schema
   actually exposes are mapped; an absent field stays absent, never a
   fabricated `0`.
-- Module layout: `llama.rs` (`LlamaMonitor`, polling, metric mapping) and
-  `ui.rs` (layout, event handling, state) remain the main modules; focused
-  helpers were extracted into `src/llama/` (`http`, `metrics`, `props`,
-  `slots`, `speculative`) and `src/ui/` (`dialogs`, `gpu_panel`, `history`,
-  `llm`, `processes`, `system`, `widgets`, plus the TestBackend regression
-  modules). Put new helper code in the matching submodule where one exists.
+- Module layout: `ui.rs`, `app.rs` and `llama.rs` are thin roots over their
+  submodules (decomposition, PR #98 `18c5c4e`): `src/llama/` (`http`,
+  `metrics`, `monitor`, `prometheus`, `props`, `slots`, `speculative`),
+  `src/ui/` (`dialogs`, `draw`, `gpu_panel`, `history`, `llm`, `processes`,
+  `system`, `widgets`, `state_*`, plus the TestBackend regression modules)
+  and `src/app/` (`channels`, `loop_events`, `process`, `server`, `workers`).
+  Put new helper code in the matching submodule where one exists.
 - Two worker threads (fast: system/GPU/processes; LLM: HTTP) publish
   snapshots; the UI renders only the latest snapshot. `orsiktop diag`
   (`diagnostics.rs`) prints a no-secrets state dump for bug reports.
@@ -108,7 +109,9 @@ accounts, browsers, or daemons.
 - Validate after change groups:
   `cargo fmt --all -- --check`, `cargo check --all-targets --locked`,
   `cargo clippy --all-targets --locked -- -D warnings`,
-  `cargo test --all-targets --locked`.
+  `cargo test --all-targets --locked`. The test gate is pinned at **589**
+  (581 run + 8 ignored, `docs/S22_STAGE_SUMMARY.md:32`); do not lower the
+  count without an explicit decision.
 - Small, isolated, reviewable commits on the existing branch. No push
   without explicit approval.
 - Larger work stages get a summary in `docs/S*_STAGE_SUMMARY.md`.

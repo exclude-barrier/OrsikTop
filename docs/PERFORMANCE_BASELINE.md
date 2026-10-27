@@ -910,9 +910,10 @@ wiederholen.
 
 ## Querverweise
 
-- `src/app.rs` — `RedrawScheduler`, `simulated_idle_redraws`, die zwei
-  Benchmark-Tests; Fast-Worker/Prozesskollektor (`spawn_fast_worker`,
-  `collect_process_stats`).
-- `src/llama.rs` — `LlamaMonitor::sample` (Polling-Pfad).
+- `src/app.rs` — `RedrawScheduler` (`:99`); Fast-Worker/Prozesskollektor
+  (`spawn_fast_worker` in `src/app/workers.rs`, `collect_process_stats` in
+  `src/app/process.rs`); die zwei Benchmark-Tests in
+  `src/app/tests/workers.rs` (`perf_baseline_soak_and_process_collection_benchmark`).
+- `src/llama/monitor.rs` — `LlamaMonitor::sample` (Polling-Pfad).
 - `docs/TELEMETRY_VERIFICATION.md` — Telemetrie-Semantik (CFA-33).
 - `docs/LIVE_VS_FIXTURE.md` — Live-/Fixture-Evidenzstufen.

@@ -36,7 +36,11 @@ Environments (both non-root, kernel `7.2.5-omarchy`; see
   `llama serve` (b10909, `--parallel 2`). Captured 2026-09-18 (S24).
 - One live backend run (Strata) names no box (commit text only).
 
-Baseline `main @ 2c087a3`, **583 passed / 8 ignored**. Ignored-by-default
+Baseline `main @ 2c087a3`, **583 passed / 8 ignored** (historical, recorded at
+that commit; the gate is pinned at **589** — 581 run + 8 ignored — see
+`docs/S22_STAGE_SUMMARY.md:32`). Line anchors below are point-in-time records
+from before the `ui.rs`/`app.rs`/`llama.rs` decomposition (PR #98, `18c5c4e`);
+the named tests still exist, now under `src/<module>/tests/`. Ignored-by-default
 live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
 `intel_real_system_smoke` (`src/providers/intel.rs:581`),
 `drm_real_system_smoke` (`src/drm.rs:904`) — run with `cargo test -- --ignored`.
@@ -68,7 +72,7 @@ enc/dec stayed `—`. CPU: `1304 MHz`/`26 °C` (Auto) and `1070 MHz`/`26 °C`
 | GPU — NVIDIA MIG | — | Topology, stable child keys, process attribution, UI matching | Exact `MIG-…` UUID form a driver emits; `Device::uuid()` on a child handle | `src/providers/nvidia.rs`, `src/gpu_map.rs`, `src/domain.rs`, `src/ui.rs` |
 | CPU / sensors | Hybrid P+E topology, cpufreq, hwmon temperature, RAPL `None` under non-root (dev box); 2026-10-18 `cf-desktop` diag: i9-12900K P=8/E=8, 4428 MHz, 51 °C, power `—` | LP-E class; conventional (all-P) Intel; **AMD CPU thermal sensors** (`k10temp`/`Tctl`); capacity fallback | — | `src/cpu.rs`, `src/cpu_sensors.rs` tests |
 | Multi-server | — (only a **single** server was ever auto-discovered; parallel polling/isolation/selector never observed live) | Concurrency, per-server isolation, selector rendering, diagnostics inventory | — | `src/app.rs`, `src/discovery_llm.rs`, `src/ui.rs`, `src/diagnostics.rs` tests |
-| TUI | Observed on both boxes (rendered against live data) | 116 `TestBackend` render/interaction tests | — | `src/ui.rs::tests` |
+| TUI | Observed on both boxes (rendered against live data) | 116 `TestBackend` render/interaction tests | — | `src/ui/tests/` |
 | Discovery / DRM / GPU mapping / domain | DRM/sysfs discovery + per-process fdinfo on the dev box; BDF identity on both boxes; NVML compute-app mapping on test-desktop | Parser/shape branches; multi-render-node attribution; render-fd mapping branch; `Multi` mapping state | — | `discovery_real_system_smoke`, `drm_real_system_smoke`; `src/discovery.rs`, `src/drm.rs`, `src/gpu_map.rs`, `src/domain.rs` tests |
 | Config / diagnostics / redaction | `orsiktop diag` on test-desktop (`docs/HARDWARE_SUPPORT.md:55`, `:66`), the dev box (`docs/S18_STAGE_SUMMARY.md:72`), and `cf-desktop` on 2026-10-18 with broken NVML (exit `0`, unavailable values) | Parsing, sanitizing, no-secrets rendering; headless CI smoke (no GPU, no server) | — | `src/config.rs`, `src/diagnostics.rs`, `src/redact.rs` tests |
 
@@ -243,7 +247,7 @@ enc/dec stayed `—`. CPU: `1304 MHz`/`26 °C` (Auto) and `1070 MHz`/`26 °C`
 - **Live.** The TUI was observed rendering live data on both boxes (Intel
   iGPU/xe state, LLM slot state, `—` for unavailable metrics) per
   `docs/HARDWARE_SUPPORT.md` and `docs/V0_2_6_NOTES.md`.
-- **Fixture.** `src/ui.rs::tests` (`src/ui.rs:1538`, 116 tests) render to a
+- **Fixture.** `src/ui/tests/` (116 tests) render to a
   ratatui `TestBackend` buffer and assert on cells, covering the GPU panel PWR
   `—` semantics (`gpu_panel_renders_pwr_unavailable_without_power_telemetry`
   at `src/ui.rs:3863`), LLM panel/slot overview

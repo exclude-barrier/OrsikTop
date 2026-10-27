@@ -97,6 +97,9 @@ out of scope.
 
 ## 4. Known limitations
 
+Stage-time record; both points have since moved on. The decomposition landed as
+PR #98 (`18c5c4e`), and the release was made (v0.4.4).
+
 - The branch is **unpushed**; `main` is untouched at `476bf5d`. A release
   (Unreleased → v0.4.3) is due but out of scope for this stage.
 - `llama.rs` still contains `impl LlamaMonitor` (543 lines / 8 methods);
