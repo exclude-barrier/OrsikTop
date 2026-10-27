@@ -336,6 +336,9 @@ jobs:
             artifacts/*
 
   announce:
+    # Intentional no-op placeholder: no announcement target is configured and
+    # the GitHub release itself is created by the `host` job above. Re-apply
+    # this note after `dist generate`.
     needs: [plan, host]
     if: ${{ always() && needs.host.result == 'success' }}
     runs-on: ubuntu-22.04
