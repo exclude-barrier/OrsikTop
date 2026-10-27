@@ -17,7 +17,13 @@ categories = ["command-line-utilities"]
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.29"
 nvml-wrapper = "0.13"
-ratatui = "0.30"
+# Minimal feature set: the TUI only uses the crossterm backend plus
+# Paragraph/Block/Borders/Clear widgets. default-features would pull in the
+# calendar widget (and its time stack), the st!/stylize!/layout! macros, and
+# the termwiz/termina backend tree — none of which is used and none of which
+# is ever compiled, but all of which sits in Cargo.lock, the SBOM and audits.
+# `layout-cache` is kept for layout performance.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1.0"
 sysinfo = "0.39"
