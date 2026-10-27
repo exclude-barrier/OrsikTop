@@ -8,6 +8,10 @@ Produktivcode geändert; insbesondere bleibt `src/strata.rs` unverändert
 (geschützte Datei, Hash in `production-state.json`). Quelle der Wahrheit sind
 Code und Fixtures am genannten HEAD — nicht die Herstellerprosa.
 
+**Stand-Hinweis:** Evidenzdokument am Stand `e9600d6` (v0.4.0). Die drei
+F2-Aussagen in §4, §6 und §8 wurden nachträglich auf den CFA-86-Stand
+(v0.4.1) aktualisiert; dort ist jeweils der CFA-86-Hinweis zu lesen.
+
 Zitierweise: Funktionsnamen sind der stabile Schlüssel; die `file:line`
 verschieben sich mit dem Baum und sind nur Wegweiser. Jede Aussage ist in der
 letzten Spalte auf Code oder Fixture zurückgeführt.
@@ -200,12 +204,17 @@ Feste Regeln:
 - **CTX-Paar aus einem Slot.** Belegung, Kapazität und Slot-Tag stammen immer aus
   **einem** Slot (meist-genutzter Busy-Slot, sonst meist-genutzter Slot), nie
   aus unabhängigen Maxima (`src/llama/slots.rs:31-42`).
-- **REQ prompt Fallback.** `n_prompt_tokens_processed` **oder**, falls der
-  Server den Namen nicht führt, `n_prompt_tokens` (`src/llama/slots.rs:78-81`).
-  Diesen Fallback nutzt auch Strata **neu** (das den Fortschrittsnamen nicht
-  führt); die CACHE-/REQUEST-Semantik dieses Falls ist der in
-  `docs/TELEMETRY_VERIFICATION.md` als **F2** geführte offene Befund und hier
-  nur referenziert, nicht korrigiert.
+- **REQ prompt — kein Fallback (am Stand `e9600d6`: F2 offen; behoben durch
+  CFA-86, v0.4.1).** Am Stand dieser Doku fiel `n_prompt_tokens_processed`
+  auf `n_prompt_tokens` zurück (`src/llama/slots.rs:78-81`), auch bei Strata
+  **neu** (das den Fortschrittsnamen nicht führt); das war der in
+  `docs/TELEMETRY_VERIFICATION.md` als **F2** geführte Befund. **CFA-86 hat
+  den Fallback entfernt:** REQUEST prompt stammt nur aus
+  `n_prompt_tokens_processed` bzw. (Strata) `live.prompt_tokens`, sonst
+  `None`/`—`; `n_prompt_tokens` ist die CTX-Belegung und steht nie für
+  Fortschritt (Kommentar in `src/llama/slots.rs`; Regressionstests
+  `llama_slot_without_processed_counter_keeps_request_prompt_unknown`,
+  `strata_new_slots_report_direct_occupancy`).
 - **Aggregat nur vollständig.** Meldet ein Busy-Slot seinen Fortschritts-Zähler
   nicht, ist die REQUEST-Summe unvollständig → `None`/`—`, kein stiller
   Teilsummenwert (`src/llama/slots.rs:46-50, 84-101`).
@@ -269,7 +278,7 @@ ersatzweise aus der lokalen Prozess-CLI; das MTP-Kennzeichen in der UI ist
 | CTX-Belegung | `/slots` `n_prompt_tokens` | alt: fehlt → `—`; neu: `n_prompt_tokens` |
 | CTX-Kapazität | `/props` `n_ctx`, sonst Slot-`n_ctx` | dazu `engine.max_context`/`engine.context` |
 | CTX watermark | `n_tokens_max` → `diag` `watermark` | nicht vorhanden → `—` |
-| REQUEST prompt | `n_prompt_tokens_processed`, sonst `n_prompt_tokens` | Slot-Wert, sonst `live.prompt_tokens`; neu = Belegung (F2) |
+| REQUEST prompt | nur `n_prompt_tokens_processed`, sonst `—` (kein Fallback, CFA-86) | Slot-Wert, sonst `live.prompt_tokens`; `n_prompt_tokens` bleibt CTX (F2 behoben) |
 | REQUEST generated | `next_token[].n_decoded` | `live.generated` |
 | REQ active/deferred | `requests_processing` + `requests_deferred` | nur `live.queued` → deferred; Active immer `—` |
 | LIVE PP | Counter-/Slot-Delta, sonst `prompt_total`-Delta | **nicht verfügbar** (kein Instant-Prefill) → `—` |
@@ -311,11 +320,12 @@ In-Process-Fake-Server: `sample_reads_strata_json_metrics_end_to_end`
   `n_prompt_tokens` ist als `slots_strata_new.json` erfasst, aber **nicht**
   live nachgeprüft; das live gelaufene Schema kannte das Feld nicht.
 - **Kein Live-Box-Name** für den Strata-Lauf; die Evidenz ist der Commit-Text.
-- **F2 (aus `docs/TELEMETRY_VERIFICATION.md`):** ohne
-  `n_prompt_tokens_processed` (neueres Strata; llama.cpp ohne den Namen) zeigt
-  REQUEST prompt die **KV-Belegung**, nicht den Prompt-Fortschritt. Hier nur
-  dokumentiert; eine Korrektur wäre ein eigener Code-Task, nicht Teil von
-  HW-02.
+- **F2 (aus `docs/TELEMETRY_VERIFICATION.md`) — behoben (CFA-86, v0.4.1).**
+  Am Stand `e9600d6` zeigte REQUEST prompt ohne `n_prompt_tokens_processed`
+  (neueres Strata; llama.cpp ohne den Namen) die **KV-Belegung** statt des
+  Prompt-Fortschritts. CFA-86 hat den Fallback entfernt: fehlend → `—`,
+  `n_prompt_tokens` bleibt reine CTX-Belegung (Status und Regressionstests in
+  `docs/TELEMETRY_VERIFICATION.md` §F2).
 - **Strata Draft-Anzahl** und **Active-Request-Gauge** existieren im Schema
   nicht; beide bleiben dauerhaft `—`.
 - Der Strata-Adapter mappt **nur** das verifizierte Schema; unbekannte Felder
