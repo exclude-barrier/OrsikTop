@@ -8,6 +8,15 @@ module. It complements the shorter, hand-written worker tests in
 (`soak_endurance_all_failure_modes_without_mixing_and_recovers`, `:480`;
 `soak_set_servers_churn_keeps_generations_and_polling_bounded`, `:299`).
 
+## Where the ignored runs happen
+
+The PR gate runs only the short tests. The `#[ignore]`d runs — long soaks, the leak
+probe, the perf baseline — are executed weekly by
+`.github/workflows/scheduled.yml` (Mondays, `--ignored --test-threads=1`,
+`ORSIK_SOAK_SECS=120`) together with a 60 s libFuzzer run of the Prometheus parser.
+Hardware-asserting smokes are skipped in that job, because GitHub-hosted runners have
+no GPU; those rows stay operator runs per `HARDWARE_TEST_MATRIX.md` §4.
+
 ## What it exercises
 
 Rotating over 1, 4 and 16 servers, each server is walked through: repeated
