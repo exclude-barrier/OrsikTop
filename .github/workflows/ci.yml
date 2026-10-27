@@ -15,9 +15,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - name: Install pinned Rust stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.99.1
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Cache Cargo
@@ -70,3 +71,23 @@ jobs:
           # `diag` reads the real /sys, /proc and runs one bounded llama probe;
           # on a headless runner (no GPU, no server) it must still exit 0.
           cargo run --locked -- diag
+
+  # Guarantees the declared floor (rust-version in Cargo.toml) still builds:
+  # a dependency whose own rust-version exceeds the floor fails this job with
+  # a clear cargo error, so the declared MSRV can never silently rot.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install MSRV
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Cargo check at MSRV
+        run: cargo check --locked --all-targets

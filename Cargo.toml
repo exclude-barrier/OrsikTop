@@ -2,6 +2,10 @@
 name = "orsiktop"
 version = "0.4.4"
 edition = "2021"
+# Effective floor of the dependency set (currently sysinfo 0.39.6, which
+# declares rust-version 1.95). CI checks this floor in a dedicated MSRV job
+# (.github/workflows/ci.yml) and builds the main gate on a pinned stable.
+rust-version = "1.95"
 description = "Fast terminal monitoring for local LLM Orks"
 license = "Apache-2.0"
 repository = "https://github.com/exclude-barrier/OrsikTop"
