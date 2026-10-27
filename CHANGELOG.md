@@ -10,6 +10,13 @@ All notable changes to OrsikTop will be documented here.
   by the dependency set (sysinfo 0.39.6 requires 1.95). CI now builds the
   main gate on a pinned stable (1.99.1) and checks the declared floor in a
   dedicated MSRV job.
+- **Ratatui trimmed to its minimal feature set** (`default-features = false`,
+  features `crossterm` and `layout-cache`). The UI uses only the crossterm
+  backend and the base widgets (Paragraph, Block, Borders, Clear); the
+  calendar widget, the `st!`/`stylize!`/`layout!` macros and the
+  termwiz/termina backend tree are no longer pulled in. Cargo.lock shrinks by
+  69 crate entries, which shrinks the audit and SBOM surface to what is
+  actually compiled. No behaviour change.
 
 ## [0.4.4] - 2026-10-26
 
