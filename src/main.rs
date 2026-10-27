@@ -16,6 +16,8 @@ mod redact;
 mod server_editor;
 mod strata;
 mod system;
+#[cfg(test)]
+mod testutil;
 mod ui;
 
 use std::{

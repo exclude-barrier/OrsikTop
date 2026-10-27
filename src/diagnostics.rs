@@ -1198,42 +1198,10 @@ mod tests {
 
     #[test]
     fn probe_servers_reports_a_healthy_server_while_an_offline_one_is_isolated() {
-        use std::io::{Read, Write};
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
-
-        fn read_path(stream: &mut TcpStream) -> Option<String> {
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 512];
-            loop {
-                let n = stream.read(&mut chunk).ok()?;
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            String::from_utf8_lossy(&buf)
-                .lines()
-                .next()?
-                .split_whitespace()
-                .nth(1)
-                .map(str::to_string)
-        }
-        fn write_json(stream: &mut TcpStream, body: &str) {
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-        }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         listener.set_nonblocking(true).expect("nonblocking");
@@ -1244,7 +1212,7 @@ mod tests {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        if let Some(path) = read_path(&mut stream) {
+                        if let Some(path) = crate::testutil::read_request_path(&mut stream) {
                             let body = if path.contains("/props") {
                                 "{\"model_path\":\"model-A\",\"total_slots\":1,\"default_generation_settings\":{\"n_ctx\":4096}}".to_string()
                             } else if path.contains("/slots") {
@@ -1252,7 +1220,12 @@ mod tests {
                             } else {
                                 "llamacpp:prompt_tokens_total 100\n".to_string()
                             };
-                            write_json(&mut stream, &body);
+                            crate::testutil::write_response(
+                                &mut stream,
+                                200,
+                                "application/json",
+                                &body,
+                            );
                         }
                     }
                     Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
