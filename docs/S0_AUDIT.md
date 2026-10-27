@@ -1,5 +1,9 @@
 # S0 — Repository & Architecture Audit (HEAD `d135a60`)
 
+> **Historical record.** The module table below describes the pre-decomposition
+> layout. `ui.rs`, `app.rs` and `llama.rs` were split into submodules by PR #98
+> (`18c5c4e`); the current layout is described in `docs/DEVELOPMENT.md`.
+
 ## Module structure
 
 | File | Lines | Role |

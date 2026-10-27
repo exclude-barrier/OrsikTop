@@ -3,9 +3,10 @@
 `src/app/tests/soak.rs` drives the *real* LLM worker
 (`spawn_llm_worker`) against local loopback mock llama.cpp servers. No
 inference server is contacted; every check runs against mocks defined in the
-module. It complements the shorter, hand-written worker tests in `src/app.rs`
-(`soak_endurance_all_failure_modes_without_mixing_and_recovers`,
-`soak_set_servers_churn_keeps_generations_and_polling_bounded`, …).
+module. It complements the shorter, hand-written worker tests in
+`src/app/tests/soak_scenarios.rs`
+(`soak_endurance_all_failure_modes_without_mixing_and_recovers`, `:480`;
+`soak_set_servers_churn_keeps_generations_and_polling_bounded`, `:299`).
 
 ## What it exercises
 

@@ -7,7 +7,9 @@ operator can run on the target hardware, and an explicit split between
 and fixture-tested, never observed live).
 
 This file does not replace the other two hardware documents; it is the
-test-actionable view over them:
+test-actionable view over them. Line anchors (`file.rs:NNN`) are point-in-time
+records from before the `ui.rs`/`app.rs`/`llama.rs` decomposition (PR #98,
+`18c5c4e`); the named tests still exist, now under `src/<module>/tests/`.
 
 - `docs/HARDWARE_SUPPORT.md` — per-capability hardware detail and evidence
   levels.
@@ -59,7 +61,7 @@ The five roadmap priorities in roadmap order; the hardware name is bold.
 | 2 | **Intel i915 / Arc dGPU** | i915 iGPU live, Arc dGPU fixture | **Partial** (i915 iGPU clock live; Arc dGPU open) | `src/providers/intel.rs`: i915 root-GT `rps_cur_freq_mhz` + `throttle_reason_*` (card dir, then `gt/gt0` fallback); dGfx hwmon `temp1_input` + `power1_max` (PL1) | `samples_i915_from_card_directory` (`src/providers/intel.rs:471`), `i915_reads_clock_and_reasons_from_gt_gt0_fallback` (`:502`), `missing_throttle_source_is_unavailable_not_none` (`:484`), `samples_xe_dgpu_with_hwmon` (`:373`), `pl1_limit_of_zero_is_treated_as_unavailable` (`:564`) | i915 iGPU clock live on `cf-desktop`; xe iGPU live on the dev box; Arc dGfx **not** live | an Intel Arc dGPU (i915 iGPU is now covered) |
 | 3 | **AMD Ryzen/EPYC CPU sensors** | fixture-tested | **Open** | `src/cpu.rs` vendor-neutral identity; `src/cpu_sensors.rs` hwmon walker accepts the AMD driver names `k10temp` and `zenpower` (out-of-tree) plus the generic `x86_pkg` package-temp name (`is_cpu_thermal_driver`, `src/cpu_sensors.rs:315`) and the `Tctl` package label (`is_package_label`, `:325`); no hybrid-PMU files → `cpu_capacity` fallback | `temperature_reads_an_amd_k10temp_tctl_sensor` (`src/cpu_sensors.rs:470`), `temperature_reads_a_zenpower_package_sensor` (`src/cpu_sensors.rs:494`), `parses_amd_identity` (`src/cpu.rs:516`) | — (both boxes are Intel) | an AMD Ryzen or EPYC host |
 | 4 | **NVIDIA Multi-GPU** | partially live | **Partially confirmed** | `src/discovery.rs` enumerates every display-class PCI GPU, sorted by BDF; `src/gpu.rs` `resolve_discovered` / `GpuSelector::Index(n)`; `src/gpu_map.rs` `Multi` mapping state | `discovers_intel_xe_igpu_and_amd_dgpu_sorted_by_bdf` (`src/discovery.rs:299`), `index_selects_the_nth_nvidia_on_igpu_dgpu_machines` (`src/gpu.rs:285`), `multi_gpu_when_process_opens_two_render_nodes` (`src/gpu_map.rs:460`) | test-desktop **iGPU + one NVIDIA** (both enumerated, BDF-sorted, `Auto`→NVIDIA) | a second NVIDIA GPU (2× NVIDIA index selection) |
-| 5 | **NVIDIA MIG** | fixture-tested | **Open** | `src/providers/nvidia.rs` MIG topology at construction; `src/domain.rs` `MIG-…` identity; `src/gpu_map.rs` `gpu_instance_id`/`compute_instance_id` attribution; `src/ui.rs` parent↔child chip | `mig_child_key_prefers_driver_uuid` (`src/providers/nvidia.rs:653`) ff.; `mig_uuid_detection` (`src/domain.rs:672`); `attribute_mig_child_when_instance_evidence_matches` (`src/gpu_map.rs:617`); `gpu_in_mapping_matches_mig_parent_and_child` (`src/ui.rs:3753`) | — (no MIG-capable A100/H100) | an A100/H100-class MIG host |
+| 5 | **NVIDIA MIG** | fixture-tested | **Open** | `src/providers/nvidia.rs` MIG topology at construction; `src/domain.rs` `MIG-…` identity; `src/gpu_map.rs` `gpu_instance_id`/`compute_instance_id` attribution; `src/ui.rs` parent↔child chip | `mig_child_key_prefers_driver_uuid` (`src/providers/nvidia.rs:653`) ff.; `mig_uuid_detection` (`src/domain.rs:672`); `attribute_mig_child_when_instance_evidence_matches` (`src/gpu_map.rs:617`); `gpu_in_mapping_matches_mig_parent_and_child` (`src/ui/tests/layout_shell.rs:964`) | — (no MIG-capable A100/H100) | an A100/H100-class MIG host |
 
 ## Evidence required per category (the open rows)
 
@@ -132,8 +134,8 @@ passing test), and the `real_system_smoke` filter narrows the run to the three
 hardware smokes. **Do not** run a bare `cargo test -- --ignored`: it also runs
 two heavy tests —
 
-- `perf_baseline_soak_and_process_collection_benchmark` (`src/app.rs:3659`)
-- `soak_many_set_servers_rounds_bound_resources_single_threaded` (`src/app.rs:4715`)
+- `perf_baseline_soak_and_process_collection_benchmark` (`src/app/tests/workers.rs:936`)
+- `soak_many_set_servers_rounds_bound_resources_single_threaded` (`src/app/tests/soak_scenarios.rs:580`)
 
 — which their own doc comments restrict to an approved single-threaded runner
 and which are **not** part of the hardware check (a failure of the leak probe
