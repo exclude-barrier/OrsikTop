@@ -4,8 +4,8 @@
 
 > **Current status (2026-10-17, `main` `2e1f0d2`):** the semantic contract
 > below still holds; the detailed CFA-33 verification is historical (HEAD
-> `2e0d37f`). Gate at that time: **583 passed / 8 ignored** (the gate is now
-> pinned at **589** — 581 run + 8 ignored, `docs/S22_STAGE_SUMMARY.md:32`).
+> `2e0d37f`). Gate at that time: **583 passed / 8 ignored** (the standing gate
+> is now pinned at **590** — 581 run + 9 ignored, `.omp/rules/project-context.md`).
 > Concise contract:
 > CTX = direct slot occupancy only; REQUEST = `n_prompt_tokens_processed`;
 > LIVE = verified slot/aggregate delta, otherwise unavailable; AVG = lifetime

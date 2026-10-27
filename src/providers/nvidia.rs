@@ -689,4 +689,49 @@ mod tests {
         assert_eq!(key.mig_parent_uuid().as_deref(), Some("GPU-parent"));
         assert_eq!(key.mig_instance(), None);
     }
+
+    /// Smoke test against the real machine (run with
+    /// `cargo test -- --ignored nvidia_real`). Not part of CI.
+    ///
+    /// The NVML provider has no `Sys` seam, so this smoke is the only check of
+    /// the real sampling path (init, enumeration, selector resolution, slow
+    /// properties, sanitization) against a live driver. It asserts only the
+    /// standing rule — a sample reports a device or a reason, never a
+    /// fabricated reading — and prints the rest.
+    #[test]
+    #[ignore]
+    fn nvidia_real_system_smoke() {
+        use crate::discovery::discover_gpus;
+        use crate::domain::GpuVendor;
+        use crate::system::RealSys;
+        let gpus = discover_gpus(&RealSys);
+        let nvidia = gpus
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.vendor == GpuVendor::Nvidia)
+            .collect::<Vec<_>>();
+        if nvidia.is_empty() {
+            eprintln!("no NVIDIA GPU on this machine; skipping");
+            return;
+        }
+        for (i, gpu) in nvidia {
+            let mut provider = NvidiaGpuProvider::new(GpuSelector::Index(i as u32));
+            let stats = provider.sample();
+            assert!(stats.available || !stats.error.is_empty());
+            println!(
+                "{:?} card={} bdf={} available={} name={} util={:?} temp={:?} power={:?} pstate={} reason={} error={}",
+                gpu.vendor,
+                gpu.card,
+                gpu.device_id.key(),
+                stats.available,
+                stats.name,
+                stats.utilization,
+                stats.temperature_c,
+                stats.power_w,
+                stats.pstate,
+                stats.limit_reason,
+                stats.error
+            );
+        }
+    }
 }

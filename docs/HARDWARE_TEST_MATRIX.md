@@ -148,6 +148,7 @@ full picture:
 | --- | --- | --- | --- |
 | `discovery_real_system_smoke` | `src/discovery.rs:452` | prints every DRM-discovered GPU | at least one GPU is found (`:469-472`), every GPU carries a BDF (`:474-477`) and the vendor read succeeded (`:479-483`) — it **can** go red |
 | `intel_real_system_smoke` | `src/providers/intel.rs:581` | prints one Intel provider sample; returns `skipping` when the host has no Intel GPU | `available`, the device key, and `utilization`/`memory_total_mib` are `None` — **not** clock, throttle reason, temperature or PL1 |
+| `nvidia_real_system_smoke` | `src/providers/nvidia.rs:703` | prints one NVML provider sample; returns `skipping` when the host has no NVIDIA GPU | the sample reports a device or a reason (`available || !error.is_empty()`), never a fabricated reading — the rest is print-only |
 | `drm_real_system_smoke` | `src/drm.rs:911` | counts processes holding a DRM fd and prints each | nothing — output only; its doc comment says it always passes |
 
 So a green run is not by itself vendor telemetry: reading the printed output is
@@ -241,6 +242,18 @@ For each priority, on a host that has the hardware:
      synthetic `{parent}#mig-{slot}`; per-MIG metrics NVML does not expose
      render `—`. Also report the exact `MIG-…` string the driver emits and
      whether `Device::uuid()` on a child handle returns it (see Open list below).
+
+Base row — **NVIDIA discrete** — on an NVIDIA host with the driver loaded.
+
+- `cargo test -- --ignored --nocapture nvidia_real_system_smoke` and
+  `cargo run -- diag`.
+- The NVML provider has no `Sys` seam, so the smoke is the only check of the
+  real sampling path (init, enumeration, selector resolution, slow properties,
+  sanitization) against a live driver. It asserts only the standing rule — the
+  sample reports a device or a reason, never a fabricated reading — and prints
+  utilization, temperature, power, P-state and the throttle summary. The base
+  row was live-verified on test-desktop 2026-10-19 (driver `615.78.08`);
+  re-run the smoke on every visit to an NVIDIA host.
 
 ### 5. Recording evidence
 

@@ -37,8 +37,9 @@ Environments (both non-root, kernel `7.2.5-omarchy`; see
 - One live backend run (Strata) names no box (commit text only).
 
 Baseline `main @ 2c087a3`, **583 passed / 8 ignored** (historical, recorded at
-that commit; the gate is pinned at **589** — 581 run + 8 ignored — see
-`docs/S22_STAGE_SUMMARY.md:32`). Line anchors below are point-in-time records
+that commit; the standing gate is pinned at **590** — 581 run + 9 ignored,
+`.omp/rules/project-context.md`; the S22 stage had pinned 589, the NVML live
+smoke added the ninth ignored test). Line anchors below are point-in-time records
 from before the `ui.rs`/`app.rs`/`llama.rs` decomposition (PR #98, `18c5c4e`);
 the named tests still exist, now under `src/<module>/tests/`. Ignored-by-default
 live smokes: `discovery_real_system_smoke` (`src/discovery.rs:452`),
