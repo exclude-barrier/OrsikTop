@@ -41,8 +41,8 @@
 
 use super::{
     accepts_llm_sample, assert_no_cross_mixing, read_request_path, self_status_field,
-    start_soak_worker, test_spec, LlmCommand, LlmSample, LocalServerIdentity, ServerSpec,
-    MAX_MONITORED_SERVERS, MIN_LLM_POLL_MS,
+    start_soak_worker, test_spec, write_response, LlmCommand, LlmSample, LocalServerIdentity,
+    ServerSpec, MAX_MONITORED_SERVERS, MIN_LLM_POLL_MS,
 };
 
 use std::collections::HashSet;
@@ -266,15 +266,6 @@ fn spawn_accept(
     (halt, handle)
 }
 
-fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
 fn serve_connection(mut stream: TcpStream, shared: &MockShared) {
     let _ = stream.set_nonblocking(false);
     let Some(path) = read_request_path(&mut stream) else {
@@ -312,28 +303,23 @@ fn serve_connection(mut stream: TcpStream, shared: &MockShared) {
         }
         Behavior::CorruptJson => {
             if path.contains("/metrics") {
-                write_response(&mut stream, "200 OK", "text/plain", "\u{1}garbage{{{");
+                write_response(&mut stream, 200, "text/plain", "\u{1}garbage{{{");
             } else {
-                write_response(
-                    &mut stream,
-                    "200 OK",
-                    "application/json",
-                    "{\"model_path\":",
-                );
+                write_response(&mut stream, 200, "application/json", "{\"model_path\":");
             }
         }
         Behavior::MissingTelemetry => {
             if path.contains("/props") {
-                write_response(&mut stream, "200 OK", "application/json", "{}");
+                write_response(&mut stream, 200, "application/json", "{}");
             } else if path.contains("/metrics") {
                 write_response(
                     &mut stream,
-                    "200 OK",
+                    200,
                     "text/plain",
                     "# HELP unrelated_metric nothing llama.cpp knows\nunrelated_metric 1\n",
                 );
             } else {
-                write_response(&mut stream, "404 Not Found", "text/plain", "not found");
+                write_response(&mut stream, 404, "text/plain", "not found");
             }
         }
         Behavior::Healthy => serve_healthy_soak(&mut stream, &path, shared, metrics_index),
@@ -347,13 +333,13 @@ fn serve_healthy_soak(stream: &mut TcpStream, path: &str, shared: &MockShared, i
         let body = format!(
             "{{\"model_path\":\"{model}\",\"total_slots\":{slots},\"default_generation_settings\":{{\"n_ctx\":{n_ctx}}}}}"
         );
-        write_response(stream, "200 OK", "application/json", &body);
+        write_response(stream, 200, "application/json", &body);
     } else if path.contains("/slots") {
         let entries: Vec<String> = (0..slots)
             .map(|id| format!("{{\"id\":{id},\"n_ctx\":{n_ctx},\"is_processing\":false}}"))
             .collect();
         let body = format!("[{}]", entries.join(","));
-        write_response(stream, "200 OK", "application/json", &body);
+        write_response(stream, 200, "application/json", &body);
     } else {
         let base = shared.counter_base.load(Ordering::SeqCst);
         let prompt = base + index * 100;
@@ -361,7 +347,7 @@ fn serve_healthy_soak(stream: &mut TcpStream, path: &str, shared: &MockShared, i
         let body = format!(
             "llamacpp:prompt_tokens_total {prompt}\nllamacpp:tokens_predicted_total {predicted}\n"
         );
-        write_response(stream, "200 OK", "text/plain", &body);
+        write_response(stream, 200, "text/plain", &body);
     }
 }
 

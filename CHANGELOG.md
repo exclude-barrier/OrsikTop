@@ -22,6 +22,18 @@ All notable changes to OrsikTop will be documented here.
   carried debug info the TUI never uses. `panic = "abort"` was deliberately
   not set — unwinding keeps the graceful-degradation rule for telemetry paths.
   No behaviour change; smaller artifacts.
+- **Mock backends share their HTTP primitives** through the new test-only
+  `src/testutil.rs` (`#[cfg(test)] mod testutil`): request-line reading, the
+  status-reason table, one response writer. The three harnesses
+  (`src/app/tests/mod.rs`, `src/app/tests/soak.rs`, `src/llama/tests/monitor.rs`)
+  each carried a copy, `src/diagnostics.rs` a fourth, `src/llama/tests/monitor.rs`
+  four inline copies of the parser inside one file; `llama/http.rs`'s `serve_200`
+  is a fifth and stays as it is, because it deliberately writes a response
+  without a `Content-Type`. What is genuinely harness-specific — the mode enums, the
+  request counters, the soak port re-bind, thread-per-connection accounting, the
+  backend's self-expiring deadline — stays with the harness that asserts it, so
+  a consolidation cannot quietly remove an asserted guarantee. No test renamed,
+  added or removed; the gate count is unchanged.
 
 ### Fixed
 

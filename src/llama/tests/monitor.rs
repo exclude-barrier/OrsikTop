@@ -1,5 +1,6 @@
 //! `LlamaMonitor` state-machine tests against a mock HTTP backend.
 use super::super::*;
+use crate::testutil::{read_request_path, write_response};
 use serde_json::json;
 
 #[test]
@@ -298,7 +299,7 @@ fn slots_outcome_maps_to_error_or_counters() {
 
 #[test]
 fn sample_reads_strata_json_metrics_end_to_end() {
-    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
@@ -316,10 +317,7 @@ fn sample_reads_strata_json_metrics_end_to_end() {
         while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line);
-                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let path = read_request_path(&mut stream).unwrap_or_default();
                     let body = if path.contains("/props") {
                         r#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1,"model_alias":"strata-model"}"#.to_string()
                     } else if path.contains("/slots") {
@@ -397,7 +395,7 @@ fn sample_reads_strata_json_metrics_end_to_end() {
 
 #[test]
 fn a_wire_format_switch_resets_the_counter_baseline() {
-    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
@@ -415,10 +413,7 @@ fn a_wire_format_switch_resets_the_counter_baseline() {
         while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line);
-                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let path = read_request_path(&mut stream).unwrap_or_default();
                     // /slots uses the exact Strata shape (no counters), so
                     // the slot path must abstain and the counter baseline
                     // (not a fabricated slot zero) is the only live-rate
@@ -484,7 +479,7 @@ fn a_wire_format_switch_resets_the_counter_baseline() {
 
 #[test]
 fn sample_keeps_strata_context_occupancy_unknown_but_tracks_progress() {
-    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -500,10 +495,7 @@ fn sample_keeps_strata_context_occupancy_unknown_but_tracks_progress() {
         while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line);
-                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let path = read_request_path(&mut stream).unwrap_or_default();
                     // /props has no n_ctx and /slots is Strata 0.1.40-shaped
                     // (no counters, no occupancy); /metrics carries the
                     // engine capacity and live active-request progress.
@@ -733,7 +725,6 @@ where
     F: Fn(&str, usize) -> (u16, &'static str, String) + Send + 'static,
 {
     use std::collections::HashMap;
-    use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -749,10 +740,7 @@ where
         while !stop_flag.load(Ordering::Relaxed) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line);
-                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let path = read_request_path(&mut stream).unwrap_or_default();
                     let index = {
                         let mut calls = calls.lock().expect("mock call counter");
                         let entry = calls.entry(path.clone()).or_insert(0);
@@ -761,19 +749,7 @@ where
                         index
                     };
                     let (status, content_type, body) = respond(&path, index);
-                    let reason = match status {
-                        200 => "OK",
-                        404 => "Not Found",
-                        501 => "Not Implemented",
-                        _ => "Error",
-                    };
-                    let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
+                    write_response(&mut stream, status, content_type, &body);
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2));

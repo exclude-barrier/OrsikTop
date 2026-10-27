@@ -3,9 +3,9 @@ use super::{
     accepts_llm_sample, bench_emit, build_server_summaries, change_refresh, collect_process_stats,
     drain_try_recv, join_bounded, mock_body, next_cycle_target, read_process_thread_count,
     read_request_path, self_status_field, spawn_gated_server, spawn_llm_worker, spawn_plain_server,
-    test_spec, try_send_snapshot, ui, write_http, DashboardSnapshot, DrmSamplerState, LlmCommand,
-    LlmSample, LlmStats, ProcessCache, ProcessStats, RealSys, RedrawScheduler, SystemStats,
-    UiState, IDLE_REDRAW_INTERVAL, MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
+    test_spec, try_send_snapshot, ui, write_response, DashboardSnapshot, DrmSamplerState,
+    LlmCommand, LlmSample, LlmStats, ProcessCache, ProcessStats, RealSys, RedrawScheduler,
+    SystemStats, UiState, IDLE_REDRAW_INTERVAL, MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
     MIN_REFRESH_MS,
 };
 
@@ -588,7 +588,7 @@ fn spawn_blocking_mock(
                     if let Some(path) = read_request_path(&mut stream) {
                         let (body, content_type) =
                             mock_body(&path, model, n_ctx, prompt_tokens, predicted);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                     }
                 }
                 Err(_) => break,

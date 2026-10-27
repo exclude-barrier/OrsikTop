@@ -2,6 +2,9 @@
 //!
 //! The shared test infrastructure (mock HTTP backends, soak helpers,
 //! identity constructors) lives here; theme files import it via `super`.
+//! The HTTP primitives themselves (request-line reading, response writing) are
+//! shared crate-wide through `crate::testutil`, so the harnesses differ only in
+//! what they assert, not in how they speak HTTP.
 use super::{
     accepts_llm_sample, apply_fast_snapshot, build_server_summaries, change_refresh,
     changed_identity_keys, collect_process_stats, drain_try_recv, io_wait_percent, join_bounded,
@@ -14,8 +17,9 @@ use super::{
     ServerSpec, SystemStats, UiState, IDLE_REDRAW_INTERVAL, MAX_MONITORED_SERVERS,
     MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
 };
+pub(crate) use crate::testutil::{read_request_path, write_response};
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -63,28 +67,6 @@ fn test_spec(key: &str, endpoint: &str) -> ServerSpec {
 // and a condition variable); the timeouts only bound failure, they are
 // never the success condition.
 
-fn read_request_path(stream: &mut TcpStream) -> Option<String> {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    text.lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_string)
-}
-
 fn mock_body(
     path: &str,
     model: &str,
@@ -114,16 +96,6 @@ fn mock_body(
     }
 }
 
-fn write_http(stream: &mut TcpStream, body: &str, content_type: &str) {
-    let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
 /// A plain mock server that answers every request immediately.
 fn spawn_plain_server(
     model: &'static str,
@@ -143,7 +115,7 @@ fn spawn_plain_server(
                     if let Some(path) = read_request_path(&mut stream) {
                         let (body, content_type) =
                             mock_body(&path, model, n_ctx, prompt_tokens, predicted);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                     }
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -177,7 +149,7 @@ fn spawn_gated_server(
                     };
                     if path.contains("/props") {
                         let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                         continue;
                     }
                     if !signaled {
@@ -191,7 +163,7 @@ fn spawn_gated_server(
                         released = condvar.wait(released).unwrap();
                     }
                     let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
-                    write_http(&mut stream, &body, content_type);
+                    write_response(&mut stream, 200, content_type, &body);
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2));
@@ -229,7 +201,7 @@ fn spawn_metrics_off_server() -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandl
                         let _ = stream.flush();
                     } else {
                         let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                     }
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -243,16 +215,6 @@ fn spawn_metrics_off_server() -> (SocketAddr, Arc<AtomicBool>, thread::JoinHandl
 }
 
 /// Write a non-2xx HTTP response with a short body.
-fn write_http_status(stream: &mut TcpStream, status: &str, body: &str) {
-    let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
 /// A mock whose `/metrics` returns 501 on request `fail_on` and 200 with
 /// increasing counters otherwise; `/slots` is always 501 so the metric
 /// path (not the slot path) supplies the live rate.
@@ -275,20 +237,20 @@ fn spawn_flaky_metrics_server(
                     if path.contains("/metrics") {
                         let index = metrics_requests.fetch_add(1, Ordering::Relaxed) + 1;
                         if index == fail_on {
-                            write_http_status(&mut stream, "501 Not Implemented", "disabled");
+                            write_response(&mut stream, 501, "text/plain", "disabled");
                         } else {
                             let prompt = 1000 * index as u64;
                             let predicted = 500 * index as u64;
                             let body = format!(
                                     "llamacpp:prompt_tokens_total {prompt}\nllamacpp:tokens_predicted_total {predicted}\n"
                                 );
-                            write_http(&mut stream, &body, "text/plain");
+                            write_response(&mut stream, 200, "text/plain", &body);
                         }
                     } else if path.contains("/slots") {
-                        write_http_status(&mut stream, "501 Not Implemented", "no slots");
+                        write_response(&mut stream, 501, "text/plain", "no slots");
                     } else {
                         let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                     }
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -317,10 +279,10 @@ fn spawn_empty_metrics_server() -> (SocketAddr, Arc<AtomicBool>, thread::JoinHan
                         continue;
                     };
                     if path.contains("/metrics") {
-                        write_http(&mut stream, "", "text/plain");
+                        write_response(&mut stream, 200, "text/plain", "");
                     } else {
                         let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                     }
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -350,12 +312,12 @@ fn spawn_body_metrics_server(
                         continue;
                     };
                     if path.contains("/metrics") {
-                        write_http(&mut stream, body, "text/plain");
+                        write_response(&mut stream, 200, "text/plain", body);
                     } else if path.contains("/props") {
                         let (body, content_type) = mock_body(&path, "model-A", 4096, 1000, 500);
-                        write_http(&mut stream, &body, content_type);
+                        write_response(&mut stream, 200, content_type, &body);
                     } else {
-                        write_http_status(&mut stream, "501 Not Implemented", "no slots");
+                        write_response(&mut stream, 501, "text/plain", "no slots");
                     }
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -380,27 +342,27 @@ fn serve_healthy(
         let body = format!(
                 "{{\"model_path\":\"{model}\",\"total_slots\":1,\"default_generation_settings\":{{\"n_ctx\":{n_ctx}}}}}"
             );
-        write_http(stream, &body, "application/json");
+        write_response(stream, 200, "application/json", &body);
     } else if path.contains("/slots") {
         let body = format!("[{{\"id\":0,\"n_ctx\":{n_ctx},\"is_processing\":false}}]");
-        write_http(stream, &body, "application/json");
+        write_response(stream, 200, "application/json", &body);
     } else {
         let prompt = counter_base + index * 100;
         let predicted = counter_base + index * 50;
         let body = format!(
             "llamacpp:prompt_tokens_total {prompt}\nllamacpp:tokens_predicted_total {predicted}\n"
         );
-        write_http(stream, &body, "text/plain");
+        write_response(stream, 200, "text/plain", &body);
     }
 }
 
 fn serve_bad_json(stream: &mut TcpStream, path: &str) {
     if path.contains("/metrics") {
         // Not a recognised metrics sample -> metrics unavailable.
-        write_http(stream, "this is not a metrics body", "text/plain");
+        write_response(stream, 200, "text/plain", "this is not a metrics body");
     } else {
         // Malformed JSON for /props and /slots.
-        write_http(stream, "{ this is not json", "application/json");
+        write_response(stream, 200, "application/json", "{ this is not json");
     }
 }
 
@@ -460,11 +422,11 @@ fn programmable_mock(model: String, n_ctx: u64, counter_base: u64) -> Programmab
                         }
                         MockMode::BadJson => serve_bad_json(&mut stream, &path),
                         MockMode::Empty => {
-                            write_http(&mut stream, "", "application/json");
+                            write_response(&mut stream, 200, "application/json", "");
                         }
                         MockMode::MetricsOff => {
                             if path.contains("/metrics") {
-                                write_http_status(&mut stream, "501 Not Implemented", "disabled");
+                                write_response(&mut stream, 501, "text/plain", "disabled");
                             } else {
                                 serve_healthy(
                                     &mut stream,
