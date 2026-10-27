@@ -4,6 +4,13 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Declared `rust-version = 1.95`.** The floor was previously implicit, set
+  by the dependency set (sysinfo 0.39.6 requires 1.95). CI now builds the
+  main gate on a pinned stable (1.99.1) and checks the declared floor in a
+  dedicated MSRV job.
+
 ## [0.4.4] - 2026-10-26
 
 ### Changed
