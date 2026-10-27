@@ -28,6 +28,12 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde_json = "1.0"
 sysinfo = "0.39"
 
+[profile.release]
+# Shipped binaries never carry debug info the TUI cannot use. `panic = "abort"`
+# is deliberately not set: unwinding keeps the graceful-degradation rule for
+# telemetry paths (a broken sensor must degrade, not crash the TUI).
+strip = true
+
 [profile.dist]
 inherits = "release"
 lto = "thin"
