@@ -19,9 +19,9 @@ use crate::{
     discovery::{discover_gpus, DiscoveredGpu},
     discovery_llm::{
         collect_candidates, read_process_start_time, select_endpoint, selected_endpoint_server,
-        LocalServerIdentity, ServerSource,
+        ServerSource,
     },
-    domain::{GpuEvidence, GpuMapping, GpuSelector},
+    domain::{GpuEvidence, GpuMapping, GpuSelector, LocalServerIdentity},
     gpu::new_gpu_provider,
     gpu_map::{map_server_gpus, nvml_compute_gpus, process_render_gpus},
     llama::{LlamaMonitor, LlmStats, UNKNOWN_MODEL_LABEL},
@@ -419,7 +419,7 @@ struct MultiServerEntry {
 /// diagnostics always terminate. Each probe reuses the production
 /// [`LlamaMonitor`] timeouts (750 ms connect / 1200 ms total), and the whole
 /// set is bounded by the 16-server cap.
-fn probe_servers(servers: &[crate::app::ServerSpec]) -> Vec<LlmStats> {
+fn probe_servers(servers: &[crate::domain::ServerSpec]) -> Vec<LlmStats> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = servers
             .iter()
@@ -1243,12 +1243,12 @@ mod tests {
         drop(dead);
 
         let servers = vec![
-            crate::app::ServerSpec {
+            crate::domain::ServerSpec {
                 key: crate::domain::server_key(&format!("http://{addr}")),
                 endpoint: format!("http://{addr}"),
                 identity: None,
             },
-            crate::app::ServerSpec {
+            crate::domain::ServerSpec {
                 key: crate::domain::server_key(&format!("http://{dead_addr}")),
                 endpoint: format!("http://{dead_addr}"),
                 identity: None,

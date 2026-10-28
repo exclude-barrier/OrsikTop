@@ -13,14 +13,18 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::{
     config,
-    discovery_llm::LocalServerIdentity,
     domain::{
-        DashboardSnapshot, FastSnapshot, MAX_MONITORED_SERVERS, MAX_REFRESH_MS, MIN_REFRESH_MS,
-        REFRESH_STEP_MS,
+        DashboardSnapshot, FastSnapshot, LocalServerIdentity, MAX_MONITORED_SERVERS,
+        MAX_REFRESH_MS, MIN_REFRESH_MS, REFRESH_STEP_MS,
     },
     llama::LlmStats,
     ui::{self, UiState},
 };
+
+// The monitored-server spec is a domain type (the UI and diagnostics consume
+// the same description); the app owns only the reconciliation of the set.
+// Re-exported so the app's own code and its test modules keep one import path.
+pub(crate) use crate::domain::ServerSpec;
 
 #[cfg(test)]
 use crate::domain::{GpuMapping, ProcessStats, SystemStats, MIN_LLM_POLL_MS};
@@ -44,7 +48,7 @@ use workers::{spawn_fast_worker, spawn_llm_worker};
 pub(crate) use server::{
     build_server_summaries, map_server_identity, publish_selected_mapping, rebuild_poll_slots,
     selected_identity_of, stabilize_llm_sample, sync_server_set, update_resolved_server,
-    LlmCommand, LlmPollSlot, ServerSpec,
+    LlmCommand, LlmPollSlot,
 };
 #[cfg(test)]
 pub(crate) use server::{

@@ -11,7 +11,7 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use crate::cpu::{detect_cpu_topology, CpuTopology};
 use crate::cpu_sensors::CpuSensors;
 use crate::discovery::discover_gpus;
-use crate::discovery_llm::LocalServerIdentity;
+use crate::domain::LocalServerIdentity;
 use crate::domain::{
     FastSnapshot, GpuMapping, GpuSelector, ProcessStats, SystemStats, MAX_REFRESH_MS,
     MIN_LLM_POLL_MS, MIN_REFRESH_MS,

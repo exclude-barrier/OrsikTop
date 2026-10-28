@@ -108,12 +108,12 @@ fn server_selector_keeps_the_not_monitored_block_visible_when_scrolled() {
         .map(|i| summary(&format!("s{i:02}"), true, true, 1, 4))
         .collect();
     let overflow = vec![
-        crate::app::ServerSpec {
+        crate::domain::ServerSpec {
             key: "o1".to_string(),
             endpoint: "http://10.0.0.9:8080".to_string(),
             identity: None,
         },
-        crate::app::ServerSpec {
+        crate::domain::ServerSpec {
             key: "o2".to_string(),
             endpoint: "http://10.0.0.10:8080".to_string(),
             identity: None,
@@ -176,12 +176,12 @@ fn server_selector_keeps_the_highlighted_detail_line_visible_at_odd_heights() {
         })
         .collect();
     let overflow = vec![
-        crate::app::ServerSpec {
+        crate::domain::ServerSpec {
             key: "o1".to_string(),
             endpoint: "http://10.0.0.9:8080".to_string(),
             identity: None,
         },
-        crate::app::ServerSpec {
+        crate::domain::ServerSpec {
             key: "o2".to_string(),
             endpoint: "http://10.0.0.10:8080".to_string(),
             identity: None,
@@ -372,8 +372,8 @@ fn server_selector_overflow_continuation_counts_missing_entries_exactly() {
     let servers: Vec<ServerSummary> = (0..16)
         .map(|i| summary(&format!("s{i:02}"), true, true, 1, 4))
         .collect();
-    let overflow: Vec<crate::app::ServerSpec> = (0..10)
-        .map(|i| crate::app::ServerSpec {
+    let overflow: Vec<crate::domain::ServerSpec> = (0..10)
+        .map(|i| crate::domain::ServerSpec {
             key: format!("o{i}"),
             endpoint: format!("http://10.0.0.{}:8080", 10 + i),
             identity: None,
@@ -1132,7 +1132,7 @@ fn render_selector(
     servers: &[ServerSummary],
     selected: &str,
     highlight: usize,
-    overflow: &[crate::app::ServerSpec],
+    overflow: &[crate::domain::ServerSpec],
     area: Rect,
 ) -> String {
     let backend = ratatui::backend::TestBackend::new(area.width, area.height);

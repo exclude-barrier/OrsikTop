@@ -13,6 +13,11 @@ use std::path::Path;
 
 use crate::system::Sys;
 
+// The identity type itself lives in the domain layer (it is part of a
+// `ServerSpec`, which the UI and diagnostics also consume); discovery keeps
+// its own name for it so the scan reads as server discovery.
+pub use crate::domain::LocalServerIdentity;
+
 /// Where a candidate endpoint came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerSource {
@@ -38,20 +43,6 @@ pub struct LlamaServerCandidate {
     /// Together with the PID it forms a [`LocalServerIdentity`] that a reused
     /// PID cannot spoof.
     pub start_time: Option<u64>,
-}
-
-/// Stable identity of a locally discovered llama.cpp server.
-///
-/// The kernel recycles PIDs, so a bare PID can name an entirely different
-/// process later. Pairing it with the process start time read at discovery
-/// time lets the GPU-mapping path reject a reused PID immediately, before the
-/// next server resync. `start_time` is raw `/proc/<pid>/stat` field 22 (clock
-/// ticks), so it is compared against a fresh read of the same field without
-/// any unit conversion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalServerIdentity {
-    pub pid: u32,
-    pub start_time: u64,
 }
 
 /// Scan `/proc` for running llama.cpp servers and return every distinct

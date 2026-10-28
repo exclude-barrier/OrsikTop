@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use crate::config;
 use crate::discovery::DiscoveredGpu;
-use crate::discovery_llm::LocalServerIdentity;
-use crate::domain::{DashboardSnapshot, GpuMapping, ServerBackend, ServerSummary};
+use crate::domain::{
+    DashboardSnapshot, GpuMapping, LocalServerIdentity, ServerBackend, ServerSpec, ServerSummary,
+};
 use crate::gpu_map::map_server_gpus;
 use crate::llama::{LlamaMonitor, LlmStats};
 use crate::ui::UiState;
@@ -86,16 +87,6 @@ pub(crate) fn build_server_summaries(
             }
         })
         .collect()
-}
-
-/// One server to monitor: a stable key, the endpoint to poll, and (for a
-/// locally discovered process) its identity so a same-endpoint restart can be
-/// detected and that server's caches reset.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ServerSpec {
-    pub key: String,
-    pub endpoint: String,
-    pub identity: Option<LocalServerIdentity>,
 }
 
 /// Command to the LLM worker.
