@@ -73,6 +73,15 @@ All notable changes to OrsikTop will be documented here.
 
 ### Fixed
 
+- **Hardware matrix inventory updated to the current smokes.** The smoke table
+  still described `nvidia_real_system_smoke` as a single-sample print (it now
+  walks the NVIDIA ordinals, see the entry below) and carried two stale line
+  anchors. Added the dated operator records the 2026-10-28 `cf-desktop` visit
+  produced — the full ignored suite run (9/9 green with all four hardware
+  smokes executing, including the i915 provider smoke and the discovery smoke
+  on a hybrid host) and the first scheduled-job run in CI (8/8 green plus a
+  clean 60 s fuzz run, recorded as harness evidence and explicitly not as
+  hardware evidence). No code change.
 - **The NVIDIA live smoke selected the wrong device on a hybrid host.**
   `nvidia_real_system_smoke` iterated the BDF-sorted discovery list and passed
   that position as `GpuSelector::Index`, but `Index` counts *NVIDIA* devices (the

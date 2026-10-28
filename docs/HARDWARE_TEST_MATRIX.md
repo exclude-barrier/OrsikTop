@@ -65,6 +65,19 @@ Live environments (both non-root, kernel `7.2.5-omarchy`):
   against a same-moment `nvidia-smi` of `100 %`, `23557 MiB`, `46 °C`,
   `143.33 W`, fan `30 %`. CPU power stays `—` on this host, RAPL requires root
   (open row 6).
+- **2026-10-28 `cf-desktop` full ignored-suite run** (after `#116`, same copy):
+  `ORSIK_SOAK_SECS=120 cargo test --all-targets --locked -- --ignored
+  --test-threads=1 --nocapture` — 9/9 green in 396.28 s with **all four
+  hardware smokes executing** (no `skipping` on this host):
+  `discovery_real_system_smoke` enumerated `card0 0000:00:02.0 driver=i915`
+  and `card1 0000:01:00.0 driver=nvidia`; `intel_real_system_smoke` printed
+  `available=true clock=Some(300.0) reason=none temp=None limit=None` (i915
+  clock + throttle source live, temp/PL1 absent as designed for an iGPU);
+  `nvidia_real_system_smoke` printed `ordinal=0 … util=Some(0.0)
+  temp=Some(36.0) power=Some(11.243) pstate=P8 reason=idle` — the card
+  sampled in its idle state; `drm_real_system_smoke` counted
+  `processes with DRM fds: 0` (no DRM client on the host at that moment,
+  output-only test).
 
 ## Priority matrix
 
@@ -164,8 +177,8 @@ full picture:
 | --- | --- | --- | --- |
 | `discovery_real_system_smoke` | `src/discovery.rs:452` | prints every DRM-discovered GPU | at least one GPU is found (`:469-472`), every GPU carries a BDF (`:474-477`) and the vendor read succeeded (`:479-483`) — it **can** go red |
 | `intel_real_system_smoke` | `src/providers/intel.rs:581` | prints one Intel provider sample; returns `skipping` when the host has no Intel GPU | `available`, the device key, and `utilization`/`memory_total_mib` are `None` — **not** clock, throttle reason, temperature or PL1 |
-| `nvidia_real_system_smoke` | `src/providers/nvidia.rs:703` | prints one NVML provider sample; returns `skipping` when the host has no NVIDIA GPU | the sample reports a device or a reason (`available || !error.is_empty()`), never a fabricated reading — the rest is print-only |
-| `drm_real_system_smoke` | `src/drm.rs:911` | counts processes holding a DRM fd and prints each | nothing — output only; its doc comment says it always passes |
+| `nvidia_real_system_smoke` | `src/providers/nvidia.rs:710` | prints one NVML provider sample per discovered NVIDIA device, keyed by NVML ordinal; returns `skipping` when the host has no NVIDIA GPU | the sample reports a device or a reason (`available || !error.is_empty()`), never a fabricated reading, and if NVML answers for one NVIDIA device it must answer for every discovered one (§4) — the rest is print-only |
+| `drm_real_system_smoke` | `src/drm.rs:913` | counts processes holding a DRM fd and prints each | nothing — output only; its doc comment says it always passes |
 
 So a green run is not by itself vendor telemetry: reading the printed output is
 what turns it into evidence. For AMD (Priority 1) the asserted discovery evidence
@@ -290,7 +303,10 @@ GitHub-hosted runners have no GPU, so the weekly scheduled job
 (`.github/workflows/scheduled.yml`) runs the ignored set single-threaded but skips
 `discovery_real_system_smoke`. A hardware row is filled only by an operator run on
 the target hardware (§4), never by that job; provider smokes that print `skipping`
-on a runner without the vendor are not evidence either.
+on a runner without the vendor are not evidence either. The job first ran on
+2026-10-28 (`workflow_dispatch`, run `40686687892`): 8/8 ignored tests green in
+395.80 s (`ORSIK_SOAK_SECS=120`) and the 60 s `parse_prometheus` fuzz run produced
+no artifacts — it confirms the soak/leak/perf harnesses, not any hardware row.
 
 ## Confirmed support vs. open hardware tests
 
