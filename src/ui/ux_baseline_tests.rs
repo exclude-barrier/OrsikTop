@@ -36,7 +36,7 @@
 //! (alle Alter werden als feste `age_ms`-Werte in die Fixture geschrieben).
 
 use super::{draw_server_selector, ServerSummary};
-use crate::app::ServerSpec;
+use crate::domain::ServerSpec;
 use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
 /// Render den Selektor und liefert den Buffer zeilenweise, damit pro Server

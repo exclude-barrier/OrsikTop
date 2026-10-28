@@ -195,7 +195,7 @@ pub(super) fn draw_settings_too_small(frame: &mut Frame, area: Rect) {
 
 /// Rows the overflow block needs: one header plus one row per configured
 /// endpoint beyond the monitoring cap. Zero when there is no overflow.
-fn overflow_line_count(overflow: &[crate::app::ServerSpec]) -> usize {
+fn overflow_line_count(overflow: &[crate::domain::ServerSpec]) -> usize {
     if overflow.is_empty() {
         0
     } else {
@@ -242,7 +242,7 @@ pub(super) fn draw_server_selector(
     servers: &[ServerSummary],
     selected_server: &str,
     highlight: usize,
-    overflow: &[crate::app::ServerSpec],
+    overflow: &[crate::domain::ServerSpec],
 ) {
     let overflow_rows = overflow_line_count(overflow) as u16;
     let width = area.width.saturating_sub(6).min(78);

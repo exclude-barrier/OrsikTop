@@ -47,7 +47,7 @@ pub fn draw(
     servers: &[ServerSummary],
     selected_server: &str,
     // Configured endpoints beyond the monitoring cap; listed as "limit reached".
-    overflow: &[crate::app::ServerSpec],
+    overflow: &[crate::domain::ServerSpec],
     state: &mut UiState,
     server: &str,
     refresh_ms: u64,
@@ -145,7 +145,7 @@ fn draw_overlays(
     area: Rect,
     servers: &[ServerSummary],
     selected_server: &str,
-    overflow: &[crate::app::ServerSpec],
+    overflow: &[crate::domain::ServerSpec],
     state: &UiState,
 ) {
     if state.server_selector_open {

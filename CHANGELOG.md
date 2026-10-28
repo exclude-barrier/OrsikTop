@@ -58,6 +58,18 @@ All notable changes to OrsikTop will be documented here.
   have no GPU — hardware evidence stays an operator concern
   (`HARDWARE_TEST_MATRIX.md` §5). The ignored set ran locally on the dev box:
   7/7 green in 398 s.
+- **`ServerSpec` and `LocalServerIdentity` moved to the domain layer.** The one
+  cycle in the module graph was `app` ↔ `ui`: the UI overview and the
+  diagnostics probe consumed `ServerSpec`, a type owned by `app::server`. The
+  struct (and `LocalServerIdentity`, which it carries) now live in
+  `src/domain.rs`, the base layer both sides already import from;
+  `discovery_llm` and `app` re-export the names so their own code and test
+  modules keep their existing paths, and `ui`, `diagnostics` and `main` import
+  them from `domain`. `LocalServerIdentity` stays its own type rather than
+  aliasing `ProcessIdentity`: its `start_time` is raw `/proc` stat field 22 in
+  clock ticks, compared without conversion, while `ProcessIdentity` carries
+  epoch seconds. No behaviour change, no test renamed or moved; the gate count
+  is unchanged.
 
 ### Fixed
 

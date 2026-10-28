@@ -37,9 +37,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::app::ServerSpec;
-use crate::discovery_llm::{LocalServerIdentity, ServerSource};
-use crate::domain::{server_key, GpuSelector, MAX_MONITORED_SERVERS};
+use crate::discovery_llm::ServerSource;
+use crate::domain::{
+    server_key, GpuSelector, LocalServerIdentity, ServerSpec, MAX_MONITORED_SERVERS,
+};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const CARGO_UPDATE_COMMAND: &str =
@@ -381,7 +382,7 @@ pub(crate) struct ResolvedServer {
     /// `endpoint`; `None` for configured/remote endpoints and when the
     /// identity cannot be read. Never a bare PID, so a reused PID cannot be
     /// mistaken for the earlier server.
-    pub identity: Option<discovery_llm::LocalServerIdentity>,
+    pub identity: Option<domain::LocalServerIdentity>,
     pub auto: bool,
 }
 
@@ -539,8 +540,8 @@ mod tests {
         sys
     }
 
-    fn identity(pid: u32, start_time: u64) -> discovery_llm::LocalServerIdentity {
-        discovery_llm::LocalServerIdentity { pid, start_time }
+    fn identity(pid: u32, start_time: u64) -> domain::LocalServerIdentity {
+        domain::LocalServerIdentity { pid, start_time }
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

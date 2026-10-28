@@ -80,6 +80,21 @@ impl ProcessIdentity {
     }
 }
 
+/// Stable identity of a locally discovered llama.cpp server.
+///
+/// The kernel recycles PIDs, so a bare PID can name an entirely different
+/// process later. Pairing it with the process start time read at discovery
+/// time lets the GPU-mapping path reject a reused PID immediately, before the
+/// next server resync. `start_time` is raw `/proc/<pid>/stat` field 22 (clock
+/// ticks), so it is compared against a fresh read of the same field without any
+/// unit conversion. That is also why this is a type of its own and not
+/// [`ProcessIdentity`], whose start time is exposed in epoch seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalServerIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
 /// Stable identity for a GPU device, independent of enumeration order.
 ///
 /// PCI BDF is the primary Linux selector (present for all PCI devices,
@@ -853,6 +868,21 @@ impl ServerBackend {
             ServerBackend::Strata => "Strata",
         }
     }
+}
+
+/// One server to monitor: a stable key, the endpoint to poll, and (for a
+/// locally discovered process) its identity so a same-endpoint restart can be
+/// detected and that server's caches reset.
+///
+/// The spec lives in the domain layer rather than in `app`: the worker's
+/// server set, the UI overview and the diagnostics probe all consume the same
+/// description, while only the app loop reconciles it. Keeping it here is what
+/// lets the UI consume servers without importing the app's orchestration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerSpec {
+    pub key: String,
+    pub endpoint: String,
+    pub identity: Option<LocalServerIdentity>,
 }
 
 /// Compact per-server status for the multi-server overview and selector.
