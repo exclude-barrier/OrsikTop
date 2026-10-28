@@ -61,6 +61,20 @@ All notable changes to OrsikTop will be documented here.
 
 ### Fixed
 
+- **The NVIDIA live smoke selected the wrong device on a hybrid host.**
+  `nvidia_real_system_smoke` iterated the BDF-sorted discovery list and passed
+  that position as `GpuSelector::Index`, but `Index` counts *NVIDIA* devices (the
+  legacy NVML ordinal). On `cf-desktop` (i915 iGPU at `0000:00:02.0`, RTX 4090 at
+  `0000:01:00.0`) it asked NVML for device 1 of one and printed
+  `available=false … no NVIDIA GPU matches the selection` while the 4090 was
+  present, and the standing-rule assertion accepted that as a reason. The smoke
+  now walks the NVIDIA ordinals, prints `ordinal=` beside the BDF, and requires
+  that when NVML answers for one NVIDIA device it answers for every discovered
+  one, so a smoke that sampled nothing cannot pass. Product code is unchanged:
+  `resolve_discovered` already maps `Index` to the n-th NVIDIA device and its
+  test pins that. Found by the first live run of the smoke added in PR #112; the
+  re-verified NVIDIA row (driver `615.71.09`, `nvidia-smi` cross-check) is
+  recorded in `HARDWARE_TEST_MATRIX.md`.
 - **Documentation housekeeping.** The test-count baselines in
   `LIVE_VS_FIXTURE.md` and `TELEMETRY_VERIFICATION.md` are marked as
   historical and the pinned gate (**589** = 581 + 8 at that time; it is 590

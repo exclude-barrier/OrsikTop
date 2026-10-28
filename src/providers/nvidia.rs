@@ -698,6 +698,13 @@ mod tests {
     /// properties, sanitization) against a live driver. It asserts only the
     /// standing rule — a sample reports a device or a reason, never a
     /// fabricated reading — and prints the rest.
+    ///
+    /// `GpuSelector::Index` is the n-th *NVIDIA* device (the legacy NVML
+    /// ordinal, because NVML enumerates NVIDIA GPUs only), not the position in
+    /// the BDF-sorted discovery list. On a hybrid host those differ: test-desktop
+    /// discovers `i915 @ 0000:00:02.0` first and the RTX 4090 second, so the
+    /// 4090 is discovery index 1 but NVML ordinal 0, and selecting by discovery
+    /// position asks NVML for a device that does not exist.
     #[test]
     #[ignore]
     fn nvidia_real_system_smoke() {
@@ -707,20 +714,26 @@ mod tests {
         let gpus = discover_gpus(&RealSys);
         let nvidia = gpus
             .iter()
+            .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
             .enumerate()
-            .filter(|(_, g)| g.vendor == GpuVendor::Nvidia)
             .collect::<Vec<_>>();
         if nvidia.is_empty() {
             eprintln!("no NVIDIA GPU on this machine; skipping");
             return;
         }
-        for (i, gpu) in nvidia {
-            let mut provider = NvidiaGpuProvider::new(GpuSelector::Index(i as u32));
+        let sampled = nvidia.len();
+        let mut resolved = 0usize;
+        for (ordinal, gpu) in nvidia {
+            let mut provider = NvidiaGpuProvider::new(GpuSelector::Index(ordinal as u32));
             let stats = provider.sample();
             assert!(stats.available || !stats.error.is_empty());
+            if stats.available {
+                resolved += 1;
+            }
             println!(
-                "{:?} card={} bdf={} available={} name={} util={:?} temp={:?} power={:?} pstate={} reason={} error={}",
+                "{:?} ordinal={} card={} bdf={} available={} name={} util={:?} temp={:?} power={:?} pstate={} reason={} error={}",
                 gpu.vendor,
+                ordinal,
                 gpu.card,
                 gpu.device_id.key(),
                 stats.available,
@@ -732,6 +745,14 @@ mod tests {
                 stats.limit_reason,
                 stats.error
             );
+        }
+        // NVML answered for one NVIDIA device but not for another means the
+        // ordinals did not line up with the discovered devices, which is a
+        // harness bug rather than a degradation: a wrong ordinal would let a
+        // live smoke pass while sampling nothing. Total NVML failure stays
+        // allowed (driver/library mismatch hosts report `—`, not fake zeros).
+        if resolved > 0 {
+            assert_eq!(resolved, sampled, "NVML answered for {resolved} of {sampled} NVIDIA devices; the smoke selected the wrong NVML ordinals");
         }
     }
 }

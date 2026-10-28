@@ -49,6 +49,22 @@ Live environments (both non-root, kernel `7.2.5-omarchy`):
 - **2026-10-19 re-run:** driver `615.78.08` works; Auto reports RTX 4090
   utilization `0 %`, `37 °C`, `38.4 W`; `--gpu 0000:00:02.0` reports i915
   `clocks` only, with the other GPU fields `—`.
+- **2026-10-28 `cf-desktop` operator run** (`rustc 1.99.1`, checkout at
+  `50c26c1`): discovery lists `card0 0000:00:02.0 vendor=intel` (i915) first and
+  `card1 0000:01:00.0 vendor=nvidia` second. `diag` (Auto) reports the RTX 4090
+  with `0 %`, `40 °C`, `78.8 W` and utilization, memory, temperature, power,
+  clocks, fan, PCIe and enc/dec all available. `--gpu 0` (NVML ordinal 0)
+  reports `0 %`, `41 °C`, `151.5 W` against a same-moment `nvidia-smi` of
+  `0 %`, `23553 MiB`, `41 °C`, `149.32 W`, limit `450 W`, fan `30 %`, PCIe
+  gen 4 x16; `--gpu 1` reports `no GPU matches the selection`, because there is
+  exactly one NVIDIA device. `nvidia_real_system_smoke` first printed
+  `available=false … error=no NVIDIA GPU matches the selection`: it had selected
+  the **discovery position** (1) instead of the **NVML ordinal** (0). After the
+  fix the same host yields
+  `Nvidia ordinal=0 card=card1 bdf=0000:01:00.0 available=true name=NVIDIA GeForce RTX 4090 util=Some(100.0) temp=Some(46.0) power=Some(143.327) pstate=P2 reason=none`,
+  against a same-moment `nvidia-smi` of `100 %`, `23557 MiB`, `46 °C`,
+  `143.33 W`, fan `30 %`. CPU power stays `—` on this host, RAPL requires root
+  (open row 6).
 
 ## Priority matrix
 
@@ -251,9 +267,17 @@ Base row — **NVIDIA discrete** — on an NVIDIA host with the driver loaded.
   real sampling path (init, enumeration, selector resolution, slow properties,
   sanitization) against a live driver. It asserts only the standing rule — the
   sample reports a device or a reason, never a fabricated reading — and prints
-  utilization, temperature, power, P-state and the throttle summary. The base
-  row was live-verified on test-desktop 2026-10-19 (driver `615.78.08`);
-  re-run the smoke on every visit to an NVIDIA host.
+  utilization, temperature, power, P-state and the throttle summary.
+- It walks the NVIDIA devices by **NVML ordinal** (`Index` counts NVIDIA devices
+  only; on a hybrid host the BDF discovery position differs from the ordinal, as
+  the 2026-10-28 `cf-desktop` run showed) and prints `ordinal=` beside the BDF.
+  When NVML answers for one NVIDIA device it must answer for every discovered
+  one: a smoke that sampled nothing is a harness bug, not a degradation. A host
+  where NVML fails entirely stays allowed to report `—`.
+- The base row was live-verified on test-desktop 2026-10-19 (driver
+  `615.78.08`) and re-verified on `cf-desktop` 2026-10-28 (driver `615.71.09`,
+  `nvidia-smi` cross-check above); re-run the smoke on every visit to an NVIDIA
+  host.
 
 ### 5. Recording evidence
 
