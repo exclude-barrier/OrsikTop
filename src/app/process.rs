@@ -9,11 +9,24 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 
 use crate::domain::{ProcessIdentity, ProcessStats};
 use crate::drm::{sample_process_gpus, DrmSamplerState};
 use crate::system::{RealSys, Sys};
+
+/// Process rows are thread-group leaders, not individual Linux tasks. sysinfo's
+/// `nothing()` still enables tasks by default: scanning them repeats shared
+/// memory and DRM FD tables. Process CPU already includes the group's threads;
+/// the dynamic THR column is read separately from /proc/<pid>/status.
+pub(crate) fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .without_tasks()
+        .with_memory()
+        .with_cpu()
+        // execve keeps PID/start time, so the executable must remain dynamic.
+        .with_exe(UpdateKind::Always)
+}
 
 /// Cached *static* process metadata, keyed by [`ProcessIdentity`].
 ///

@@ -6,7 +6,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use super::process::process_refresh_kind;
+use sysinfo::{ProcessesToUpdate, System};
 
 use crate::cpu::{detect_cpu_topology, CpuTopology};
 use crate::cpu_sensors::CpuSensors;
@@ -117,13 +118,7 @@ pub(super) fn spawn_fast_worker(
                 system.refresh_processes_specifics(
                     ProcessesToUpdate::All,
                     true,
-                    ProcessRefreshKind::nothing()
-                        .with_memory()
-                        .with_cpu()
-                        // Refresh on every cycle: `execve` keeps the PID and
-                        // start time, so `OnlyIfNotSet` would pin the pre-exec
-                        // image forever.
-                        .with_exe(UpdateKind::Always),
+                    process_refresh_kind(),
                 );
                 process_stats = collect_process_stats(&system, &mut process_cache, &mut drm_state);
                 last_process_refresh = Some(Instant::now());

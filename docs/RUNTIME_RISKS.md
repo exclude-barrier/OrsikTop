@@ -90,12 +90,13 @@ behaviour.
 - `src/app.rs:1033-1036` — `try_send`, `Full` → drop; `Disconnected` → the fast
   worker exits.
 
-**Effect:** intentional "latest wins" for a UI/GPU snapshot; only a problem in
-combination with F2/F4.
+**Effect:** bounded FIFO with drop-new behavior: a full channel retains its
+queued snapshots and discards the incoming update, not "latest wins". The UI
+can briefly lag until a later sample is successfully enqueued.
 
 **Resolution:** the same `try_send_snapshot` counter covers this channel; the
-footer reports the fast and LLM counters together. The snapshot is still
-replaced by the next refresh, so no history is fabricated.
+footer reports the fast and LLM counters together. Once queue space is available,
+a later refresh can be delivered; a full queue is not overwritten.
 
 ## F4 — Polls are independent per server (resolved)
 
