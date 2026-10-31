@@ -51,10 +51,7 @@ pub(crate) use server::{
     LlmCommand, LlmPollSlot,
 };
 #[cfg(test)]
-pub(crate) use server::{
-    changed_identity_keys, new_server_monitor, rebuild_server_monitors, reconcile_server,
-    ServerChange,
-};
+pub(crate) use server::{changed_identity_keys, reconcile_server, ServerChange};
 
 pub(crate) use process::{
     collect_process_stats, io_wait_percent, per_cpu_usage_by_id, read_cpu_frequency_mhz,

@@ -79,7 +79,7 @@ impl UiState {
             SettingsField::Refresh => SettingsField::Gpu,
             SettingsField::ProcessRefresh => SettingsField::Refresh,
             SettingsField::OfflineGrace => SettingsField::ProcessRefresh,
-            SettingsField::AutoDiscovery => SettingsField::ServerList,
+            SettingsField::AutoDiscovery => SettingsField::OfflineGrace,
             SettingsField::ServerList => SettingsField::AutoDiscovery,
         };
         self.settings_server_error = None;

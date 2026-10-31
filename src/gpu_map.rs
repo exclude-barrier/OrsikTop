@@ -25,76 +25,63 @@ use std::path::Path;
 use nvml_wrapper::Nvml;
 
 use crate::discovery::DiscoveredGpu;
-use crate::domain::{
-    normalize_pci_bdf, parse_pci_bdf, DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu,
-};
+use crate::domain::{normalize_pci_bdf, DeviceId, GpuEvidence, GpuMapping, GpuVendor, MappedGpu};
 use crate::providers::nvidia::MigChild;
 use crate::system::Sys;
 
-/// Parse the PCI BDF embedded in a DRM **by-path** name
+/// Legacy by-path grammar regression helper; names are no longer used as
+/// attribution evidence. Parse the PCI BDF embedded in a DRM **by-path** name
 /// (`pci-0000:01:00.0-render`, `pci-0000:01:00.0-card`). The by-path name is
 /// the stable, PCI-derived identity that `/proc/<pid>/fd` entries resolve to.
 /// Returns `None` for non-PCI by-path names (`platform-…`) or malformed input.
 /// An 8-digit PCI domain is accepted and canonicalized to the 4-digit form
 /// via [`normalize_pci_bdf`] (domains ≥ `0x10000` stay 8-digit, like NVML
 /// ingress).
+#[cfg(test)]
 fn bdf_from_by_path_name(name: &str) -> Option<String> {
     let rest = name.strip_prefix("pci-")?;
     let bdf = rest.split('-').next()?;
-    parse_pci_bdf(bdf)
+    crate::domain::parse_pci_bdf(bdf)
 }
 
 /// PCI BDFs of the discovered GPUs that the process has an open DRM render
 /// node for, derived from the process's open file descriptors.
 ///
-/// A process that has allocated a DRM render node keeps it open for the life
-/// of its context, so an open `/dev/dri/*` fd is solid evidence the process is
-/// using that GPU. Each fd is an absolute path whose final component is
-/// either a render-node name (`renderD…`) or a by-path name (`pci-<BDF>-…`);
-/// both resolve to a PCI BDF that is matched against the discovered GPUs.
+/// Match the character-device number of each open fd against the discovered
+/// render nodes. This follows aliases and rejects regular files, even when
+/// they are named `renderD128` or `pci-<BDF>-render`. An unreadable device
+/// yields no evidence; filenames and BDF-shaped strings are never sufficient.
 ///
 /// Returns deduped device ids (empty if the process has no open render node).
 pub fn process_render_gpus<S: Sys>(sys: &S, pid: u32, gpus: &[DiscoveredGpu]) -> Vec<DeviceId> {
+    let render_devices: Vec<_> = gpus
+        .iter()
+        .flat_map(|gpu| {
+            gpu.render_nodes.iter().filter_map(move |node| {
+                sys.char_device_id(&Path::new("/dev/dri").join(node))
+                    .map(|id| (id, &gpu.device_id))
+            })
+        })
+        .collect();
+    if render_devices.is_empty() {
+        return Vec::new();
+    }
     let fd_dir = Path::new("/proc").join(pid.to_string()).join("fd");
-    let Some(fd_entries) = sys.read_dir(&fd_dir) else {
+    let Some(fd_names) = sys.read_dir_names(&fd_dir) else {
         return Vec::new();
     };
 
     let mut result: Vec<DeviceId> = Vec::new();
-    for entry in &fd_entries {
-        let Some(target) = sys.symlink_target(&fd_dir.join(&entry.name)) else {
+    for name in fd_names {
+        let Some(id) = sys.char_device_id(&fd_dir.join(name)) else {
             continue;
         };
-        let Some(component) = Path::new(target.trim())
-            .components()
-            .next_back()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-
-        // Resolve the fd's device node to a stable BDF key.
-        let key = if component.starts_with("renderD") {
-            // Stable render-node name → the discovered GPU that exposes one
-            // of its (possibly several) render nodes.
-            gpus.iter()
-                .find(|g| g.render_nodes.iter().any(|n| n.as_str() == component))
-                .map(|g| g.device_id.key().to_string())
-        } else {
-            // by-path name → BDF embedded in the name.
-            bdf_from_by_path_name(&component)
-        };
-
-        if let Some(key) = key {
-            let Some(device) = gpus
-                .iter()
-                .find(|g| g.device_id.key() == key)
-                .map(|g| g.device_id.clone())
-            else {
-                continue;
-            };
+        if let Some((_, device)) = render_devices
+            .iter()
+            .find(|(render_id, _)| *render_id == id)
+        {
             if !result.iter().any(|d| d.key() == device.key()) {
-                result.push(device);
+                result.push((*device).clone());
             }
         }
     }
@@ -325,6 +312,10 @@ mod tests {
             &format!("/dev/dri/{render}"),
         );
         sys.dir_entry("/dev/dri", render, false, true);
+        sys.char_device(
+            &format!("/dev/dri/{render}"),
+            render.trim_start_matches("renderD").parse().unwrap(),
+        );
     }
 
     fn gpu_list(bdfs: &[&str]) -> Vec<DiscoveredGpu> {
@@ -397,6 +388,7 @@ mod tests {
         let mut gpus = gpu_list(&["0000:01:00.0"]);
         // The iGPU also exposes a compute-only render node (i915/xe shape).
         gpus[0].render_nodes.push("renderD129".to_string());
+        sys.char_device("/dev/dri/renderD129", 129);
 
         // The process holds an open fd to the compute node, not renderD128.
         sys.dir_entry("/proc/4242/fd", "7", false, false);
@@ -425,6 +417,53 @@ mod tests {
             map_server_gpus(true, render, vec![], &gpus),
             GpuMapping::Unknown
         );
+    }
+
+    #[test]
+    fn render_mapping_requires_a_matching_character_device_not_a_filename() {
+        for target in [
+            "/tmp/not-a-device/renderD128",
+            "/tmp/pci-0000:01:00.0-render",
+            "/tmp/pci-0000:01:00.0-card",
+            "/dev/dri/renderD999",
+        ] {
+            let mut sys = FixtureSys::default();
+            add_gpu(&mut sys, "card0", "0000:01:00.0", "renderD128");
+            sys.dir_entry("/proc/42/fd", "7", false, true);
+            sys.symlink("/proc/42/fd/7", target);
+            sys.file(target, "regular file");
+            let gpus = gpu_list(&["0000:01:00.0"]);
+            assert!(process_render_gpus(&sys, 42, &gpus).is_empty(), "{target}");
+            // Even a real character device must have the right device number.
+            sys.char_device(target, 999);
+            assert!(process_render_gpus(&sys, 42, &gpus).is_empty(), "{target}");
+        }
+    }
+
+    #[test]
+    fn render_mapping_accepts_device_aliases_and_deduplicates_fds() {
+        let mut sys = FixtureSys::default();
+        add_gpu(&mut sys, "card0", "0000:01:00.0", "renderD128");
+        sys.char_device("/custom/gpu-alias", 128);
+        for fd in ["7", "8"] {
+            sys.dir_entry("/proc/42/fd", fd, false, true);
+            sys.symlink(&format!("/proc/42/fd/{fd}"), "/custom/gpu-alias");
+        }
+        let gpus = gpu_list(&["0000:01:00.0"]);
+        assert_eq!(
+            process_render_gpus(&sys, 42, &gpus),
+            vec![gpus[0].device_id.clone()]
+        );
+    }
+
+    #[test]
+    fn unreadable_render_device_never_falls_back_to_its_name() {
+        let mut sys = FixtureSys::default();
+        sys.dir_entry("/proc/42/fd", "7", false, true);
+        sys.symlink("/proc/42/fd/7", "/dev/dri/renderD128");
+        // fd itself is readable but the canonical device cannot be verified.
+        sys.char_device("/proc/42/fd/7", 128);
+        assert!(process_render_gpus(&sys, 42, &gpu_list(&["0000:01:00.0"])).is_empty());
     }
 
     #[test]

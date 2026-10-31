@@ -252,11 +252,6 @@ pub(crate) fn map_server_identity(
 /// One monitored server's worker-side state.
 pub(crate) struct LlmServerMonitor {
     pub(crate) key: String,
-    pub(crate) endpoint: String,
-    /// Process identity of a locally discovered server (pid + start time); a
-    /// change on the same key means the process restarted, so the monitor's
-    /// caches are rebuilt.
-    pub(crate) identity: Option<LocalServerIdentity>,
     pub(crate) monitor: Option<LlamaMonitor>,
     pub(crate) init_error: String,
     /// Per-server last good sample and its time, for the offline-grace hold.
@@ -272,42 +267,17 @@ pub(crate) fn new_server_monitor(spec: ServerSpec) -> LlmServerMonitor {
     };
     LlmServerMonitor {
         key: spec.key,
-        endpoint: spec.endpoint,
-        identity: spec.identity,
         monitor,
         init_error,
         last_good: None,
     }
 }
 
-/// Rebuild the monitor list for a new server set. A monitor is preserved only
-/// when its key, endpoint *and* process identity all still match, so a periodic
-/// resync keeps telemetry for an unchanged server while a same-endpoint
-/// restart (new identity) resets that server's caches.
-#[cfg(test)]
-pub(crate) fn rebuild_server_monitors(
-    existing: Vec<LlmServerMonitor>,
-    list: Vec<ServerSpec>,
-) -> Vec<LlmServerMonitor> {
-    let mut old: BTreeMap<String, LlmServerMonitor> = existing
-        .into_iter()
-        .map(|monitor| (monitor.key.clone(), monitor))
-        .collect();
-    list.into_iter()
-        .map(|spec| match old.remove(&spec.key) {
-            Some(existing)
-                if existing.endpoint == spec.endpoint && existing.identity == spec.identity =>
-            {
-                existing
-            }
-            _ => new_server_monitor(spec),
-        })
-        .collect()
-}
-
 /// Shared monitor plus an in-flight flag. One poll per server may run at a
 /// time, but a slow server does not block polls of the other servers.
 pub(crate) struct LlmPollSlot {
+    /// Immutable reconciliation metadata, never locked behind an HTTP poll.
+    pub(crate) spec: ServerSpec,
     pub(crate) monitor: Arc<Mutex<LlmServerMonitor>>,
     pub(crate) in_flight: Arc<AtomicBool>,
 }
@@ -315,7 +285,8 @@ pub(crate) struct LlmPollSlot {
 impl LlmPollSlot {
     pub(crate) fn new(spec: ServerSpec) -> Self {
         Self {
-            monitor: Arc::new(Mutex::new(new_server_monitor(spec))),
+            monitor: Arc::new(Mutex::new(new_server_monitor(spec.clone()))),
+            spec,
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -330,33 +301,12 @@ pub(crate) fn rebuild_poll_slots(
 ) -> Vec<LlmPollSlot> {
     let mut old: BTreeMap<String, LlmPollSlot> = existing
         .into_iter()
-        .map(|slot| {
-            let key = slot
-                .monitor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .key
-                .clone();
-            (key, slot)
-        })
+        .map(|slot| (slot.spec.key.clone(), slot))
         .collect();
     list.into_iter()
         .map(|spec| match old.remove(&spec.key) {
-            Some(existing) => {
-                let unchanged = {
-                    let monitor = existing
-                        .monitor
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    monitor.endpoint == spec.endpoint && monitor.identity == spec.identity
-                };
-                if unchanged {
-                    existing
-                } else {
-                    LlmPollSlot::new(spec)
-                }
-            }
-            None => LlmPollSlot::new(spec),
+            Some(existing) if existing.spec == spec => existing,
+            _ => LlmPollSlot::new(spec),
         })
         .collect()
 }

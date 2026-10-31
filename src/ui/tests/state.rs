@@ -31,6 +31,29 @@ fn help_popup_state_toggles_and_closes() {
 }
 
 #[test]
+fn settings_forward_and_backward_navigation_are_inverses_for_every_field() {
+    let mut state = UiState::default();
+    for field in [
+        SettingsField::Host,
+        SettingsField::Port,
+        SettingsField::Gpu,
+        SettingsField::Refresh,
+        SettingsField::ProcessRefresh,
+        SettingsField::OfflineGrace,
+        SettingsField::AutoDiscovery,
+        SettingsField::ServerList,
+    ] {
+        state.settings_field = field;
+        state.settings_handle_key(KeyCode::Tab);
+        state.settings_handle_key(KeyCode::BackTab);
+        assert_eq!(state.settings_field, field);
+        state.settings_handle_key(KeyCode::BackTab);
+        state.settings_handle_key(KeyCode::Tab);
+        assert_eq!(state.settings_field, field);
+    }
+}
+
+#[test]
 fn history_uses_a_fixed_time_window() {
     let now = Instant::now();
     let mut history = VecDeque::new();

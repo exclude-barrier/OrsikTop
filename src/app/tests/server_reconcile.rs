@@ -1,13 +1,14 @@
 //! Server-registry tests: reconcile, identity, GPU mapping, summaries and sample stabilization.
 use super::{
     accepts_llm_sample, apply_fast_snapshot, build_server_summaries, changed_identity_keys, ident,
-    map_server_identity, new_server_monitor, publish_selected_mapping, rebuild_server_monitors,
-    reconcile_server, selected_identity_of, spawn_body_metrics_server, spawn_empty_metrics_server,
-    spawn_flaky_metrics_server, spawn_metrics_off_server, stabilize_llm_sample, target,
-    update_resolved_server, DashboardSnapshot, FastSnapshot, GpuMapping, LlmSample, LlmStats,
-    LocalServerIdentity, ServerChange, ServerSpec, SystemStats, UiState,
+    map_server_identity, publish_selected_mapping, reconcile_server, selected_identity_of,
+    spawn_body_metrics_server, spawn_empty_metrics_server, spawn_flaky_metrics_server,
+    spawn_metrics_off_server, stabilize_llm_sample, target, update_resolved_server,
+    DashboardSnapshot, FastSnapshot, GpuMapping, LlmSample, LlmStats, LocalServerIdentity,
+    ServerChange, ServerSpec, SystemStats, UiState,
 };
 
+use super::super::{rebuild_poll_slots, LlmPollSlot};
 use crate::domain::ServerBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -158,6 +159,47 @@ fn stale_llm_sample_is_rejected_across_generations() {
     // under the second A session (generation 2).
     assert!(!accepts_llm_sample(1, &a_sample));
     assert!(!accepts_llm_sample(2, &a_sample));
+
+    // The real UI drain must retain B when A arrives *after* the current
+    // result. Non-blocking reconciliation permits precisely this ordering.
+    use std::sync::{atomic::AtomicU64, Arc};
+    let (_fast_tx, fast_rx) = mpsc::sync_channel(2);
+    let (llm_tx, llm_rx) = mpsc::sync_channel(2);
+    let a_key = a_sample.server.clone();
+    let b_key = b_sample.server.clone();
+    llm_tx.send(b_sample).unwrap();
+    llm_tx.send(a_sample).unwrap();
+    let order = vec![a_key.clone(), b_key.clone()];
+    let endpoints = BTreeMap::from([
+        (a_key.clone(), "http://a:1".into()),
+        (b_key.clone(), "http://b:1".into()),
+    ]);
+    let mut registry = BTreeMap::new();
+    let mut snapshot = DashboardSnapshot::default();
+    let mut ui = UiState::default();
+    let drops = Arc::new(AtomicU64::new(0));
+    let mut redraw = super::super::RedrawScheduler::new(Instant::now(), Duration::from_millis(250));
+    super::super::loop_events::pump_snapshots(
+        &fast_rx,
+        &llm_rx,
+        1,
+        0,
+        &order,
+        &endpoints,
+        &mut registry,
+        &b_key,
+        &drops,
+        &drops,
+        &mut snapshot,
+        &mut ui,
+        &mut redraw,
+    )
+    .unwrap();
+    assert_eq!(snapshot.llm.model, "B");
+    assert_eq!(registry.len(), 1);
+    assert!(registry.contains_key(&b_key));
+    assert!(!registry.contains_key(&a_key));
+    assert!(ui.server_sample_age_ms(&a_key, Instant::now()).is_none());
 }
 
 #[test]
@@ -718,15 +760,15 @@ fn rebuild_resets_monitor_on_a_same_endpoint_restart() {
             start_time: 5,
         }),
     };
-    let mut monitor = new_server_monitor(spec.clone());
+    let slot = LlmPollSlot::new(spec.clone());
     // Simulate a warm cache (a previous good sample).
-    monitor.last_good = Some((LlmStats::default(), Instant::now()));
+    slot.monitor.lock().unwrap().last_good = Some((LlmStats::default(), Instant::now()));
 
     // Same identity: the monitor and its per-server caches are preserved.
-    let kept = rebuild_server_monitors(vec![monitor], vec![spec.clone()]);
+    let kept = rebuild_poll_slots(vec![slot], vec![spec.clone()]);
     assert_eq!(kept.len(), 1);
     assert!(
-        kept[0].last_good.is_some(),
+        kept[0].monitor.lock().unwrap().last_good.is_some(),
         "an unchanged server keeps its state"
     );
 
@@ -740,10 +782,10 @@ fn rebuild_resets_monitor_on_a_same_endpoint_restart() {
         }),
         ..spec
     };
-    let reset = rebuild_server_monitors(kept, vec![restarted]);
+    let reset = rebuild_poll_slots(kept, vec![restarted]);
     assert_eq!(reset.len(), 1);
     assert!(
-        reset[0].last_good.is_none(),
+        reset[0].monitor.lock().unwrap().last_good.is_none(),
         "a same-endpoint restart must reset the per-server caches"
     );
 }
@@ -781,6 +823,52 @@ fn changed_identity_keys_detects_only_restarted_servers() {
     // A new or removed key is not a restart.
     assert!(changed_identity_keys(std::slice::from_ref(&a), std::slice::from_ref(&b)).is_empty());
     assert!(changed_identity_keys(&[], std::slice::from_ref(&a)).is_empty());
+}
+
+#[test]
+fn rebuilding_poll_slots_never_waits_for_an_inflight_monitor() {
+    use std::sync::Arc;
+    let spec = ServerSpec {
+        key: "http://localhost:8080/".into(),
+        endpoint: "http://localhost:8080".into(),
+        identity: Some(ident(42, 100)),
+    };
+    for next in [
+        vec![spec.clone()],
+        vec![ServerSpec {
+            identity: Some(ident(42, 200)),
+            ..spec.clone()
+        }],
+        vec![ServerSpec {
+            endpoint: "http://localhost:8080/".into(),
+            ..spec.clone()
+        }],
+        vec![],
+    ] {
+        let unchanged = next.first() == Some(&spec);
+        let expected_len = next.len();
+        let slot = LlmPollSlot::new(spec.clone());
+        let monitor = Arc::clone(&slot.monitor);
+        let in_flight = Arc::clone(&slot.in_flight);
+        in_flight.store(true, Ordering::Release);
+        let held_poll = monitor.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let rebuild = thread::spawn(move || {
+            tx.send(rebuild_poll_slots(vec![slot], next)).unwrap();
+        });
+        // The lock remains held until after receipt: passing is a structural
+        // proof of lock independence, not a fragile sub-millisecond threshold.
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        drop(held_poll);
+        rebuild.join().unwrap();
+        let slots = result.expect("reconciliation must finish while the HTTP poll is locked");
+        assert_eq!(slots.len(), expected_len);
+        if let Some(slot) = slots.first() {
+            assert_eq!(Arc::ptr_eq(&monitor, &slot.monitor), unchanged);
+            assert_eq!(Arc::ptr_eq(&in_flight, &slot.in_flight), unchanged);
+            assert_eq!(slot.in_flight.load(Ordering::Acquire), unchanged);
+        }
+    }
 }
 
 #[test]
