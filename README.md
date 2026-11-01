@@ -20,8 +20,8 @@ OrsikTop brings **LLM inference, GPU telemetry, Linux system load and processes*
 - **Multiple servers:** monitor up to 16 endpoints concurrently, with separate connection state and throughput history. Servers poll independently, so a slow endpoint never delays the healthy ones. Switch servers without losing their histories.
 - **Settings in the TUI:** add, edit and remove additional endpoints; change GPU selection and refresh settings without restarting.
 - **GPU and system telemetry:** NVIDIA, AMD and Intel backends, CPU/core activity, RAM, swap, sensors and 60-second histories. Available metrics depend on hardware, drivers and permissions.
-- **Interactive processes:** sort, search, group and pin processes, with per-process GPU telemetry where available.
-- **Explicit uncertainty:** unknown LLM fields show `—`; held samples are marked stale. Unknown activity is not guessed to be idle.
+- **Interactive processes:** sort, search, group and pin processes, with per-process GPU telemetry where available. Each process appears once, not once per thread; CPU and memory cover the whole process, while `THR` shows its current thread count.
+- **Explicit uncertainty:** unknown fields and missing or expired history readings show `—`; a measured zero stays zero. Held samples are marked stale. Unknown activity is not guessed to be idle.
 
 ## Quick start
 
@@ -99,6 +99,7 @@ There are no automatic background update checks. Full controls, configuration, C
 - **Server limit:** at most 16 servers are polled. Extra configured endpoints are retained and marked **NOT MONITORED — limit reached**, not reported as offline.
 - **Terminal size:** the full dashboard needs at least **72×22** cells. A reduced layout works from **54×16**; smaller terminals show a resize notice.
 - **Measurements:** `CTX` is reported slot context occupancy, not request progress or exact physical KV-cache use. `REQUEST` describes the in-flight request. Unavailable values stay `—`.
+- **Configuration compatibility (unreleased changes on `main`):** additional servers are saved as a JSON array so URLs containing commas survive restart. Legacy comma-separated lists remain readable, but older OrsikTop versions cannot read the new format. See [configuration](docs/USAGE.md).
 
 ## Troubleshooting
 
@@ -129,6 +130,10 @@ Diagnostics redact endpoint credentials, paths and query values. Review the repo
 Bug reports and focused feature requests are welcome through [GitHub Issues](https://github.com/exclude-barrier/OrsikTop/issues). Include your OrsikTop version, expected behavior, steps to reproduce and reviewed diagnostics where useful. Keep changes focused on making monitoring clearer and more useful.
 
 For source builds and checks before submitting changes, see [Development](docs/DEVELOPMENT.md).
+
+Tag-triggered publication requires successful Rust checks, script regression tests,
+security checks and an MSRV build through the reusable CI workflow. See
+[Development](docs/DEVELOPMENT.md) for the validation commands.
 
 ## License
 
