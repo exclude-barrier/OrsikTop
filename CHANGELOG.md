@@ -19,6 +19,27 @@ All notable changes to OrsikTop will be documented here.
 
 ### Changed
 
+- Production sampling now explicitly disables sysinfo's per-thread task rows.
+  Process CPU/memory and the dynamic `THR` column remain process-level; shared
+  DRM FD tables are no longer scanned once per thread. The worker and profiler
+  share one refresh-kind definition; `ORSIK_PROCESS_PROFILE_TASKS=1` selects the
+  legacy diagnostic comparison only.
+- Tag releases must pass the reusable CI workflow (Rust checks, Python script
+  tests, audit, deny and MSRV) before planning or publishing with write access.
+- Empty, expired, missing and held history values render `—`; real zeroes stay
+  zero. Past graph points are retained without presenting them as current data.
+  Snapshot documentation now states the actual bounded FIFO/drop-new behavior.
+- The installer checksum patch is byte-idempotent, migrates repeated legacy
+  guards and refreshes checksum entries for the modified installer as well as
+  the updater. Offline shell tests reject tampered downloads before install.
+  The Rust gate is now **606** (597 run + 9 ignored), plus seven Python tests.
+
+- The opt-in process-collection benchmark supports bounded repeated component
+  profiling, FD/readlink/fdinfo counters and a diagnostic comparison without
+  sysinfo task enumeration. Production sampling is unchanged. The measured
+  process/FD-load results and tracing limits are recorded in
+  `docs/PERFORMANCE_BASELINE.md`.
+
 - **Declared `rust-version = 1.95`.** The floor was previously implicit, set
   by the dependency set (sysinfo 0.39.6 requires 1.95). CI now builds the
   main gate on a pinned stable (1.99.1) and checks the declared floor in a
@@ -72,6 +93,23 @@ All notable changes to OrsikTop will be documented here.
   is unchanged.
 
 ### Fixed
+
+- Additional server URLs now round-trip through a JSON `servers=` array,
+  including commas in credentials, paths and queries. Legacy comma-separated
+  lists remain readable; old application versions cannot read the new format.
+- Server-set reconciliation uses immutable poll-slot metadata instead of
+  waiting for the monitor mutex held by an in-flight HTTP request. The restart
+  regression test now exercises the production poll-slot rebuild path. The
+  soak checks monotonicity after generation filtering: independent polls can
+  finish out of order, and a direct UI-drain regression confirms a late old
+  result cannot overwrite a current one.
+- Server-to-GPU render-node attribution requires matching character-device
+  numbers, not a matching filename. Regular files and unrelated devices cannot
+  impersonate a GPU; aliases of a verified render device remain supported.
+- A failed temporary config creation no longer deletes an existing file or
+  symlink at the colliding name. Forward/backward settings navigation is now
+  symmetric across every field. Ten new regression tests bring the gate to
+  **600** tests (591 run + 9 ignored), with no existing test removed.
 
 - **Hardware matrix inventory updated to the current smokes.** The smoke table
   still described `nvidia_real_system_smoke` as a single-sample print (it now

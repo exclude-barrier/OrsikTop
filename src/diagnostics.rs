@@ -697,6 +697,10 @@ mod tests {
             &format!("/dev/dri/{render}"),
         );
         sys.dir_entry("/dev/dri", render, false, true);
+        sys.char_device(
+            &format!("/dev/dri/{render}"),
+            render.trim_start_matches("renderD").parse().unwrap(),
+        );
     }
 
     #[test]

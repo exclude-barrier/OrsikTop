@@ -109,8 +109,10 @@ accounts, browsers, or daemons.
 - Validate after change groups:
   `cargo fmt --all -- --check`, `cargo check --all-targets --locked`,
   `cargo clippy --all-targets --locked -- -D warnings`,
-  `cargo test --all-targets --locked`. The test gate is pinned at **590**
-  (581 run + 9 ignored); do not lower the count without an explicit decision.
+  `cargo test --all-targets --locked`. The test gate is pinned at **606**
+  (597 run + 9 ignored); do not lower the count without an explicit decision.
+  Release scripts also have a standard-library Python gate:
+  `python3 -B -m unittest discover -s scripts/tests -v`.
 - Small, isolated, reviewable commits on the existing branch. No push
   without explicit approval.
 - Larger work stages get a summary in `docs/S*_STAGE_SUMMARY.md`.

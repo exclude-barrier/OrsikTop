@@ -495,7 +495,7 @@ struct Driver<'a> {
     last_sample: Vec<Instant>,
     restart_at: Vec<Option<Instant>>,
     generation: u64,
-    last_stream_generation: u64,
+    last_accepted_generation: u64,
     cmds: mpsc::Sender<LlmCommand>,
     report: SoakReport,
 }
@@ -609,13 +609,6 @@ impl Driver<'_> {
     fn check_sample(&mut self, sample: LlmSample, now: Instant) {
         self.report.samples += 1;
         assert!(
-            sample.generation >= self.last_stream_generation,
-            "generation went backwards in the sample stream ({} after {})",
-            sample.generation,
-            self.last_stream_generation
-        );
-        self.last_stream_generation = sample.generation;
-        assert!(
             sample.generation <= self.generation,
             "sample tagged with a generation ({}) the app never issued (latest {})",
             sample.generation,
@@ -635,6 +628,16 @@ impl Driver<'_> {
             self.report.stale_rejected += 1;
             return;
         }
+        // Independent polls may finish out of order across a non-blocking
+        // set rebuild. Only the accepted stream must be monotonic; late old
+        // results are explicitly rejected above, just as in the app loop.
+        assert!(
+            sample.generation >= self.last_accepted_generation,
+            "an accepted sample went backwards ({} after {})",
+            sample.generation,
+            self.last_accepted_generation
+        );
+        self.last_accepted_generation = sample.generation;
         assert!(
             self.active[index],
             "an accepted sample was attributed to server {index}, which is not in the current set"
@@ -730,7 +733,7 @@ fn run_soak(params: &SoakParams) -> SoakReport {
         last_sample: vec![start; n],
         restart_at: vec![None; n],
         generation: 0,
-        last_stream_generation: 0,
+        last_accepted_generation: 0,
         cmds,
         report: SoakReport {
             servers: n,

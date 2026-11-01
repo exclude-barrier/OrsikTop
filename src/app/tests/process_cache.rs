@@ -6,6 +6,69 @@ use super::{
 use crate::domain::ProcessIdentity;
 
 #[test]
+fn production_refresh_samples_process_groups_without_task_rows() {
+    use super::super::process::process_refresh_kind;
+    use sysinfo::UpdateKind;
+    let kind = process_refresh_kind();
+    assert!(!kind.tasks());
+    assert!(kind.cpu());
+    assert!(kind.memory());
+    assert_eq!(kind.exe(), UpdateKind::Always);
+}
+
+#[test]
+fn multithreaded_process_has_one_row_with_group_memory_and_thread_count() {
+    use super::super::process::{collect_process_stats, process_refresh_kind};
+    use crate::drm::DrmSamplerState;
+    use std::sync::mpsc;
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..3 {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            releases.push(release_tx);
+            let ready_tx = ready_tx.clone();
+            scope.spawn(move || {
+                let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+                let tid: u32 = stat.split_whitespace().next().unwrap().parse().unwrap();
+                ready_tx.send(tid).unwrap();
+                // Channel disconnect also releases the thread during unwinding.
+                let _ = release_rx.recv();
+            });
+        }
+        let tids: Vec<_> = (0..3).map(|_| ready_rx.recv().unwrap()).collect();
+        let pid = Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            process_refresh_kind(),
+        );
+        let rows = collect_process_stats(
+            &system,
+            &mut ProcessCache::default(),
+            &mut DrmSamplerState::default(),
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "threads must not become additional process rows"
+        );
+        assert_eq!(rows[0].pid, pid.as_u32());
+        assert!(tids
+            .iter()
+            .all(|tid| rows.iter().all(|row| row.pid != *tid)));
+        assert!(rows[0].threads.is_some_and(|count| count >= 4));
+        assert_eq!(rows[0].memory_bytes, system.process(pid).unwrap().memory());
+        assert!(rows[0].memory_bytes > 0);
+        assert!(!rows[0].program.is_empty());
+        drop(releases);
+    });
+}
+
+#[test]
 fn per_cpu_usage_is_indexed_by_kernel_cpu_id_with_holes() {
     // Online set 0,2-3 (cpu1 offline): usage lands at its ids, hole stays 0.
     let usage = per_cpu_usage_by_id(&[("cpu0", 10.0), ("cpu2", 30.0), ("cpu3", 40.0)]);

@@ -9,6 +9,7 @@ use super::{
     MIN_REFRESH_MS,
 };
 
+use super::super::process::process_refresh_kind;
 use crate::domain::{ProcessIdentity, ServerBackend};
 use crate::drm::sample_process_gpus;
 use crate::llama::LlamaMonitor;
@@ -20,7 +21,7 @@ use std::sync::{mpsc, Arc};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{ProcessesToUpdate, System};
 
 // ------------------------------------------------------------------
 // CFA-35 — reproducible runtime performance baseline
@@ -934,6 +935,27 @@ fn perf_baseline_benchmark_for_dirty_only_redraw_and_polling() {
 #[test]
 #[ignore = "heavy: reads the whole host /proc table + DRM fdinfo; run via an approved single-threaded runner, not in the shared gate"]
 fn perf_baseline_soak_and_process_collection_benchmark() {
+    // Opt-in profiling can increase the sample count without adding this
+    // host-wide scan to the regular gate. Keep the historical default.
+    let cycles = std::env::var("ORSIK_PROCESS_PROFILE_CYCLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(3, 100);
+    bench_emit("process_profile_cycles", cycles);
+    // Default follows production. Explicit TASKS=1 retains the old path for
+    // diagnostic comparisons without diverging from the shared refresh kind.
+    let include_tasks = std::env::var("ORSIK_PROCESS_PROFILE_TASKS").as_deref() == Ok("1");
+    bench_emit("process_profile_includes_tasks", usize::from(include_tasks));
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        bench_emit(
+            "process_profile_host_processes",
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+                .count(),
+        );
+    }
     // Production fast-worker cycle: `refresh_processes_specifics` followed
     // by `collect_process_stats`. Both are timed, together and apart, so the
     // report does not understate the cycle by measuring only the collector.
@@ -942,13 +964,15 @@ fn perf_baseline_soak_and_process_collection_benchmark() {
     let mut drm_state = DrmSamplerState::default();
     let refresh_system = |system: &mut System| -> Duration {
         let start = Instant::now();
+        let kind = process_refresh_kind();
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing()
-                .with_memory()
-                .with_cpu()
-                .with_exe(UpdateKind::Always),
+            if include_tasks {
+                kind.with_tasks()
+            } else {
+                kind.without_tasks()
+            },
         );
         start.elapsed()
     };
@@ -957,7 +981,10 @@ fn perf_baseline_soak_and_process_collection_benchmark() {
     let mut collect_times = Vec::new();
     let mut cycle_times = Vec::new();
     let mut process_count = 0usize;
-    for _ in 0..3 {
+    // Warm up sysinfo CPU deltas and the process/DRM caches before timing.
+    refresh_system(&mut system);
+    collect_process_stats(&system, &mut process_cache, &mut drm_state);
+    for _ in 0..cycles {
         let refresh = refresh_system(&mut system);
         let collect_start = Instant::now();
         let processes = collect_process_stats(&system, &mut process_cache, &mut drm_state);
@@ -996,36 +1023,106 @@ fn perf_baseline_soak_and_process_collection_benchmark() {
     // sum of the per-process thread-count read and the per-process DRM fd
     // scan. Both phases are re-timed here (over the same process table) so
     // an optimization targets the dominant one. Reported, never asserted.
-    let mut thread_read_total = Duration::ZERO;
+    let mut thread_read_times = Vec::new();
     let mut thread_read_failures = 0usize;
-    for pid in system.processes().keys() {
+    for _ in 0..cycles {
         let start = Instant::now();
-        if read_process_thread_count(pid.as_u32()).is_none() {
-            thread_read_failures += 1;
+        for pid in system.processes().keys() {
+            if read_process_thread_count(pid.as_u32()).is_none() {
+                thread_read_failures += 1;
+            }
         }
-        thread_read_total += start.elapsed();
+        thread_read_times.push(start.elapsed());
     }
     bench_emit(
         "process_threads_read_total_us",
-        thread_read_total.as_micros(),
+        bench_mean(&thread_read_times).as_micros(),
     );
     bench_emit("process_threads_read_failures", thread_read_failures);
 
-    let mut drm_scan_total = Duration::ZERO;
-    let mut drm_procs_with_gpu = 0usize;
-    let mut drm_scan_state = DrmSamplerState::default();
-    let drm_now = Instant::now();
-    for (pid, process) in system.processes().iter() {
-        let identity = ProcessIdentity::new(pid.as_u32(), process.start_time());
-        let start = Instant::now();
-        let gpus = sample_process_gpus(&RealSys, drm_now, identity, &mut drm_scan_state);
-        drm_scan_total += start.elapsed();
-        if !gpus.is_empty() {
-            drm_procs_with_gpu += 1;
+    // Count actual filesystem operations in a separate component pass, never
+    // in the production timing above. No per-process paths/command lines are
+    // emitted. Reads describe this host, not a claim of live GPU load.
+    #[derive(Default)]
+    struct ProfileSys {
+        fd_entries: std::cell::Cell<u64>,
+        readlinks: std::cell::Cell<u64>,
+        drm_links: std::cell::Cell<u64>,
+        fdinfo_reads: std::cell::Cell<u64>,
+    }
+    impl crate::system::Sys for ProfileSys {
+        fn read_to_string(&self, path: &std::path::Path) -> Option<String> {
+            self.fdinfo_reads.set(self.fdinfo_reads.get() + 1);
+            RealSys.read_to_string(path)
+        }
+        fn read_dir(&self, path: &std::path::Path) -> Option<Vec<crate::system::SysEntry>> {
+            RealSys.read_dir(path)
+        }
+        fn read_dir_names(&self, path: &std::path::Path) -> Option<Vec<String>> {
+            let names = RealSys.read_dir_names(path)?;
+            self.fd_entries
+                .set(self.fd_entries.get() + names.len() as u64);
+            Some(names)
+        }
+        fn symlink_target(&self, path: &std::path::Path) -> Option<String> {
+            RealSys.symlink_target(path)
+        }
+        fn symlink_target_starts_with(&self, path: &std::path::Path, prefix: &[u8]) -> bool {
+            self.readlinks.set(self.readlinks.get() + 1);
+            let matched = RealSys.symlink_target_starts_with(path, prefix);
+            if matched {
+                self.drm_links.set(self.drm_links.get() + 1);
+            }
+            matched
         }
     }
-    bench_emit("process_drm_scan_total_us", drm_scan_total.as_micros());
+    let profile_sys = ProfileSys::default();
+    let mut drm_scan_times = Vec::new();
+    let mut drm_procs_with_gpu = 0usize;
+    let mut drm_scan_state = DrmSamplerState::default();
+    for _ in 0..cycles {
+        let drm_now = Instant::now();
+        let start = Instant::now();
+        let mut with_gpu = 0;
+        for (pid, process) in system.processes().iter() {
+            let identity = ProcessIdentity::new(pid.as_u32(), process.start_time());
+            let gpus = sample_process_gpus(&profile_sys, drm_now, identity, &mut drm_scan_state);
+            if !gpus.is_empty() {
+                with_gpu += 1;
+            }
+        }
+        drm_procs_with_gpu = with_gpu;
+        drm_scan_times.push(start.elapsed());
+    }
+    bench_emit(
+        "process_drm_scan_total_us",
+        bench_mean(&drm_scan_times).as_micros(),
+    );
     bench_emit("process_drm_procs_with_gpu", drm_procs_with_gpu);
+    for (key, total) in [
+        (
+            "process_drm_fd_entries_per_cycle",
+            profile_sys.fd_entries.get(),
+        ),
+        (
+            "process_drm_readlinks_per_cycle",
+            profile_sys.readlinks.get(),
+        ),
+        (
+            "process_drm_matching_links_per_cycle",
+            profile_sys.drm_links.get(),
+        ),
+        (
+            "process_drm_fdinfo_reads_per_cycle",
+            profile_sys.fdinfo_reads.get(),
+        ),
+    ] {
+        bench_emit(key, total / cycles as u64);
+    }
+    if std::env::var("ORSIK_PROCESS_PROFILE_ONLY").as_deref() == Ok("1") {
+        assert!(process_count > 0, "host process table is non-empty");
+        return;
+    }
 
     // Longer-operation window: render the full dashboard continuously and
     // sample RSS / threads once per second to expose growth over time. This

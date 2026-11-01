@@ -31,6 +31,13 @@ pub trait Sys {
     fn read_dir(&self, path: &Path) -> Option<Vec<SysEntry>>;
     /// Direct symlink target (not resolved). `None` if not a symlink or
     fn symlink_target(&self, path: &Path) -> Option<String>;
+    /// Kernel device number of a character device, following symlinks (also
+    /// `/proc/<pid>/fd/<fd>`). Regular files and unreadable paths are unknown.
+    /// Comparing this with a discovered render node proves device identity;
+    /// a matching basename alone is not GPU evidence.
+    fn char_device_id(&self, _path: &Path) -> Option<u64> {
+        None
+    }
     /// List only the entry **names** of a directory, without reading per-entry
     /// metadata. The DRM fd scan only needs the fd numbers and reads each
     /// symlink target itself, so it can skip the per-entry classification.
@@ -55,6 +62,15 @@ pub trait Sys {
 pub struct RealSys;
 
 impl Sys for RealSys {
+    fn char_device_id(&self, path: &Path) -> Option<u64> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::metadata(path).ok()?;
+        metadata
+            .file_type()
+            .is_char_device()
+            .then(|| metadata.rdev())
+    }
+
     fn read_to_string(&self, path: &Path) -> Option<String> {
         std::fs::read_to_string(path).ok()
     }
@@ -118,9 +134,15 @@ pub struct FixtureSys {
     files: BTreeMap<String, String>,
     dirs: BTreeMap<String, Vec<SysEntry>>,
     symlinks: BTreeMap<String, String>,
+    char_devices: BTreeMap<String, u64>,
 }
 #[cfg(test)]
 impl FixtureSys {
+    pub fn char_device(&mut self, path: &str, device_id: u64) -> &mut Self {
+        self.char_devices.insert(path.to_string(), device_id);
+        self
+    }
+
     pub fn file(&mut self, path: &str, content: impl Into<String>) -> &mut Self {
         self.files.insert(path.to_string(), content.into());
         self
@@ -151,6 +173,19 @@ impl FixtureSys {
 }
 #[cfg(test)]
 impl Sys for FixtureSys {
+    fn char_device_id(&self, path: &Path) -> Option<u64> {
+        let mut path = path.to_path_buf();
+        for _ in 0..16 {
+            let key = path.to_string_lossy();
+            if let Some(id) = self.char_devices.get(key.as_ref()) {
+                return Some(*id);
+            }
+            let target = self.symlinks.get(key.as_ref())?;
+            path = path.parent().unwrap_or(Path::new(".")).join(target);
+        }
+        None
+    }
+
     fn read_to_string(&self, path: &Path) -> Option<String> {
         self.files
             .get(&path.to_string_lossy().into_owned())
@@ -171,6 +206,20 @@ impl Sys for FixtureSys {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn real_character_device_identity_rejects_regular_files_and_follows_fds() {
+        use std::os::fd::AsRawFd;
+        let dev = std::fs::File::open("/dev/null").unwrap();
+        let fd = PathBuf::from(format!("/proc/self/fd/{}", dev.as_raw_fd()));
+        let id = RealSys.char_device_id(Path::new("/dev/null")).unwrap();
+        assert_eq!(RealSys.char_device_id(&fd), Some(id));
+        assert_eq!(RealSys.char_device_id(Path::new("Cargo.toml")), None);
+        assert_eq!(
+            RealSys.char_device_id(Path::new("/proc/self/no-such-file")),
+            None
+        );
+    }
 
     #[test]
     fn fixture_round_trips_files_dirs_and_symlinks() {

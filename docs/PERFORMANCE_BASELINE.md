@@ -908,6 +908,136 @@ aber keine gemessene Startrate.
 maschinenspezifisch (`cf-desktop`); für andere Hosts ist der Lauf dort zu
 wiederholen.
 
+## Prozess-/DRM-Komponentenprofil (2026-10-31)
+
+Der vorhandene ignorierte Benchmark kann jetzt gezielt den Produktionspfad
+`refresh_processes_specifics` + `collect_process_stats` messen, ohne danach den
+zehnsekündigen Render-Soak auszuführen:
+
+```sh
+ORSIK_PROCESS_PROFILE_CYCLES=20 ORSIK_PROCESS_PROFILE_ONLY=1 \
+  cargo test --release --locked \
+  app::tests::workers::perf_baseline_soak_and_process_collection_benchmark \
+  -- --exact --ignored --nocapture --test-threads=1
+```
+
+Die Zykluszahl ist auf 3–100 begrenzt (Standard: 3); ohne `PROFILE_ONLY=1`
+bleibt der Render-Soak aktiv. Ein ungemessener Warmup-Zyklus initialisiert
+sysinfo und die Prozess-/DRM-Caches. Die Produktionsmessung bleibt frei von
+zusätzlichen Zählern. Ein separater Komponentenpass über den zuletzt erfassten
+Prozessbestand misst Threadzahl-Lesen und DRM-Scanning jeweils wiederholt;
+die bestehenden `process_*_total_us`-Komponentenwerte sind Mittelwerte **pro
+Scan**, nicht die aufsummierte Dauer aller Wiederholungen. Dieser Pass zählt
+zusätzlich FD-Einträge, Readlink-Versuche, DRM-Pfadtreffer und fdinfo-Leseversuche
+pro Scan. Fehler/verschwundene Prozesse werden weiterhin normal behandelt.
+
+Die Messungen sind ungetaktete Warm-Cache-Kosten pro Scan, keine direkt
+gemessene TUI-CPU-Prozentzahl. Komponentenpässe laufen separat; ihre Zeiten
+dürfen wegen veränderlicher Prozesse und Cacheeffekte nicht als exakte
+Zerlegung eines einzelnen Produktionszyklus addiert werden. Keine Pfade,
+Prozessargumente oder Deskriptorziele werden protokolliert.
+
+Hintergrund: In sysinfo 0.39.6 bedeutet `ProcessRefreshKind::nothing()`
+ausdrücklich **nicht** `tasks=false`; auch einzelne Linux-Threads werden als
+Prozessobjekte erfasst. Deren gemeinsame FD-Tabellen können dadurch mehrfach
+gescannt werden. Nach diesem Befund ist die Entscheidung gefallen: Der
+Produktionspfad erfasst Tasks **nicht** mehr separat. `app::process::process_refresh_kind()`
+(`nothing().without_tasks().with_memory().with_cpu().with_exe(Always)`) ist die
+gemeinsame Definition von Fast-Worker und Benchmark;
+`ORSIK_PROCESS_PROFILE_TASKS=1` stellt die alte Variante nur noch für
+diagnostische Vergleichsläufe her. Die Prozesstabellen-Semantik bleibt
+korrekt: sysinfo liefert weiterhin eine Zeile pro Prozess (CPU und Speicher
+sind Gruppenwerte inklusive aller Threads), und die dynamische `THR`-Spalte
+liest `Threads:` weiterhin direkt aus `/proc/<pid>/status`. Abgedeckt durch
+`production_refresh_samples_process_groups_without_task_rows` und
+`multithreaded_process_has_one_row_with_group_memory_and_thread_count`
+(mehrthreadiger Realprozess: genau eine Zeile, Thread-IDs erscheinen nicht als
+Prozesszeilen, Speicher-/Threadwerte stimmen).
+
+### Gemessene Ergebnisse und Schlussfolgerung
+
+Host: Intel Core Ultra 9 288V, Kernel `7.3.0-10-generic`, Rust `1.99.1`,
+sysinfo `0.39.6`; Arbeitsbaum auf `0bae7a1` mit den Runtime-Korrekturen dieses
+Abschnitts. Je Variante drei Release-Läufe mit 20 gemessenen Zyklen plus
+Warmup. Die reale Desktop-/Entwicklungsumgebung hatte rund 600 Prozesse.
+Die kontrollierte Zusatzlast bestand aus **128 eigenen, wartenden `sleep`
+Prozessen mit jeweils 64 zusätzlich geerbten `/dev/null`-FDs**; alle Kinder
+wurden anschließend einzeln beendet und geerntet. Es wurde kein Inferenzserver
+gestartet, umkonfiguriert oder belastet. Die Lastfälle sind Prozess-/FD-Last,
+kein synthetischer Ersatz für eine GPU-Inferenzmessung.
+
+Die Tabelle zeigt den Median der drei jeweiligen Laufmittelwerte, in ms pro
+Scan; Eintragszahlen stammen aus sysinfo und enthalten in der bisherigen
+Produktionsvariante (mit Tasks) auch Threads:
+
+| Variante | Einträge (Bereich) | sysinfo | Kollektor gesamt | Produktionszyklus | Threadzahl-Lesen separat | DRM separat | FD-Einträge/Scan (Median) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Bisherige Produktion (mit Tasks), Host | 2253–2294 | 20,03 | 381,21 | 401,24 | 14,66 | 357,20 | 147492 |
+| Bisherige Produktion, +128 Prozesse/64 FDs | 2363–2371 | 20,04 | 344,55 | 364,59 | 14,19 | 298,63 | 149881 |
+| Ohne Tasks, Host | 602–605 | 6,28 | 16,14 | 22,48 | 2,58 | 11,70 | 6404 |
+| Ohne Tasks, +128 Prozesse/64 FDs | 730 | 8,05 | 27,66 | 35,71 | 3,29 | 25,05 | 15166 |
+
+**Befund:** Der dominante Kollektorpfad ist der FD-/DRM-Scan, nicht das Lesen
+der Threadzahl oder das Rendering. Die aktuelle Host-Variante erzeugte
+2885–2910 fdinfo-Leseversuche/Scan, die Variante ohne Tasks nur 80. Die große
+Mehrarbeit entsteht durch wiederholte Scans gemeinsamer FD-Tabellen einzelner
+Threads. Die 465–475 DRM-positiven *Einträge* der Task-Variante sind deshalb
+ausdrücklich keine 465–475 unabhängigen GPU-Prozesse; ohne Tasks waren es 14.
+
+Die Läufe waren sequenziell, nicht randomisiert, und der fremde Hostbestand
+veränderte sich währenddessen. Dass die aktuelle Zusatzlast-Variante schneller
+als der vorherige Host-Lauf war, ist **kein** Nachweis eines positiven
+Last-Effekts. Der Host-Zyklus schwankte zwischen 347,84 und 527,79 ms. Es wird
+deshalb kein kausaler Beschleunigungsfaktor und kein CPU-Prozentgewinn für das
+Produkt behauptet. Die klar unterschiedliche Anzahl wiederholt gescannter
+Einträge und FDs sowie die dokumentierte sysinfo-Option identifizierten den
+konkreten Kandidaten: Tasks nicht separat erfassen. Der Folgeauftrag hat
+diese Entscheidung umgesetzt — siehe nächsten Abschnitt.
+
+### Umstellung der Produktion auf ohne-Tasks-Scans (2026-10-31)
+
+Der Fast-Worker nutzt jetzt `process_refresh_kind()` mit `without_tasks()`;
+Worker und Benchmark teilen dieselbe Definition. Die Prozessanzeige bleibt
+korrekt: eine Zeile pro Prozess (CPU/Speicher als Gruppenwerte), `THR`
+direkt aus `/proc/<pid>/status`; zwei neue Regressionstests sichern das
+(mehrthreadiger Realprozess → genau eine Zeile, Thread-IDs nie als
+Prozesszeilen, Speicherwert = sysinfo-Prozesswert, THR ≥ 4).
+
+Drei neue Release-Läufe (20 Zyklen + Warmup, Produktionsstandard,
+`ORSIK_PROCESS_PROFILE_TASKS` nicht gesetzt, Host ohne Zusatzlast,
+Median der Laufmittelwerte in ms pro Scan):
+
+| Produktionszyklus | sysinfo-Einträge | FD-Einträge/Scan | fdinfo-Leseversuche/Scan | GPU-Prozesse | Threadzahl-Lesen |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 37,74 | 611–617 | 6999–7028 | 80 | 14 | 4,08–4,70 |
+
+Der Produktionszyklus sank damit auf demselben Host von 401,24 ms auf
+37,74 ms pro Scan (≈ Faktor 10,6), die wiederholt gescannten FD-Einträge
+von ~147.500 auf ~7.000. Wie oben sind das Warm-Cache-Kosten pro Scan auf
+diesem Host (Prozessbestand inzwischen 611–617), keine Produkt-CPU-Prozentzahl.
+`process_threads_read_failures=0`. Rohdaten: `target/`-Testläufe dieser
+Session; die Schalter stehen dauerhaft im Benchmark.
+
+`perf stat` war wegen `perf_event_paranoid=4` nicht zulässig; keine Rechte oder
+Kernelparameter wurden geändert. Der vollständige Ersatz-Trace lief mit drei
+Zyklen, Task-Auflistung aktiv, und
+`strace --seccomp-bpf -f -c -e trace=readlink,getdents64,openat,statx`:
+1.070.158 `readlink`-Aufrufe (73,25 % der Zeit **dieser vier gefilterten
+Syscalls**), 29.436 `getdents64`, 68.425 `openat`, 56.822 `statx`. Die
+instrumentierten Laufzeiten werden wegen Tracing-Overhead nicht als
+Produktionsperformance verwendet. Ein vorher abgebrochener Trace ist nicht in
+die Ergebnisse eingegangen.
+
+Rohdaten dieser Session: `/tmp/opencode/orsiktop-sampling-profile/`, mit
+`completed-components.json` (sechs ursprüngliche Läufe), `results.json`
+(Vergleichsläufe, vollständiger Trace, Toolchain-/Binary-Provenienz), allen
+Lauflogs und `host_strace_complete.strace`. SHA-256 des Vergleichs-/Trace-
+Testbinarys: `212298fec7f6de634ec4b29b1afb694e8a320f280230ff6869dd4a3178385f39`.
+Der ursprüngliche Produktionsvergleich lief vor Ergänzung des diagnostischen
+Task-Schalters; seine Sampling-Einstellungen waren identisch mit der aktuellen
+Produktionsvariante. Temporäre Rohdaten sind nicht versioniert; die Zahlen und
+die reproduzierbaren Benchmark-Schalter stehen dauerhaft in diesem Dokument.
+
 ## Querverweise
 
 - `src/app.rs` — `RedrawScheduler` (`:99`); Fast-Worker/Prozesskollektor

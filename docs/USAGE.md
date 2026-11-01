@@ -90,7 +90,7 @@ Settings are stored at `$XDG_CONFIG_HOME/orsiktop/config`, or `~/.config/orsikto
 
 ```text
 server=http://127.0.0.1:8080
-servers=http://127.0.0.1:8081,http://192.168.1.20:8080
+servers=["http://127.0.0.1:8081","http://192.168.1.20:8080"]
 gpu=auto
 refresh_ms=1000
 process_refresh_ms=1000
@@ -98,7 +98,7 @@ offline_grace_ms=2500
 auto_discovery=true
 ```
 
-`server` is the primary configured endpoint; `servers` is a comma-separated list of additional endpoints. Remove the example additional endpoints if you do not intend to monitor them. GPU selectors use the same syntax as `--gpu` below.
+`server` is the primary configured endpoint; `servers` is a JSON array of additional endpoint strings. Saves use JSON so commas in URL paths, passwords or query values survive a restart. Legacy comma-separated lists are still read, but cannot represent a URL containing an unescaped comma. Remove the example additional endpoints if you do not intend to monitor them. GPU selectors use the same syntax as `--gpu` below. Older OrsikTop versions do not understand the new JSON list format.
 
 | Setting | Default | Bounds / behavior |
 | --- | --- | --- |
@@ -148,7 +148,7 @@ Put global overrides before the subcommand, for example `orsiktop --server http:
 
 ## Reading telemetry
 
-LLM fields and sensor gauges distinguish unavailable (`—`) from a reported zero. Backend format, schema, permissions and drivers determine which measurements are available. **Current history-view limitation:** GPU/VRAM history headers can still show `0%` above an empty graph when those measurements are unavailable. Use the GPU panel to check availability; an empty history is not evidence of idle hardware.
+LLM fields, sensor gauges and history headers distinguish unavailable (`—`) from a reported zero. Backend format, schema, permissions and drivers determine which measurements are available. Empty or expired histories do not imply `0%` or idle. When a current measurement is missing or held during reconnect, past graph points remain visible but the current history header shows `—`, not the previous speed or utilization. A measured zero remains `0%` or `0.0 tok/s`.
 
 ### LLM panel
 
@@ -177,6 +177,8 @@ For Strata, LIVE TG uses the server's short-window `live.tok_s` only while gener
 The selected GPU can expose utilization, VRAM, memory-controller utilization, clocks, temperature, power/limit, P-state, throttle reasons, fan, encoder/decoder activity and PCIe RX/TX. This is not a promise that every vendor exposes every field. NVIDIA uses NVML without running `nvidia-smi` each refresh; AMD and Intel use their kernel sysfs/hwmon interfaces. Per-process GPU data uses DRM fdinfo where available. See [Hardware support](HARDWARE_SUPPORT.md) for exact coverage.
 
 System telemetry includes CPU utilization/frequency, per-core activity, hybrid P/E grouping where exposed, package temperature, power when readable, load, I/O wait, RAM and swap. Histories cover 60 seconds for CPU/RAM, GPU/VRAM and LLM prefill/decode. Missing sensors and insufficient permissions leave readings unavailable rather than substituting another measurement.
+
+The process table lists processes, not separate Linux thread/task rows. CPU and memory belong to the whole process; `THR` is the freshly read thread count. Grouping equal program names sums distinct processes rather than counting their shared memory and GPU descriptors again for each thread.
 
 ## Troubleshooting
 

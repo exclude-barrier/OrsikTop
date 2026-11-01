@@ -21,6 +21,27 @@ CHECKSUM_LINE = re.compile(
     r'^[ \t]*verify_checksum "\$_updater_file" "sha256" "[0-9a-f]{64}"[ \t]*\n',
     re.MULTILINE,
 )
+SHA256_GUARD = (
+    '            if ! check_cmd sha256sum; then\n'
+    '                err "sha256sum is required to verify orsiktop-update"\n'
+    "            fi\n"
+)
+
+
+def patch_installer(text: str, digest: str) -> str:
+    # Migrate both pristine and previously patched installers, including old
+    # versions that duplicated the availability guard on every invocation.
+    text = CHECKSUM_LINE.sub("", text).replace(SHA256_GUARD, "")
+    opener = 'if ! downloader "$_updater_url" "$_updater_file"; then'
+    if text.count(opener) != 1:
+        raise ValueError("expected exactly one updater download block")
+    start = text.index(opener)
+    fi = text.find("            fi\n", start)
+    if fi == -1:
+        raise ValueError("updater download block is incomplete")
+    insert_at = fi + len("            fi\n")
+    guard = SHA256_GUARD + f'            verify_checksum "$_updater_file" "sha256" "{digest}"\n'
+    return text[:insert_at] + guard + text[insert_at:]
 
 
 def main() -> int:
@@ -37,37 +58,30 @@ def main() -> int:
 
     installer, updater = installers[0], updaters[0]
     digest = hashlib.sha256(updater.read_bytes()).hexdigest()
-    text = installer.read_text()
-    text = CHECKSUM_LINE.sub("", text)
-
-    opener = 'if ! downloader "$_updater_url" "$_updater_file"; then'
-    start = text.find(opener)
-    if start == -1:
-        print(f"updater download block not found in {installer}", file=sys.stderr)
+    try:
+        text = patch_installer(installer.read_text(), digest)
+    except ValueError as error:
+        print(f"cannot patch {installer}: {error}", file=sys.stderr)
         return 1
-    fi = text.find("            fi\n", start)
-    if fi == -1:
-        print(f"updater download block is incomplete in {installer}", file=sys.stderr)
-        return 1
-    insert_at = fi + len("            fi\n")
-    guard = (
-        '            if ! check_cmd sha256sum; then\n'
-        '                err "sha256sum is required to verify orsiktop-update"\n'
-        "            fi\n"
-        f'            verify_checksum "$_updater_file" "sha256" "{digest}"\n'
-    )
-    text = text[:insert_at] + guard + text[insert_at:]
     installer.write_text(text)
+
+    installer_digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+    checksums = {installer.name: installer_digest, updater.name: digest}
 
     sums = root / "sha256.sum"
     if sums.is_file():
         lines = [
             line
             for line in sums.read_text().splitlines()
-            if not line.endswith(f"*{updater.name}")
+            if not line.split() or line.split(maxsplit=1)[-1].lstrip("*") not in checksums
         ]
-        lines.append(f"{digest} *{updater.name}")
+        lines.extend(f"{value} *{name}" for name, value in checksums.items())
         sums.write_text("\n".join(lines) + "\n")
+
+    for name, value in checksums.items():
+        standalone = root / f"{name}.sha256"
+        if standalone.is_file():
+            standalone.write_text(f"{value} *{name}\n")
 
     print(f"patched {installer.name}: {updater.name} sha256={digest}")
     return 0

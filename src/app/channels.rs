@@ -20,9 +20,9 @@ pub(super) fn drain_try_recv<T>(rx: &Receiver<T>, mut apply: impl FnMut(T)) -> R
     }
 }
 
-/// Send without blocking. A full channel keeps the newest UI state and counts
-/// the dropped update; `false` means the receiver is gone and the worker must
-/// stop.
+/// Send without blocking. A full channel retains its queued snapshots, drops
+/// the incoming update and increments the drop counter (not "latest wins").
+/// `false` means the receiver is gone and the worker must stop.
 pub(super) fn try_send_snapshot<T>(tx: &SyncSender<T>, value: T, drops: &AtomicU64) -> bool {
     match tx.try_send(value) {
         Ok(()) => true,

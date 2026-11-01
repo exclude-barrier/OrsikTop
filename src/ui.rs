@@ -126,6 +126,9 @@ pub struct UiState {
     vram_history: VecDeque<TimedSample>,
     cpu_history: VecDeque<TimedSample>,
     ram_history: VecDeque<TimedSample>,
+    /// Last host observation, including unavailable fields. An older history
+    /// point is not a current reading after a failed/missing sensor sample.
+    last_host_sample_at: Option<Instant>,
     /// History/connection state of the currently selected server.
     llm_history: LlmHistory,
     /// Per-server history/connection state, keyed by stable server identity.
@@ -196,6 +199,7 @@ impl Default for UiState {
             vram_history: VecDeque::with_capacity(600),
             cpu_history: VecDeque::with_capacity(600),
             ram_history: VecDeque::with_capacity(600),
+            last_host_sample_at: None,
             llm_history: LlmHistory::default(),
             llm_histories: HashMap::new(),
             llm_history_key: String::new(),

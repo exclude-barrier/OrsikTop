@@ -33,6 +33,19 @@ pub(super) fn smooth_llm_sample_interval(previous_ms: Option<f64>, current_ms: f
     )
 }
 
+/// Only a finite point from the current observation and the visible window
+/// may label a graph as a current reading. Older points remain in the graph.
+fn latest_history_value(
+    history: &VecDeque<TimedSample>,
+    observed_at: Option<Instant>,
+) -> Option<f64> {
+    let latest = history.back()?;
+    (latest.value.is_finite()
+        && latest.at.elapsed() <= HISTORY_WINDOW
+        && observed_at.is_none_or(|at| latest.at >= at))
+    .then_some(latest.value)
+}
+
 pub(super) fn draw_llm_rate_history(frame: &mut Frame, area: Rect, state: &UiState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -43,6 +56,7 @@ pub(super) fn draw_llm_rate_history(frame: &mut Frame, area: Rect, state: &UiSta
         cols[0],
         "PREFILL",
         &state.llm_history.prefill,
+        state.llm_history.last_observed_at,
         CYAN,
         true,
     );
@@ -51,6 +65,7 @@ pub(super) fn draw_llm_rate_history(frame: &mut Frame, area: Rect, state: &UiSta
         cols[1],
         "DECODE",
         &state.llm_history.decode,
+        state.llm_history.last_observed_at,
         ORK_GREEN,
         false,
     );
@@ -61,6 +76,7 @@ pub(super) fn draw_llm_rate_history_column(
     area: Rect,
     title: &str,
     history: &VecDeque<TimedSample>,
+    observed_at: Option<Instant>,
     color: Color,
     right_border: bool,
 ) {
@@ -77,28 +93,27 @@ pub(super) fn draw_llm_rate_history_column(
         return;
     }
 
-    let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
-    if !llm_rate_history_has_activity(history) {
-        let header = format!(" {title} idle");
-        frame.render_widget(
-            Paragraph::new(fit_cell(&header, inner.width as usize))
-                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-        return;
-    }
-
+    let latest = latest_history_value(history, observed_at);
     let scale = history_max(history).max(1.0);
-    let header = format!(
-        " {title} {} tok/s · max {}",
-        compact_rate(latest),
-        compact_rate(scale)
+    let header = latest.map_or_else(
+        || format!(" {title} —"),
+        |value| {
+            format!(
+                " {title} {} tok/s · max {}",
+                compact_rate(value),
+                compact_rate(scale)
+            )
+        },
     );
     frame.render_widget(
         Paragraph::new(fit_cell(&header, inner.width as usize))
             .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+
+    if !llm_rate_history_has_activity(history) {
+        return;
+    }
 
     let graph = Rect::new(
         inner.x,
@@ -119,7 +134,9 @@ pub(super) fn draw_llm_rate_history_column(
 }
 
 pub(super) fn llm_rate_history_has_activity(history: &VecDeque<TimedSample>) -> bool {
-    history.iter().any(|sample| sample.value > 0.05)
+    history.iter().any(|sample| {
+        sample.at.elapsed() <= HISTORY_WINDOW && sample.value.is_finite() && sample.value > 0.05
+    })
 }
 
 pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
@@ -163,16 +180,27 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
             top[0],
             "GPU",
             &state.gpu_history,
+            state.last_host_sample_at,
             ORK_GREEN,
             true,
             true,
         );
-        draw_history_column(frame, top[1], "VRAM", &state.vram_history, CYAN, true, true);
+        draw_history_column(
+            frame,
+            top[1],
+            "VRAM",
+            &state.vram_history,
+            state.last_host_sample_at,
+            CYAN,
+            true,
+            true,
+        );
         draw_history_rate_column(
             frame,
             top[2],
             "DECODE",
             &state.llm_history.decode,
+            state.llm_history.last_observed_at,
             ORK_GREEN,
             false,
             true,
@@ -182,6 +210,7 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
             bottom[0],
             "CPU",
             &state.cpu_history,
+            state.last_host_sample_at,
             ORK_GREEN,
             true,
             false,
@@ -191,6 +220,7 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
             bottom[1],
             "RAM",
             &state.ram_history,
+            state.last_host_sample_at,
             CYAN,
             true,
             false,
@@ -200,6 +230,7 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
             bottom[2],
             "PREFILL",
             &state.llm_history.prefill,
+            state.llm_history.last_observed_at,
             WHITE,
             false,
             false,
@@ -227,6 +258,7 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
         top[0],
         "GPU",
         &state.gpu_history,
+        state.last_host_sample_at,
         ORK_GREEN,
         true,
         true,
@@ -236,6 +268,7 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
         top[1],
         "VRAM",
         &state.vram_history,
+        state.last_host_sample_at,
         CYAN,
         false,
         true,
@@ -245,6 +278,7 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
         bottom[0],
         "CPU",
         &state.cpu_history,
+        state.last_host_sample_at,
         ORK_GREEN,
         true,
         false,
@@ -254,17 +288,20 @@ pub(super) fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
         bottom[1],
         "RAM",
         &state.ram_history,
+        state.last_host_sample_at,
         CYAN,
         false,
         false,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_history_column(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     history: &VecDeque<TimedSample>,
+    observed_at: Option<Instant>,
     color: Color,
     right_border: bool,
     bottom_border: bool,
@@ -285,7 +322,7 @@ pub(super) fn draw_history_column(
         return;
     }
 
-    let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
+    let latest = latest_history_value(history, observed_at);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -298,7 +335,7 @@ pub(super) fn draw_history_column(
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{latest:>3.0}%"),
+                latest.map_or_else(|| "  —".to_string(), |value| format!("{value:>3.0}%")),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -318,11 +355,13 @@ pub(super) fn draw_history_column(
 
 /// Rate variant of [`draw_history_column`]: header uses `tok/s` and the graph
 /// is scaled to the window maximum instead of a fixed 100 percent.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_history_rate_column(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     history: &VecDeque<TimedSample>,
+    observed_at: Option<Instant>,
     color: Color,
     right_border: bool,
     bottom_border: bool,
@@ -342,30 +381,27 @@ pub(super) fn draw_history_rate_column(
         return;
     }
 
-    let latest = history.back().map(|sample| sample.value).unwrap_or(0.0);
+    let latest = latest_history_value(history, observed_at);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
 
-    if !llm_rate_history_has_activity(history) {
-        frame.render_widget(
-            Paragraph::new(fit_cell(&format!(" {title} idle"), inner.width as usize))
-                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
-            rows[0],
-        );
-        return;
-    }
-
     let scale = history_max(history).max(1.0);
     frame.render_widget(
         Paragraph::new(fit_cell(
-            &format!(" {title} {} tok/s", compact_rate(latest)),
+            &latest.map_or_else(
+                || format!(" {title} —"),
+                |value| format!(" {title} {} tok/s", compact_rate(value)),
+            ),
             inner.width as usize,
         ))
         .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
         rows[0],
     );
+    if !llm_rate_history_has_activity(history) {
+        return;
+    }
     frame.render_widget(
         Paragraph::new(trend_lines_scaled(
             history,
@@ -449,7 +485,7 @@ pub(super) fn resample_history(
         .iter()
         .filter_map(|sample| {
             let age = now.saturating_duration_since(sample.at);
-            (age <= HISTORY_WINDOW)
+            (age <= HISTORY_WINDOW && sample.value.is_finite())
                 .then_some((window_secs - age.as_secs_f64(), sample.value.max(0.0)))
         })
         .peekable();
@@ -501,6 +537,9 @@ pub(super) fn braille_char(mask: u8) -> char {
 }
 
 pub(super) fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, now: Instant) {
+    if !value.is_finite() {
+        return;
+    }
     history.push_back(TimedSample {
         at: now,
         value: clamp_percent(value),
@@ -521,6 +560,7 @@ pub(super) fn push_history_at(history: &mut VecDeque<TimedSample>, value: f64, n
 /// metric is never appended as a fabricated zero; only a present rate enters
 /// the graph, keeping unknown distinct from a real `0`.
 pub(super) fn observe_llm_into(history: &mut LlmHistory, llm: &LlmStats, now: Instant) {
+    history.last_observed_at = Some(now);
     if llm.connected && !llm.reconnecting {
         if !history.was_connected {
             history.connected_since = Some(now);
@@ -553,13 +593,12 @@ pub(super) fn push_metric_history_at(
     value: f64,
     now: Instant,
 ) {
+    if !value.is_finite() {
+        return;
+    }
     history.push_back(TimedSample {
         at: now,
-        value: if value.is_finite() {
-            value.max(0.0)
-        } else {
-            0.0
-        },
+        value: value.max(0.0),
     });
 
     while history

@@ -3,6 +3,7 @@
 //! Shared test fixtures/helpers used by more than one theme file live here.
 use super::*;
 
+mod history;
 mod layout_shell;
 mod llm_panel;
 mod process_table;

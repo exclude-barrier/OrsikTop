@@ -16,6 +16,7 @@ pub(super) struct LlmHistory {
     pub(super) prefill: VecDeque<TimedSample>,
     pub(super) decode: VecDeque<TimedSample>,
     pub(super) last_fresh_at: Option<Instant>,
+    pub(super) last_observed_at: Option<Instant>,
     pub(super) sample_interval_ema_ms: Option<f64>,
     pub(super) connected_since: Option<Instant>,
     pub(super) connected_flash_until: Option<Instant>,
@@ -25,6 +26,7 @@ pub(super) struct LlmHistory {
 impl UiState {
     pub fn push_sample(&mut self, gpu: &GpuStats, system: &SystemStats) {
         let now = Instant::now();
+        self.last_host_sample_at = Some(now);
         let vram = match (gpu.memory_used_mib, gpu.memory_total_mib) {
             (Some(used), Some(total)) if total > 0.0 => Some(percent(used, total)),
             _ => None,

@@ -33,8 +33,9 @@ pub struct AppConfig {
     /// compatibility and CLI precedence; it is the first entry of the monitored
     /// server set when present.
     pub server: Option<String>,
-    /// Additional configured endpoints (`servers=`, comma-separated). Monitored
-    /// alongside `server` and any locally discovered servers.
+    /// Additional configured endpoints (`servers=`, JSON array; legacy comma
+    /// lists are still read). Monitored alongside `server` and any locally
+    /// discovered servers.
     pub servers: Vec<String>,
     pub gpu_selector: GpuSelector,
     pub refresh_ms: u64,
@@ -217,17 +218,18 @@ fn atomic_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp.{}.{}", std::process::id(), unique))
 }
 
-/// Write `contents` to `tmp` and rename it over `path`. `tmp` is removed on
-/// every failure path, and `path` is left untouched when the write or the
-/// rename fails, so an existing configuration survives a failed save.
+/// Create `tmp`, write `contents` and rename it over `path`. A file created by
+/// this save is removed on failure; a colliding existing file is never touched.
+/// `path` survives a failed write or rename.
 fn replace_file_atomically(path: &Path, tmp: &Path, contents: &str) -> io::Result<()> {
+    // Only a successfully created file belongs to this save. In particular,
+    // AlreadyExists must leave a colliding file or symlink untouched.
+    let mut file = create_private_temp(tmp)?;
     let result = (|| {
         // Create the temp private, write, then flush to disk *before* the
         // rename so a crash cannot leave a renamed-but-empty config behind.
-        let mut file = create_private_temp(tmp)?;
         file.write_all(contents.as_bytes())?;
-        // Only now widen to the target's existing mode (or keep 0600 for a
-        // new file), so the content is never briefly world-readable.
+        // Keep both new and existing configurations private.
         apply_target_permissions(path, tmp)?;
         file.sync_all()?;
         drop(file);
@@ -299,7 +301,12 @@ fn render_config(config: &AppConfig) -> String {
         lines.push(format!("{SERVER_KEY}={server}"));
     }
     if !config.servers.is_empty() {
-        lines.push(format!("{SERVERS_KEY}={}", config.servers.join(",")));
+        // JSON strings escape commas, quotes, backslashes and line breaks;
+        // joining raw URLs with commas cannot round-trip valid URL queries.
+        lines.push(format!(
+            "{SERVERS_KEY}={}",
+            serde_json::json!(config.servers)
+        ));
     }
     let selector = config.gpu_selector.as_string();
     if !selector.is_empty() {
@@ -358,12 +365,20 @@ fn parse_config(text: &str) -> AppConfig {
                 saw_server = true;
             }
             SERVERS_KEY => {
-                config.servers.extend(
-                    value
-                        .split(',')
-                        .map(|entry| entry.trim().to_string())
-                        .filter(|entry| !entry.is_empty()),
-                );
+                if value.starts_with('[') {
+                    // A malformed array is not a legacy list: never invent
+                    // endpoints by splitting its fragments at commas.
+                    if let Ok(servers) = serde_json::from_str::<Vec<String>>(value) {
+                        config.servers.extend(servers);
+                    }
+                } else {
+                    config.servers.extend(
+                        value
+                            .split(',')
+                            .map(|entry| entry.trim().to_string())
+                            .filter(|entry| !entry.is_empty()),
+                    );
+                }
             }
             GPU_KEY => {
                 config.gpu_selector = GpuSelector::parse(value);
@@ -517,7 +532,7 @@ mod tests {
 
         let rendered = render_config(&config);
         assert!(rendered.contains("server=http://a:1"));
-        assert!(rendered.contains("servers=http://b:2,http://c:3"));
+        assert!(rendered.contains(r#"servers=["http://b:2","http://c:3"]"#));
         // Round-trips without changing the configured set.
         let again = parse_config(&rendered);
         assert_eq!(again.server, config.server);
@@ -544,6 +559,47 @@ mod tests {
         assert_eq!(
             config.servers,
             vec!["http://h:1".to_string(), "http://g:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_urls_round_trip_through_disk_without_splitting_or_unescaping() {
+        let dir = unique_temp_dir("url-roundtrip");
+        let path = dir.join("config");
+        let config = AppConfig {
+            servers: vec![
+                "http://user:p,a@localhost:8080/v1,a?route=a,b&token=x=y#part,a".into(),
+                "https://[::1]:8443/?quoted=\"a,b\"&escaped=%2C".into(),
+                "http://localhost:8081/?backslash=\\&line=one\ntwo".into(),
+            ],
+            ..AppConfig::default()
+        };
+        save_to_path(&path, &config).unwrap();
+        assert_eq!(load_from_path(&path).unwrap(), config);
+        assert_eq!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .matches("servers=")
+                .count(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn json_and_legacy_server_lists_accumulate_and_invalid_arrays_do_not_split() {
+        let config = parse_config(
+            "servers=http://legacy:1,http://legacy:2\n\
+             servers=[\"http://json:3/?route=a,b\",\"http://legacy:1/\"]\n\
+             servers=[\"http://invalid:4\",false]\n",
+        );
+        assert_eq!(
+            config.servers,
+            [
+                "http://legacy:1",
+                "http://legacy:2",
+                "http://json:3/?route=a,b"
+            ]
         );
     }
 
@@ -648,6 +704,34 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temp_collision_preserves_existing_file_and_config() {
+        let dir = unique_temp_dir("temp-collision");
+        let path = dir.join("config");
+        let tmp = dir.join(".config.tmp.collision");
+        fs::write(&path, "old config").unwrap();
+        fs::write(&tmp, "not owned by this save").unwrap();
+        let err = replace_file_atomically(&path, &tmp, "new config").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), "not owned by this save");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old config");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn temp_collision_preserves_symlink_and_its_target() {
+        let dir = unique_temp_dir("temp-symlink-collision");
+        let target = dir.join("other-file");
+        let tmp = dir.join(".config.tmp.collision");
+        fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        let err = replace_file_atomically(&dir.join("config"), &tmp, "new config").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

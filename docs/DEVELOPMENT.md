@@ -51,9 +51,9 @@ The UI helpers cover dialogs, GPU, LLM, processes, system, history and shared wi
 
 ## Runtime boundaries
 
-The UI consumes snapshots from a fast system/GPU/process worker and an LLM coordinator. The coordinator polls a bounded set of servers concurrently, with a separate monitor and counter baseline per endpoint. HTTP sampling stays off the UI thread, so slow endpoints do not block keyboard or mouse input. Generation-tagged samples prevent old server-set results from appearing under newly selected configuration.
+The UI consumes snapshots from a fast system/GPU/process worker and an LLM coordinator. The coordinator polls a bounded set of servers concurrently, with a separate monitor and counter baseline per endpoint. HTTP sampling stays off the UI thread, so slow endpoints do not block keyboard or mouse input. Generation-tagged samples prevent old server-set results from appearing under newly selected configuration. `app::process::process_refresh_kind` disables individual Linux tasks so shared memory and DRM FD tables are sampled once per process; the worker and opt-in benchmark share this definition.
 
-GPU discovery uses stable PCI BDF identity and vendor-specific providers. Server-to-GPU mapping requires local process evidence, not a matching model name or device-wide utilization. Sensor and LLM fields preserve unavailable values as `—`; the current history-header limitation is documented under [Reading telemetry](USAGE.md#reading-telemetry).
+GPU discovery uses stable PCI BDF identity and vendor-specific providers. Server-to-GPU mapping requires local process evidence, not a matching model name or device-wide utilization. Sensor and LLM fields, including history headers, preserve unavailable values as `—`; see [Reading telemetry](USAGE.md#reading-telemetry).
 
 For user-visible contracts, use [Usage](USAGE.md), [Hardware support](HARDWARE_SUPPORT.md) and [Backend versions](BACKEND_VERSIONS.md). The [live vs fixture matrix](LIVE_VS_FIXTURE.md) distinguishes implemented paths from real-hardware or backend verification. Do not turn fixture coverage into a broad live-support claim.
 
@@ -66,7 +66,13 @@ cargo fmt --all -- --check
 cargo check --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+python3 -B -m unittest discover -s scripts/tests -v
 ```
+
+Tag releases call this same CI workflow (including audit, deny and MSRV) as a
+read-only prerequisite. Both release planning and publication explicitly require
+its successful result; `always()` on the publishing job cannot bypass it.
+Release-workflow and installer-patch regressions are covered by the Python gate.
 
 CLI smoke commands:
 
