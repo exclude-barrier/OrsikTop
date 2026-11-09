@@ -69,10 +69,12 @@ cargo test --all-targets --locked
 python3 -B -m unittest discover -s scripts/tests -v
 ```
 
-The same CI `rust` job also runs the dependency-policy and smoke gates on every
-push to `main` and every pull request:
+The same CI `rust` job also compiles the release profile and runs the
+dependency-policy and smoke gates on every push to `main` and every pull
+request:
 
 ```bash
+cargo build --release --locked     # the release artifact must build in the PR gate
 cargo audit                        # advisories; CI runs with denyWarnings
 cargo deny check                   # licenses and sources per deny.toml
 python3 scripts/sbom.py --locked   # CycloneDX SBOM artifact
