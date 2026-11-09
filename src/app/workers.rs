@@ -221,6 +221,35 @@ pub(super) fn spawn_fast_worker(
     })
 }
 
+/// The human-readable text of a caught panic payload. String panics carry
+/// their message; any other payload falls back to a generic marker.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
+
+/// Runs one LLM poll body, converting a panic inside it into an error
+/// sample for the coordinator instead of a silent poll-thread death. A
+/// panic in a per-server poll thread must reach the app as a
+/// `connected = false` error sample (reported like any other poll
+/// failure); the `PollFlag` still clears the in-flight flag on unwind, so
+/// the next cycle re-polls.
+pub(super) fn poll_with_panic_report(poll: impl FnOnce() -> LlmStats) -> LlmStats {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll)).unwrap_or_else(|payload| {
+        LlmStats {
+            connected: false,
+            error: format!(
+                "llm poll task panicked: {}",
+                panic_payload_message(&payload)
+            ),
+            ..Default::default()
+        }
+    })
+}
+
 pub(super) fn spawn_llm_worker(
     initial_servers: Vec<ServerSpec>,
     refresh_ms: Arc<AtomicU64>,
@@ -279,21 +308,24 @@ pub(super) fn spawn_llm_worker(
                     let mut server = monitor
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let raw_stats = match server.monitor.as_mut() {
-                        Some(monitor) => monitor.sample(),
-                        None => LlmStats {
-                            error: server.init_error.clone(),
-                            ..Default::default()
-                        },
-                    };
-                    let stats = stabilize_llm_sample(
-                        raw_stats,
-                        &mut server.last_good,
-                        Instant::now(),
-                        offline_grace,
-                    );
+                    let key = server.key.clone();
+                    let stats = poll_with_panic_report(|| {
+                        let raw_stats = match server.monitor.as_mut() {
+                            Some(monitor) => monitor.sample(),
+                            None => LlmStats {
+                                error: server.init_error.clone(),
+                                ..Default::default()
+                            },
+                        };
+                        stabilize_llm_sample(
+                            raw_stats,
+                            &mut server.last_good,
+                            Instant::now(),
+                            offline_grace,
+                        )
+                    });
                     let _ = sample_tx.send(LlmSample {
-                        server: server.key.clone(),
+                        server: key,
                         generation,
                         stats,
                     });
