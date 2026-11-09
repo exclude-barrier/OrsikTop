@@ -11,7 +11,7 @@ mod prometheus;
 mod props;
 mod slots;
 mod speculative;
-use http::{endpoint_url, fetch_json, fetch_raw, join_or};
+use http::{endpoint_is_loopback, endpoint_url, fetch_json, fetch_raw, join_or};
 use metrics::{
     average_over_seconds, counter_delta_opt, counter_rate, parse_metrics_body, pick_metric_opt,
 };

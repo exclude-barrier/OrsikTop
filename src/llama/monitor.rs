@@ -11,34 +11,33 @@ use serde_json::Value;
 
 use super::{
     apply_local_spec_fallback, apply_slots_json, average_over_seconds, choose_live_throughput,
-    classify_backend, counter_delta_opt, counter_rate, endpoint_url, fetch_json, fetch_raw,
-    join_or, json_string, json_u64_path, local_speculative_process_config, model_display_name,
-    parse_metrics_body, pick_metric_opt, sanitize_error_text, slot_delta_tps, speculative_config,
-    CachedProps, JsonOutcome, LlamaMonitor, LlmStats, LocalSpeculativeConfig, MetricsFormat,
-    MetricsOutcome, ParsedMetrics, PreviousMetricCounters, PreviousSlotCounters, SlotCounter,
-    SpeculativeConfig, LLM_CONNECT_TIMEOUT_MS, LLM_REQUEST_TIMEOUT_MS, PROPS_REFRESH,
+    classify_backend, counter_delta_opt, counter_rate, endpoint_is_loopback, endpoint_url,
+    fetch_json, fetch_raw, join_or, json_string, json_u64_path, local_speculative_process_config,
+    model_display_name, parse_metrics_body, pick_metric_opt, sanitize_error_text, slot_delta_tps,
+    speculative_config, CachedProps, JsonOutcome, LlamaMonitor, LlmStats, LocalSpeculativeConfig,
+    MetricsFormat, MetricsOutcome, ParsedMetrics, PreviousMetricCounters, PreviousSlotCounters,
+    SlotCounter, SpeculativeConfig, LLM_CONNECT_TIMEOUT_MS, LLM_REQUEST_TIMEOUT_MS, PROPS_REFRESH,
     SPEC_ACCEPTANCE_HOLD, SPEC_REFRESH, UNKNOWN_MODEL_LABEL,
 };
 
 impl LlamaMonitor {
     pub fn new(server: &str) -> Result<Self, reqwest::Error> {
-        // Proxy behavior is deliberately left at reqwest's default: the
-        // standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY environment
-        // variables are honored, with no automatic loopback bypass. That keeps
-        // an explicitly configured remote endpoint usable behind a corporate
-        // proxy, at the cost that a user with a proxy env var set (and no
-        // matching NO_PROXY) would route even the default 127.0.0.1 endpoint
-        // through it. Disabling proxies here would break the intentional remote
-        // case, and adding a dedicated setting is not justified by a proven
-        // requirement, so this stays a documented future configurable behavior.
-        // Timeouts and redirect policy below remain fully effective either way.
-        let client = Client::builder()
+        // Loopback endpoints bypass the ambient proxy configuration
+        // (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY): a proxy env var without a
+        // matching NO_PROXY must not intercept traffic to 127.0.0.1/::1 for
+        // a server on this machine. Remote endpoints keep reqwest's default
+        // env-proxy behavior so an explicitly configured remote server stays
+        // usable behind a corporate proxy.
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_millis(LLM_CONNECT_TIMEOUT_MS))
             .timeout(Duration::from_millis(LLM_REQUEST_TIMEOUT_MS))
             // Monitor exactly the configured endpoint: never silently follow
             // a redirect to another host/port.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+            .redirect(reqwest::redirect::Policy::none());
+        if endpoint_is_loopback(server) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build()?;
 
         Ok(Self {
             client,
