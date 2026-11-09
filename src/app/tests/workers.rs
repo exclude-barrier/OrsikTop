@@ -959,7 +959,7 @@ fn perf_baseline_soak_and_process_collection_benchmark() {
     // Production fast-worker cycle: `refresh_processes_specifics` followed
     // by `collect_process_stats`. Both are timed, together and apart, so the
     // report does not understate the cycle by measuring only the collector.
-    let mut system = System::new();
+    let mut system = System::new().unwrap();
     let mut process_cache = ProcessCache::default();
     let mut drm_state = DrmSamplerState::default();
     let refresh_system = |system: &mut System| -> Duration {
