@@ -54,7 +54,11 @@ pub(super) fn spawn_fast_worker(
             .clone();
         let static_gpus = discover_gpus(&RealSys);
         let mut gpu = new_gpu_provider(current_selector.clone(), &static_gpus);
-        let mut system = System::new();
+        // sysinfo 0.40: `System::new()` is fallible (e.g. /proc unreadable).
+        // Retry every cycle until it succeeds; while unavailable, the system
+        // and process cadences are skipped and their last values stay
+        // published (GPU and LLM telemetry are unaffected).
+        let mut system = System::new().ok();
         let mut system_stats = SystemStats::default();
         let mut last_system_refresh: Option<Instant> = None;
         let mut last_process_refresh: Option<Instant> = None;
@@ -111,33 +115,46 @@ pub(super) fn spawn_fast_worker(
                     config::MAX_PROCESS_REFRESH_MS,
                 ));
 
-            if last_process_refresh
-                .map(|at| at.elapsed() >= process_interval)
-                .unwrap_or(true)
-            {
-                system.refresh_processes_specifics(
-                    ProcessesToUpdate::All,
-                    true,
-                    process_refresh_kind(),
-                );
-                process_stats = collect_process_stats(&system, &mut process_cache, &mut drm_state);
-                last_process_refresh = Some(Instant::now());
+            if system.is_none() {
+                system = System::new().ok();
+            }
 
-                // S16: recompute the server→GPU mapping on the process cadence.
-                // The mapping is only trusted while the PID still carries the
-                // start time read at discovery, so a reused PID is invalidated
-                // immediately — before the next server resync.
-                if let Some(expected) = server_identity {
-                    let current_start =
-                        crate::discovery_llm::read_process_start_time(&RealSys, expected.pid);
-                    let render = process_render_gpus(&RealSys, expected.pid, &static_gpus);
-                    let nvml = nvml_compute_gpus(nvml_handle.as_ref(), expected.pid, &mig_children);
-                    gpu_map =
-                        map_server_identity(expected, current_start, render, nvml, &static_gpus);
-                } else {
-                    // No local server process (configured/remote endpoint) →
-                    // there is no process to attribute; keep the mapping empty.
-                    gpu_map = GpuMapping::None;
+            if let Some(system) = &mut system {
+                if last_process_refresh
+                    .map(|at| at.elapsed() >= process_interval)
+                    .unwrap_or(true)
+                {
+                    system.refresh_processes_specifics(
+                        ProcessesToUpdate::All,
+                        true,
+                        process_refresh_kind(),
+                    );
+                    process_stats =
+                        collect_process_stats(system, &mut process_cache, &mut drm_state);
+                    last_process_refresh = Some(Instant::now());
+
+                    // S16: recompute the server→GPU mapping on the process cadence.
+                    // The mapping is only trusted while the PID still carries the
+                    // start time read at discovery, so a reused PID is invalidated
+                    // immediately — before the next server resync.
+                    if let Some(expected) = server_identity {
+                        let current_start =
+                            crate::discovery_llm::read_process_start_time(&RealSys, expected.pid);
+                        let render = process_render_gpus(&RealSys, expected.pid, &static_gpus);
+                        let nvml =
+                            nvml_compute_gpus(nvml_handle.as_ref(), expected.pid, &mig_children);
+                        gpu_map = map_server_identity(
+                            expected,
+                            current_start,
+                            render,
+                            nvml,
+                            &static_gpus,
+                        );
+                    } else {
+                        // No local server process (configured/remote endpoint) →
+                        // there is no process to attribute; keep the mapping empty.
+                        gpu_map = GpuMapping::None;
+                    }
                 }
             }
 
@@ -153,56 +170,58 @@ pub(super) fn spawn_fast_worker(
                 last_sensor_refresh = Some(Instant::now());
             }
 
-            if last_system_refresh
-                .map(|at| at.elapsed() >= SYSTEM_REFRESH_INTERVAL)
-                .unwrap_or(true)
-            {
-                system.refresh_cpu_usage();
-                system.refresh_memory();
+            if let Some(system) = &mut system {
+                if last_system_refresh
+                    .map(|at| at.elapsed() >= SYSTEM_REFRESH_INTERVAL)
+                    .unwrap_or(true)
+                {
+                    system.refresh_cpu_usage();
+                    system.refresh_memory();
 
-                let current_cpu_times = read_cpu_times();
-                let io_wait_pct = previous_cpu_times
-                    .zip(current_cpu_times)
-                    .and_then(|(previous, current)| io_wait_percent(previous, current));
-                if current_cpu_times.is_some() {
-                    previous_cpu_times = current_cpu_times;
+                    let current_cpu_times = read_cpu_times();
+                    let io_wait_pct = previous_cpu_times
+                        .zip(current_cpu_times)
+                        .and_then(|(previous, current)| io_wait_percent(previous, current));
+                    if current_cpu_times.is_some() {
+                        previous_cpu_times = current_cpu_times;
+                    }
+
+                    // Unknown when /proc/loadavg is unreadable: kept as `None`
+                    // and rendered `—`, never silently turned into a fake zero.
+                    let load_average = read_load_average();
+                    let per_cpu_pairs = system
+                        .cpus()
+                        .iter()
+                        .map(|cpu| (cpu.name(), cpu.usage()))
+                        .collect::<Vec<_>>();
+                    let per_cpu_usage = per_cpu_usage_by_id(&per_cpu_pairs);
+                    let topology = cpu_topology
+                        .get_or_insert_with(|| detect_cpu_topology(per_cpu_usage.len()))
+                        .clone();
+                    system_stats = SystemStats {
+                        cpu_usage: system.global_cpu_usage() as f64,
+                        per_cpu_usage,
+                        cpu_topology: topology,
+                        // S11: cpufreq first, /proc/cpuinfo as fallback (cheap,
+                        // so it stays on the fast system cadence).
+                        cpu_frequency_mhz: cpu_sensors
+                            .sample_frequency_mhz(&RealSys)
+                            .or_else(|| read_cpu_frequency_mhz(&RealSys)),
+                        // S12: reused from the slower sensor cadence.
+                        cpu_temperature_c,
+                        cpu_power_w,
+                        io_wait_pct,
+                        load_one: load_average.map(|(one, _, _)| one),
+                        load_five: load_average.map(|(_, five, _)| five),
+                        load_fifteen: load_average.map(|(_, _, fifteen)| fifteen),
+                        memory_used_bytes: system.used_memory(),
+                        memory_total_bytes: system.total_memory(),
+                        swap_used_bytes: system.used_swap(),
+                        swap_total_bytes: system.total_swap(),
+                        processes: process_stats.clone(),
+                    };
+                    last_system_refresh = Some(Instant::now());
                 }
-
-                // Unknown when /proc/loadavg is unreadable: kept as `None`
-                // and rendered `—`, never silently turned into a fake zero.
-                let load_average = read_load_average();
-                let per_cpu_pairs = system
-                    .cpus()
-                    .iter()
-                    .map(|cpu| (cpu.name(), cpu.cpu_usage()))
-                    .collect::<Vec<_>>();
-                let per_cpu_usage = per_cpu_usage_by_id(&per_cpu_pairs);
-                let topology = cpu_topology
-                    .get_or_insert_with(|| detect_cpu_topology(per_cpu_usage.len()))
-                    .clone();
-                system_stats = SystemStats {
-                    cpu_usage: system.global_cpu_usage() as f64,
-                    per_cpu_usage,
-                    cpu_topology: topology,
-                    // S11: cpufreq first, /proc/cpuinfo as fallback (cheap,
-                    // so it stays on the fast system cadence).
-                    cpu_frequency_mhz: cpu_sensors
-                        .sample_frequency_mhz(&RealSys)
-                        .or_else(|| read_cpu_frequency_mhz(&RealSys)),
-                    // S12: reused from the slower sensor cadence.
-                    cpu_temperature_c,
-                    cpu_power_w,
-                    io_wait_pct,
-                    load_one: load_average.map(|(one, _, _)| one),
-                    load_five: load_average.map(|(_, five, _)| five),
-                    load_fifteen: load_average.map(|(_, _, fifteen)| fifteen),
-                    memory_used_bytes: system.used_memory(),
-                    memory_total_bytes: system.total_memory(),
-                    swap_used_bytes: system.used_swap(),
-                    swap_total_bytes: system.total_swap(),
-                    processes: process_stats.clone(),
-                };
-                last_system_refresh = Some(Instant::now());
             }
 
             let snapshot = FastSnapshot {
@@ -217,6 +236,35 @@ pub(super) fn spawn_fast_worker(
             }
 
             sleep_until_next_cycle(cycle_started, &refresh_ms, MIN_REFRESH_MS, &stop);
+        }
+    })
+}
+
+/// The human-readable text of a caught panic payload. String panics carry
+/// their message; any other payload falls back to a generic marker.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
+
+/// Runs one LLM poll body, converting a panic inside it into an error
+/// sample for the coordinator instead of a silent poll-thread death. A
+/// panic in a per-server poll thread must reach the app as a
+/// `connected = false` error sample (reported like any other poll
+/// failure); the `PollFlag` still clears the in-flight flag on unwind, so
+/// the next cycle re-polls.
+pub(super) fn poll_with_panic_report(poll: impl FnOnce() -> LlmStats) -> LlmStats {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll)).unwrap_or_else(|payload| {
+        LlmStats {
+            connected: false,
+            error: format!(
+                "llm poll task panicked: {}",
+                panic_payload_message(&payload)
+            ),
+            ..Default::default()
         }
     })
 }
@@ -279,21 +327,24 @@ pub(super) fn spawn_llm_worker(
                     let mut server = monitor
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let raw_stats = match server.monitor.as_mut() {
-                        Some(monitor) => monitor.sample(),
-                        None => LlmStats {
-                            error: server.init_error.clone(),
-                            ..Default::default()
-                        },
-                    };
-                    let stats = stabilize_llm_sample(
-                        raw_stats,
-                        &mut server.last_good,
-                        Instant::now(),
-                        offline_grace,
-                    );
+                    let key = server.key.clone();
+                    let stats = poll_with_panic_report(|| {
+                        let raw_stats = match server.monitor.as_mut() {
+                            Some(monitor) => monitor.sample(),
+                            None => LlmStats {
+                                error: server.init_error.clone(),
+                                ..Default::default()
+                            },
+                        };
+                        stabilize_llm_sample(
+                            raw_stats,
+                            &mut server.last_good,
+                            Instant::now(),
+                            offline_grace,
+                        )
+                    });
                     let _ = sample_tx.send(LlmSample {
-                        server: server.key.clone(),
+                        server: key,
                         generation,
                         stats,
                     });

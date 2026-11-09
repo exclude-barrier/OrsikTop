@@ -27,6 +27,30 @@ pub(super) fn endpoint_url(base: &str, segment: &str) -> String {
     }
 }
 
+/// True when the configured endpoint targets this machine: a loopback
+/// address (`127.0.0.0/8`, `::1`) or `localhost`. Unparseable endpoints
+/// return false — the request fails anyway, and the proxy choice must not
+/// depend on a guess.
+pub(super) fn endpoint_is_loopback(endpoint: &str) -> bool {
+    use std::str::FromStr as _;
+
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // The url crate reports IPv6 literals with their brackets.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host == "localhost" {
+        return true;
+    }
+    std::net::IpAddr::from_str(host).is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Fetches a raw text endpoint (currently only /metrics).
 pub(super) fn fetch_raw(client: &Client, url: String) -> MetricsOutcome {
     let response = match client.get(url).send() {
@@ -140,6 +164,7 @@ mod tests {
         Client::builder()
             .timeout(std::time::Duration::from_millis(2000))
             .connect_timeout(std::time::Duration::from_millis(750))
+            .no_proxy()
             .build()
             .expect("test client")
     }
@@ -172,6 +197,33 @@ mod tests {
     fn endpoint_url_falls_back_for_invalid_base() {
         assert_eq!(endpoint_url("not a url", "metrics"), "not a url/metrics");
         assert_eq!(endpoint_url("not a url/", "metrics"), "not a url/metrics");
+    }
+
+    #[test]
+    fn endpoint_is_loopback_recognizes_local_machines() {
+        for endpoint in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.9:8080",
+            "http://[::1]:8080",
+            "http://localhost:8080",
+        ] {
+            assert!(
+                endpoint_is_loopback(endpoint),
+                "{endpoint} must be loopback"
+            );
+        }
+        for endpoint in [
+            "http://192.168.1.10:8080",
+            "http://10.0.0.5:8080",
+            "http://[fd00::1]:8080",
+            "https://llm.example.com:8443",
+            "not a url",
+        ] {
+            assert!(
+                !endpoint_is_loopback(endpoint),
+                "{endpoint} must not be loopback"
+            );
+        }
     }
 
     #[test]
