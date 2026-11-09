@@ -3,7 +3,7 @@
 > **Historical record.** These notes document the v0.2.6 development cycle
 > (2026-10-01). References to the "current version" and the "current
 > development cycle" are as of that date; the repository has since moved on
-> (latest release 0.4.4). The evidence-level definitions below still apply.
+> (see `CHANGELOG.md` for later releases). The evidence-level definitions below still apply.
 
 Durable notes for the v0.2.6 development cycle. Evidence levels follow
 `docs/HARDWARE_SUPPORT.md`: **implemented** = code plus fixture/unit tests
