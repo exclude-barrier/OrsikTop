@@ -21,6 +21,23 @@ All notable changes to OrsikTop will be documented here.
 
 ### Changed
 
+- **The PR gate builds the release profile.** The CI `rust` job runs
+  `cargo build --release --locked`, so a change that only breaks the shipped
+  profile fails before merge instead of at tag time (#124).
+- **Loopback LLM endpoints bypass the ambient HTTP proxy.** With
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` set and no matching `NO_PROXY`, a
+  server on `127.0.0.0/8`, `::1` or `localhost` was polled through the proxy.
+  `LlamaMonitor` now disables proxies for loopback endpoints only; remote
+  endpoints keep reqwest's environment-proxy behavior (#126).
+- **sysinfo 0.39.6 → 0.40.1.** `System::new()` is fallible in 0.40; the fast
+  worker retries it every cycle and keeps the last published system and
+  process values while it is unavailable. GPU and LLM telemetry are
+  unaffected (#121).
+- The hardware test matrix lists the current ignored suite (four live smokes,
+  five further ignored tests) instead of historical counts (#127).
+- Four new regression tests (#123, #126): the Rust gate is now **610**
+  (601 run + 9 ignored).
+
 - Production sampling now explicitly disables sysinfo's per-thread task rows.
   Process CPU/memory and the dynamic `THR` column remain process-level; shared
   DRM FD tables are no longer scanned once per thread. The worker and profiler
@@ -95,6 +112,12 @@ All notable changes to OrsikTop will be documented here.
   is unchanged.
 
 ### Fixed
+
+- **A panic in an LLM poll thread reaches the coordinator.** It used to end
+  the per-server poll thread silently, leaving that server's state stale
+  with no report. The poll body now runs under `catch_unwind` and a panic
+  becomes a `connected = false` error sample carrying the payload, like any
+  other poll failure; the next cycle polls again (#123).
 
 - Additional server URLs now round-trip through a JSON `servers=` array,
   including commas in credentials, paths and queries. Legacy comma-separated
