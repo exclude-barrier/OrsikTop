@@ -159,10 +159,13 @@ cargo test -- --ignored --nocapture real_system_smoke
 
 `--ignored` runs only the `#[ignore]`d tests, `--nocapture` keeps their
 `println!`/`eprintln!` output (the harness otherwise swallows the output of a
-passing test), and the `real_system_smoke` filter narrows the run to the three
+passing test), and the `real_system_smoke` filter narrows the run to the four
 hardware smokes. **Do not** run a bare `cargo test -- --ignored`: it also runs
-two heavy tests —
+five further ignored tests —
 
+- `soak_long_1_server`, `soak_long_4_servers`, `soak_long_16_servers`
+  (`src/app/tests/soak.rs:965`, `:971`, `:977`) — long soaks,
+  `ORSIK_SOAK_SECS`-bounded
 - `perf_baseline_soak_and_process_collection_benchmark` (`src/app/tests/workers.rs:936`)
 - `soak_many_set_servers_rounds_bound_resources_single_threaded` (`src/app/tests/soak_scenarios.rs:580`)
 
@@ -170,7 +173,7 @@ two heavy tests —
 and which are **not** part of the hardware check (a failure of the leak probe
 in a parallel gate is meaningless, not a hardware finding).
 
-The three smokes differ in what they assert; only the printed output gives the
+The four smokes differ in what they assert; only the printed output gives the
 full picture:
 
 | Smoke | Location | What it does | What it asserts |
