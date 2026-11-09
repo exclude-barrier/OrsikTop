@@ -1,12 +1,12 @@
 //! Worker, channel, redraw-scheduler and benchmark tests.
 use super::{
     accepts_llm_sample, bench_emit, build_server_summaries, change_refresh, collect_process_stats,
-    drain_try_recv, join_bounded, mock_body, next_cycle_target, read_process_thread_count,
-    read_request_path, self_status_field, spawn_gated_server, spawn_llm_worker, spawn_plain_server,
-    test_spec, try_send_snapshot, ui, write_response, DashboardSnapshot, DrmSamplerState,
-    LlmCommand, LlmSample, LlmStats, ProcessCache, ProcessStats, RealSys, RedrawScheduler,
-    SystemStats, UiState, IDLE_REDRAW_INTERVAL, MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS,
-    MIN_REFRESH_MS,
+    drain_try_recv, join_bounded, mock_body, next_cycle_target, poll_with_panic_report,
+    read_process_thread_count, read_request_path, self_status_field, spawn_gated_server,
+    spawn_llm_worker, spawn_plain_server, test_spec, try_send_snapshot, ui, write_response,
+    DashboardSnapshot, DrmSamplerState, LlmCommand, LlmSample, LlmStats, ProcessCache,
+    ProcessStats, RealSys, RedrawScheduler, SystemStats, UiState, IDLE_REDRAW_INTERVAL,
+    MAX_POLL_INTERVAL, MAX_REFRESH_MS, MIN_LLM_POLL_MS, MIN_REFRESH_MS,
 };
 
 use super::super::process::process_refresh_kind;
@@ -512,6 +512,33 @@ fn join_bounded_reports_panicked_worker() {
     let worker = thread::spawn(|| panic!("simulated worker panic"));
     let error = join_bounded(worker, "test", Duration::from_secs(2)).unwrap_err();
     assert!(error.contains("panicked"), "{error}");
+}
+
+#[test]
+fn a_panicking_poll_body_is_reported_to_the_coordinator() {
+    // Regression: a panic in a per-server LLM poll thread used to kill the
+    // thread silently — the coordinator received no sample at all and the
+    // server's state went stale with no report. The panic must become a
+    // connected=false error sample carrying the payload, like any other
+    // poll failure.
+    let stats = poll_with_panic_report(|| panic!("simulated poll panic"));
+    assert!(!stats.connected);
+    assert!(
+        stats.error.contains("simulated poll panic"),
+        "the panic payload must reach the coordinator: {stats:?}"
+    );
+}
+
+#[test]
+fn a_successful_poll_body_passes_through_unmodified() {
+    let stats = poll_with_panic_report(|| LlmStats {
+        connected: true,
+        model: "passthrough".to_string(),
+        ..Default::default()
+    });
+    assert!(stats.connected);
+    assert_eq!(stats.model, "passthrough");
+    assert_eq!(stats.error, "");
 }
 
 #[test]
