@@ -43,6 +43,8 @@ use channels::{drain_try_recv, join_bounded, try_send_snapshot};
 use loop_events::{handle_key_event, handle_mouse_event, pump_snapshots};
 #[cfg(test)]
 use workers::next_cycle_target;
+#[cfg(test)]
+use workers::poll_with_panic_report;
 use workers::{spawn_fast_worker, spawn_llm_worker};
 
 pub(crate) use server::{

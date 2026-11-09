@@ -40,7 +40,7 @@ fn multithreaded_process_has_one_row_with_group_memory_and_thread_count() {
         }
         let tids: Vec<_> = (0..3).map(|_| ready_rx.recv().unwrap()).collect();
         let pid = Pid::from_u32(std::process::id());
-        let mut system = System::new();
+        let mut system = System::new().unwrap();
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
             true,
