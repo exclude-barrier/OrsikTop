@@ -4,6 +4,8 @@ All notable changes to OrsikTop will be documented here.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-09
+
 ### Added
 
 - **Live smoke test for the NVIDIA provider** (`nvidia_real_system_smoke`,

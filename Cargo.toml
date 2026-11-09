@@ -1,6 +1,6 @@
 [package]
 name = "orsiktop"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 # Effective floor of the dependency set (currently sysinfo 0.39.6, which
 # declares rust-version 1.95). CI checks this floor in a dedicated MSRV job
