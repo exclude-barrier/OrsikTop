@@ -1106,3 +1106,47 @@ fn an_invalid_props_refresh_keeps_the_cached_model() {
     // The refresh stays pending so the next sample retries.
     assert!(monitor.props_dirty);
 }
+
+#[test]
+fn a_loopback_endpoint_reaches_the_server_despite_the_ambient_proxy() {
+    // A proxy env var without a matching NO_PROXY must not intercept
+    // loopback traffic: the monitor reaches the local mock directly. The
+    // proxy points at a dead port, so honoring it would fail the request.
+    // Parallel tests stay deterministic: their loopback monitors bypass the
+    // proxy too, and the http.rs unit tests pin their client with no_proxy.
+    let backend = spawn_backend(|path, _n| {
+        if path.contains("/metrics") {
+            return (
+                200,
+                "text/plain",
+                "llamacpp:prompt_tokens_total 10\n".to_string(),
+            );
+        }
+        if path.contains("/slots") {
+            return (
+                200,
+                "application/json",
+                "[{\"id\":0,\"n_ctx\":1024}]".to_string(),
+            );
+        }
+        (200, "application/json", r#"{"total_slots":1}"#.to_string())
+    });
+    // Prove the mock's accept loop is live before sampling: a probe
+    // connection (served like any other request) removes the server
+    // thread's start-up race from the assertion below.
+    std::net::TcpStream::connect(backend.base().trim_start_matches("http://"))
+        .expect("mock backend accepts connections");
+    std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
+    std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
+    let sampled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut monitor = LlamaMonitor::new(backend.base()).unwrap();
+        monitor.sample()
+    }));
+    std::env::remove_var("HTTP_PROXY");
+    std::env::remove_var("HTTPS_PROXY");
+    let stats = sampled.expect("sample must not panic");
+    assert!(
+        stats.connected,
+        "a loopback endpoint must reach the local server despite the proxy env var"
+    );
+}
