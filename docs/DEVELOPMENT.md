@@ -59,7 +59,7 @@ For user-visible contracts, use [Usage](USAGE.md), [Hardware support](HARDWARE_S
 
 ## Validation
 
-CI runs the following Rust checks:
+Run these locally on every change; they are the core of the CI `rust` job:
 
 ```bash
 cargo fmt --all -- --check
@@ -69,7 +69,22 @@ cargo test --all-targets --locked
 python3 -B -m unittest discover -s scripts/tests -v
 ```
 
-Tag releases call this same CI workflow (including audit, deny and MSRV) as a
+The same CI `rust` job also runs the dependency-policy and smoke gates on every
+push to `main` and every pull request:
+
+```bash
+cargo audit                        # advisories; CI runs with denyWarnings
+cargo deny check                   # licenses and sources per deny.toml
+python3 scripts/sbom.py --locked   # CycloneDX SBOM artifact
+cargo run --locked -- --help       # CLI smoke
+cargo run --locked -- diag         # read-only; must exit 0 with no GPU/server
+```
+
+Run `cargo audit` and `cargo deny check` before pushing a dependency change so the
+policy gate does not fail only in CI. A separate `msrv` job rebuilds the tree at the
+declared floor (`rust-version` in `Cargo.toml`) so the MSRV cannot silently rot.
+
+Tag releases call this same CI workflow (audit, deny and MSRV included) as a
 read-only prerequisite. Both release planning and publication explicitly require
 its successful result; `always()` on the publishing job cannot bypass it.
 Release-workflow and installer-patch regressions are covered by the Python gate.
