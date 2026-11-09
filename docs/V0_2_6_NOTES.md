@@ -1,6 +1,11 @@
 # v0.2.6 Development Notes
 
-Durable notes for the current development cycle. Evidence levels follow
+> **Historical record.** These notes document the v0.2.6 development cycle
+> (2026-10-01). References to the "current version" and the "current
+> development cycle" are as of that date; the repository has since moved on
+> (latest release 0.4.4). The evidence-level definitions below still apply.
+
+Durable notes for the v0.2.6 development cycle. Evidence levels follow
 `docs/HARDWARE_SUPPORT.md`: **implemented** = code plus fixture/unit tests
 running in CI; **live-verified** = additionally executed on real hardware
 (name the box); **live validation pending** = no live run recorded yet.
