@@ -31,12 +31,24 @@ pub(super) fn parse_metrics_body(text: &str) -> ParsedMetrics {
             },
         }
     } else {
+        let mut samples = parse_prometheus(text);
+        // SGLang speaks Prometheus but with its own namespace: recognisable by
+        // the `sglang:` series, then normalised to the canonical names.
+        let (format, sglang_capacity) = if crate::sglang::looks_like_sglang(text) {
+            crate::sglang::normalize(&mut samples);
+            (
+                Some(MetricsFormat::Sglang),
+                crate::sglang::context_capacity(text),
+            )
+        } else {
+            (Some(MetricsFormat::Prometheus), None)
+        };
         ParsedMetrics {
-            samples: parse_prometheus(text),
-            format: Some(MetricsFormat::Prometheus),
+            samples,
+            format,
             strata_since: None,
             strata_live: None,
-            strata_capacity: None,
+            strata_capacity: sglang_capacity,
             json: false,
         }
     }

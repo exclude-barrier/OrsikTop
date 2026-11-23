@@ -14,6 +14,7 @@ mod llama;
 mod providers;
 mod redact;
 mod server_editor;
+mod sglang;
 mod strata;
 mod system;
 #[cfg(test)]

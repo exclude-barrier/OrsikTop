@@ -197,6 +197,7 @@ fn classify_backend(
     use crate::domain::ServerBackend;
     match format {
         Some(MetricsFormat::Strata) => ServerBackend::Strata,
+        Some(MetricsFormat::Sglang) => ServerBackend::Sglang,
         Some(MetricsFormat::Prometheus)
             if metrics
                 .iter()
@@ -274,6 +275,11 @@ pub struct LlamaMonitor {
     client: Client,
     base: String,
     previous_metrics: PreviousMetricCounters,
+    /// SGLang only: (timestamp, cumulative new prompt tokens). Its prefill
+    /// counter advances at chunk completion, so a single-sample delta is a
+    /// spike or a zero; a short window reports the rate the server actually
+    /// sustains. Cleared with the counter baseline on a format change.
+    sglang_prefill: std::collections::VecDeque<(Instant, f64)>,
     previous_slots: PreviousSlotCounters,
     props: CachedProps,
     last_spec_acceptance_pct: Option<f64>,
@@ -316,6 +322,8 @@ enum MetricsFormat {
     Prometheus,
     /// Strata JSON telemetry object.
     Strata,
+    /// SGLang Prometheus exposition, normalised into the canonical names.
+    Sglang,
 }
 
 /// A parsed `/metrics` body: the canonical samples plus enough metadata to

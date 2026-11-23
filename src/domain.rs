@@ -857,6 +857,8 @@ pub enum ServerBackend {
     LlamaCpp,
     /// Strata: a recognised JSON telemetry object / reported live phase.
     Strata,
+    /// SGLang: a Prometheus exposition carrying the `sglang:` namespace.
+    Sglang,
 }
 
 impl ServerBackend {
@@ -866,6 +868,7 @@ impl ServerBackend {
             ServerBackend::Unknown => "—",
             ServerBackend::LlamaCpp => "llama.cpp",
             ServerBackend::Strata => "Strata",
+            ServerBackend::Sglang => "SGLang",
         }
     }
 }
