@@ -43,6 +43,7 @@ impl LlamaMonitor {
             client,
             base: server.trim_end_matches('/').to_string(),
             previous_metrics: PreviousMetricCounters::default(),
+            sglang_prefill: std::collections::VecDeque::new(),
             previous_slots: PreviousSlotCounters::default(),
             props: CachedProps::default(),
             last_spec_acceptance_pct: None,
@@ -153,6 +154,9 @@ impl LlamaMonitor {
             // A recognised Strata endpoint is available even when a particular
             // sample exposes no counters: the fields stay `—`, not fabricated.
             Some(MetricsFormat::Strata) => true,
+            // SGLang answers /metrics like llama.cpp: available when the body
+            // carried at least one (normalised) sample.
+            Some(MetricsFormat::Sglang) => metrics_text.is_some() && !metrics.is_empty(),
             Some(MetricsFormat::Prometheus) => metrics_text.is_some() && !metrics.is_empty(),
             None => false,
         };
@@ -280,6 +284,7 @@ impl LlamaMonitor {
             && parsed.strata_since != self.last_strata_since;
         if format_changed || since_changed {
             self.previous_metrics = PreviousMetricCounters::default();
+            self.sglang_prefill.clear();
         }
         self.last_metrics_format = parsed.format;
         if parsed.format == Some(MetricsFormat::Strata) {
@@ -337,6 +342,47 @@ impl LlamaMonitor {
             }
         }
 
+        // SGLang's `generation_tokens_total` only advances when a request
+        // finishes, so its counter delta is not a live decode rate. SGLang does
+        // expose the instantaneous rate as the `gen_throughput` gauge (mapped to
+        // `llamacpp:predicted_tokens_seconds`): use it while requests are
+        // actually running, and keep `—` when idle instead of a stale value.
+        if parsed.format == Some(MetricsFormat::Sglang) {
+            let now = Instant::now();
+            // Prefill: the per-mode counter advances when a chunk completes, so
+            // average it over a short window instead of reporting the chunk
+            // spike (or a zero between chunks).
+            if let Some(tokens) = stats.prompt_total {
+                self.sglang_prefill.push_back((now, tokens));
+                let horizon = now - std::time::Duration::from_secs(5);
+                while self.sglang_prefill.len() > 1 && self.sglang_prefill[0].0 < horizon {
+                    self.sglang_prefill.pop_front();
+                }
+                if let (Some(first), Some(last)) =
+                    (self.sglang_prefill.front(), self.sglang_prefill.back())
+                {
+                    let seconds = last.0.saturating_duration_since(first.0).as_secs_f64();
+                    let delta = last.1 - first.1;
+                    if seconds > 0.2 && delta >= 0.0 {
+                        stats.prompt_tps = Some(delta / seconds);
+                    }
+                }
+            }
+            // Decode: the frozen per-request counter cannot drive a live rate;
+            // the gen_throughput gauge can, while requests are running.
+            if stats.active_requests.is_some_and(|active| active > 0.0) {
+                if let Some(tps) = stats.generation_avg_tps {
+                    stats.generation_tps = Some(tps);
+                }
+            }
+        }
+
+        if stats.model.is_empty() && parsed.format == Some(MetricsFormat::Sglang) {
+            // SGLang has no /props: take the served model from the metric label.
+            if let Some(name) = metrics_text.as_deref().and_then(crate::sglang::model_name) {
+                stats.model = name;
+            }
+        }
         if stats.model.is_empty() {
             stats.model = UNKNOWN_MODEL_LABEL.to_string();
         }
